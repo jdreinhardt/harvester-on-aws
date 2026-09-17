@@ -1,7 +1,9 @@
 # Harvester (SUSE Virtualization) on AWS EC2
 
 Builds an EC2 AMI from a stock Harvester ISO and boots it into a working,
-self-bootstrapping single-node cluster.
+self-bootstrapping Harvester cluster — one node, or three to five with an HA
+control plane. Scripts for the image build and a CloudFormation template for
+the deployment.
 
 Targets Harvester **v1.8.2**.
 
@@ -173,31 +175,13 @@ Upload:
 aws s3 cp artifacts/harvester-v1.8.2-amd64.raw.zst s3://your-bucket/
 ```
 
-Attach a volume of **exactly `DISK_SIZE_GIB`** to a helper instance — 250 GiB
-by default, or 130 if you built small. Then:
+Attach a volume of **exactly `DISK_SIZE_GIB`** to a helper instance (250 GiB
+by default). Then:
 
 ```bash
 sudo ./01b-write-image.sh --source s3://your-bucket/harvester-v1.8.2-amd64.raw.zst --device /dev/nvme1n1
 ```
 
-> **Do not** use the obvious one-liner:
->
-> ```bash
-> aws s3 cp s3://bucket/key.zst - | zstd -dc | sudo dd of=/dev/nvme1n1   # DON'T
-> ```
->
-> `aws s3 cp` writing to stdout does a single, non-resumable GET. Its retry
-> logic cannot help, because the bytes it already emitted have gone downstream
-> into `zstd` and `dd` — there is nothing to rewind. Writing to a *file* would
-> use parallel multipart ranged GETs with per-part retries; streaming to stdout
-> disables all of that. A half-hour connection to S3 only has to hiccup once:
->
-> ```
-> 169160474624 bytes (169 GB) copied, 1289 s, 131 MB/s
-> download failed: ... ConnectionResetError(104, 'Connection reset by peer')
-> /*stdin*\ : Read error (39) : premature end
-> ```
->
 > `01b-write-image.sh` fetches the object in ranged chunks instead. Each chunk
 > is staged in a small scratch file and only emitted downstream once it has
 > been fetched intact, so any chunk can be retried without corrupting the
@@ -213,21 +197,10 @@ sudo ./01b-write-image.sh --source s3://your-bucket/harvester-v1.8.2-amd64.raw.z
 > from — not the bytes actually used — and `register-image` will not declare a
 > root volume smaller than its snapshot. So the helper volume becomes the
 > permanent *minimum* root volume for every instance launched from that AMI.
-> A 130 GiB helper volume lets you launch at anything from 250 GiB up; a 500 GiB
-> one locks you to 500 GiB and forfeits the deploy-time sizing entirely. Phase 3
-> refuses the mismatch rather than letting EBS reject it later.
 >
 > Smaller than the image is not an option either: the GPT backup header sits in
 > the image's last sector and is non-zero, so `conv=sparse` writes rather than
 > skips it, and `dd` fails with ENOSPC.
-
-> The old workflow used a volume 1 GiB larger than the image to dodge
-> "partition corruption". That symptom is just the GPT backup header sitting
-> mid-disk when the image is smaller than the volume. Matching the sizes avoids
-> it entirely; phase 2 also relocates the header (`sgdisk --move-second-header`,
-> the same thing Harvester's `stream-disk` does with `echo w | fdisk`) so a
-> larger volume works too. Add `--grow-data-disk` to expand
-> `HARV_LH_DEFAULT` into the extra space.
 
 ## Phase 2 — customize for AWS
 
@@ -240,7 +213,7 @@ sudo ./02-customize-instance.sh /dev/nvme1n1
 | `COS_GRUB` | ESP renamed to `EFI/BOOT/BOOTX64.EFI` — the removable-media path AWS boots for a snapshot-registered AMI |
 | `COS_STATE` | `active.img`/`passive.img` `bootargs.cfg` → `console=ttyS0,115200n8` only, and `net.ifnames=0`; same settings mirrored into `grubcustom` so they survive an OS upgrade |
 | `COS_OEM` | `99_aws.yaml` + `aws/stage-initramfs.sh` + `aws/configure.sh` |
-| `COS_OEM` | `harvester.config` left alone — `mode: install` **must** stay |
+| `COS_OEM` | `harvester.config` — only `install.device` is patched; `mode: install` **must** stay |
 
 Options: `--grow-data-disk`, `--no-serial-console`.
 
@@ -279,6 +252,8 @@ no console at all.
 SNAP=$(aws ec2 create-snapshot --volume-id vol-xxxxxxxx \
         --description "harvester-v1.8.2" \
         --query SnapshotId --output text)
+
+# initial snapshot can take up to an hour
 aws ec2 wait snapshot-completed --snapshot-ids "$SNAP"
 
 aws ec2 register-image \
@@ -306,20 +281,37 @@ aws ec2 register-image \
   --key-name aws-testing
 ```
 
-Picks a free VIP from the subnet if you don't pass `--vip`, generates a token,
-builds the Harvester configuration, launches with nested virtualization on, and
-assigns the VIP as a secondary private IP on the instance's ENI.
+This picks a free VIP from the subnet if you don't pass `--vip`, generates a
+token, builds the Harvester configuration, launches with nested virtualization
+enabled, and assigns the VIP as a secondary private IP on the instance's ENI.
 
-`--mtu 9000` is worth passing if you intend to run a kube-ovn overlay later —
-it can only be set at install time, and it saves the GENEVE overhead. It is not
-required; the overlay works at the default 1500. See
-[VM networking on EC2](#vm-networking-on-ec2).
+`--mtu` defaults to 1500 and you should leave it there. What matters is that it
+is set *at all* — an unset MTU produces a node that cannot talk to other nodes.
+`--mtu 9000` is a deliberate opt-in, and `--mtu 0` reproduces the broken case.
+See [MTU](#mtu-set-it-explicitly).
 
 That is *create* mode, which bootstraps a new cluster. To add a node to an
 existing one, use `--join` — see [Clustering](#clustering).
 
 `--dry-run` prints the configuration and launch parameters without creating
 anything, and makes no API calls beyond the read-only preflight.
+
+The whole stack can also be deployed through a CloudFormation template found in this repository.
+
+**`validate-template` is a weak check.** It does not run transforms, and it does
+not check parameter defaults against their type. It will happily pass a template
+with a missing resource reference or an SSM path in an `AWS::EC2::Image::Id`
+default. Before trusting a change, create a change set and inspect the processed
+template:
+
+```bash
+aws cloudformation create-change-set --stack-name probe --change-set-name probe \
+  --change-set-type CREATE --template-body file://harvester-cluster.yaml \
+  --capabilities CAPABILITY_AUTO_EXPAND --parameters ...
+aws cloudformation get-template --stack-name probe --change-set-name probe \
+  --template-stage Processed
+aws cloudformation delete-stack --stack-name probe
+```
 
 ### The VIP
 
@@ -338,6 +330,7 @@ configured Harvester node is `mgmt-br`.
 | Port | |
 |---|---|
 | 22 | SSH |
+| 80 | HTTP for redirect |
 | 443 | Harvester UI and API, on the VIP |
 | 6443 | Kubernetes API |
 | 9345 | RKE2 supervisor |
@@ -367,11 +360,15 @@ the first node printed:
   --subnet subnet-xxxxxxxx \
   --sg sg-xxxxxxxx \
   --key-name aws-testing \
-  --mtu 9000 \
+  --mtu 1500 \
   --join 172.31.15.253 \
   --token harvester-aws-xxxxxxxxxxxxxxxx \
   --name harvester-node-2
 ```
+
+* `--mtu` must match whatever node 1 was launched with.
+* `--join` takes the cluster VIP, not a node address.
+* `--token` is the token node 1 printed.
 
 `--join` takes a bare address and expands it to `https://<addr>:443`, the same
 normalisation `getFormattedServerURL()` does in the installer. In join mode the
@@ -441,41 +438,6 @@ so `server_url` — **top-level in the config, not under `install`** — is the
 whole distinction. `install.mode: join` is set alongside it for consistency, but
 it is `server_url` that decides the shape.
 
-**Point `--join` at the VIP, not at a node.** This is the easy mistake and the
-failure is opaque. A node's own primary address answers on 443 perfectly well
-— `/ping` returns `pong` — but Rancher's certificate is issued for the VIP
-only, so rancherd fails verification and retries forever:
-
-```
-failed to bootstrap system, will retry: generating plan:
-Get "https://172.31.16.75:443/system-agent-install.sh": tls: failed to verify
-certificate: x509: certificate is valid for 10.52.0.6, 10.52.0.93,
-10.53.72.101, 172.31.31.251, not 172.31.16.75
-```
-
-The address in the SAN list that you did *not* use is the VIP. Because
-`rancherd.service` sets `TimeoutStartSec=0`, the unit never fails — it sits in
-`activating` indefinitely with no rke2 units ever created, which looks like a
-hang rather than an error.
-
-On AWS the two are easy to tell apart: a VIP is a **secondary** private address
-on the ENI, a node's own address is the **primary**. Phase 3 checks this before
-launching and refuses an address that is primary. To find the VIP by hand:
-
-```bash
-aws ec2 describe-network-interfaces \
-  --filters Name=attachment.instance-id,Values=i-xxxxxxxx \
-  --query 'NetworkInterfaces[].PrivateIpAddresses[?!Primary].PrivateIpAddress'
-```
-
-Note that filtering on `addresses.private-ip-address` matches the primary too,
-so it does **not** tell you whether an address is the VIP.
-
-**The port must be 443 or 8443.** `harv-update-rke2-server-url` rewrites the URL
-to the RKE2 supervisor port 9345, but only if it matches
-`^https://(.*):(8443|443)`. Any other port is left untouched and the node never
-joins, with nothing obvious in the logs. Phase 3 rejects it up front.
-
 ### Longhorn replicas do not follow the node count
 
 **Joining a node changes no replica count, anywhere.** Nothing in Harvester
@@ -491,48 +453,7 @@ ignored. It lands as the `numberOfReplicas` **parameter** on two StorageClasses,
 (`deploy/charts/harvester/templates/harvester-storageclass.yaml`), and Longhorn
 copies that into each Volume at provision time.
 
-So there are two separate things to change, and neither happens on its own:
-
-**New volumes** take their count from the StorageClass. StorageClass
-`parameters` are **immutable** in Kubernetes, so this cannot be edited in place
-— the StorageClass has to be deleted and recreated. `harvester-longhorn` is
-chart-managed (`harvesterhci.io/is-reserved-storageclass: "true"`), so raise the
-ManagedChart value and let Fleet recreate it:
-
-```bash
-kubectl -n fleet-local edit managedchart harvester
-#   spec.values.storageClass.replicaCount: 3
-```
-
-Deleting a StorageClass does not disturb existing PVs or PVCs — a bound PV
-already carries its own parameters and does not consult the class again.
-
-**Existing volumes** keep whatever count they were created with. Longhorn will
-rebuild onto the new node once you raise it per volume:
-
-```bash
-kubectl -n longhorn-system get volumes.longhorn.io
-kubectl -n longhorn-system patch volumes.longhorn.io <vol> \
-  --type=merge -p '{"spec":{"numberOfReplicas":3}}'
-
-# watch it heal: degraded -> healthy
-kubectl -n longhorn-system get volumes.longhorn.io <vol> \
-  -o jsonpath='{.status.robustness}{"\n"}'
-```
-
-**The trap:** once the cluster has more than one node, any single-replica volume
-**blocks upgrades**. `checkAllSingleReplicaVols()` in
-`pkg/webhook/resources/upgrade/validator.go` rejects the Upgrade resource with:
-
-> Following PVCs with single-replica volume, even the volume is detached,
-> upgrade may have potential data integrity concerns: …
-
-and it explicitly *skips the check when `len(nodes) == 1`*. So a single-node
-cluster at `replica_count: 1` is fine and upgrades cleanly — and the moment you
-join a second node, every volume you created before then starts blocking
-upgrades until you patch it.
-
-**The easy path:** if you intend a three-node cluster, bootstrap node 1 with
+If you intend a three-node cluster, bootstrap node 1 with
 `--replica-count 3` from the start. Volumes created while only one node exists
 sit at `Degraded` — Longhorn will not put two replicas of the same volume on one
 node — but they attach and run normally, and heal on their own as nodes 2 and 3
@@ -541,8 +462,7 @@ existing volume afterwards.
 
 ### MTU: set it explicitly
 
-**Leave `--mtu` unset and a multi-node cluster will not form.** This one cost
-real debugging time, so it is worth stating plainly.
+**Leave `--mtu` unset and a multi-node cluster will not form.** 
 
 harvester-installer only writes an `mtu=` line into the bridge and bond
 NetworkManager connections when the value is explicitly set
@@ -567,7 +487,7 @@ The bridge keeps ENA's 9001 while the bond and NIC underneath it sit at 1500.
 Sockets route via `mgmt-br`, so TCP derives an **8961 MSS** from the bridge and
 happily emits segments the bond then drops.
 
-The failure is nasty because it is size-dependent:
+The failure is hard to notice because it is size-dependent:
 
 | | |
 |---|---|
@@ -625,7 +545,7 @@ above 1500 and anything relying on PMTUD does not, and for a VM on the overlay
 that ICMP has to find its way back through GENEVE and `natOutgoing`. 1500
 removes the question.
 
-`--mtu 9000` is a reasonable opt-in if you want it. Everything stays inside the
+`--mtu 9000` is opt-in if you want it. Everything stays inside the
 VPC at 9001, and the clearest win is Longhorn replication between nodes, which
 is bulk transfer that never leaves the VPC. Treat it as an optimisation to
 adopt deliberately and measure, not a default. `--mtu 0` leaves it unset, which
@@ -633,7 +553,7 @@ is the broken case above; the script warns.
 
 ### The VIP does not fail over
 
-This is the honest limitation of the current setup. kube-vip advertises the VIP
+This is a limitation of the current setup. kube-vip advertises the VIP
 with gratuitous ARP, and **the VPC ignores ARP for address ownership** — an
 address reaches an instance only because it is registered on that instance's
 ENI. So if the node holding the VIP dies, kube-vip will happily elect a new
@@ -650,24 +570,186 @@ load balancer in front of the nodes' primary IPs on 443/6443 and treating *that*
 as the management endpoint. The NLB is the cleaner answer and is a natural fit
 for a CloudFormation template alongside the VPC, subnet and security group.
 
-### machine-id and SSH host keys
+---
 
-Every node launched from the same AMI could in principle share
-`/etc/machine-id`, since the AMI is a snapshot of an installed system rather
-than a fresh install. **Verified that it does not** — two nodes from the same
-AMI:
+## CloudFormation
+
+`harvester-cluster.yaml` deploys 1, 3 or 5 nodes from an AMI you have already
+built. It does not build the AMI — phases 0–2 still run by
+hand, and the AMI id is a parameter.
+
+```bash
+aws cloudformation create-stack \
+  --stack-name harvester \
+  --template-body file://harvester-cluster.yaml \
+  --parameters \
+    ParameterKey=AmiSsmParameter,ParameterValue=/harvester/ami/latest \
+    ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+    ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx \
+    ParameterKey=KeyName,ParameterValue=aws-testing \
+    ParameterKey=VipAddress,ParameterValue=172.31.31.251 \
+    ParameterKey=ClusterToken,ParameterValue="$(openssl rand -hex 16)" \
+    ParameterKey=AdminCidrs,ParameterValue='203.0.113.4/32\,198.51.100.0/24' \
+  --capabilities CAPABILITY_AUTO_EXPAND
+```
+
+`CAPABILITY_AUTO_EXPAND` is required — the template uses the
+`AWS::LanguageExtensions` transform. No IAM capability is needed; the stack
+creates no IAM resources.
+
+Note the escaped comma in `AdminCidrs`: the CLI splits `ParameterValue` on
+commas, so each comma *inside* the value must be `\,`.
+
+`AmiSsmParameter` is the **name of an SSM parameter**, not an AMI id — it
+defaults to `/harvester/ami/latest`, so deploying never involves pasting an AMI.
+Publish it once at the end of phase 2.5:
+
+```bash
+aws ssm put-parameter --name /harvester/ami/latest \
+  --type String --overwrite --value ami-xxxxxxxx
+```
+
+The parameter type is `AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>`, which
+resolves the name to an AMI id at deploy time. It will **not** accept a literal
+`ami-…` — that would be read as an SSM parameter name and fail the lookup. Use
+`AmiIdOverride` for a one-off image.
+
+Note that plain `AWS::EC2::Image::Id` with an SSM path as its default
+**validates fine and then fails at stack creation** — `validate-template` does
+not check defaults against their parameter type.
+
+### Admin access is a prefix list
+
+The stack owns a prefix list holding the admin CIDRs, and the security group
+carries **four rules** — 22, 80, 443, 6443 — referencing it, regardless of how
+many CIDRs there are. Adding or removing an admin range is a stack update to the
+prefix list, not a change to the security group.
+
+The CIDRs arrive as **one comma-separated parameter**, but the slots behind it
+are fixed.
+
+`Entries` is a variable-length array of objects. `Fn::ForEach` cannot build it —
+it **merges keys into the parent object**, so iterating over CIDRs fails at
+transform time with:
 
 ```
-harvester-05f81047acf2addd0:  2aaabdc89bf05cc6418ec5496aaadb11
-harvester-0d7cef94665fb5631:  0459a42072adeb5be69ff8cb6aab05c2
+Transform AWS::LanguageExtensions failed with:
+Duplicate key 'Cidr' when merging keys to parent object in Fn::ForEach
 ```
 
-The elemental layer regenerates it per node on first boot. harvester-installer
-never references machine-id at all, so nothing in the Harvester configuration
-path depends on it either way. No scrubbing step is needed in phase 2.
+What does work is `Fn::Length` (also from `AWS::LanguageExtensions`) guarding
+fixed slots. It resolves at transform time, so each slot is gated on "the list is
+at least this long", and an unused slot is removed entirely by `AWS::NoValue`
+rather than left blank — so the array shrinks to however many were supplied:
 
-Node identity is independent of this regardless: Kubernetes node names come from
-the hostname, which phase 3 sets per instance (`harvester-<instance-id>`).
+```yaml
+MaxEntries:
+  Fn::Length: !Ref AdminCidrs
+Entries:
+  - Cidr: !Select [0, !Ref AdminCidrs]
+    Description: Admin CIDR 1
+  - !If [HasCidr2, {Cidr: !Select [1, !Ref AdminCidrs], Description: Admin CIDR 2}, !Ref 'AWS::NoValue']
+```
+
+The guard is not optional: an out-of-range `Fn::Select` is a hard error, not an
+empty value. Raising the cap past 5 means one more condition and one more entry.
+
+Note the conditions are written in **long form** (`Fn::Not`, `Fn::Equals`).
+Short-form tags cannot nest that deeply — `!Not [!Equals [!Length [...], 1]]` is
+a YAML parse error.
+
+**Mind `MaxEntries`.** It is what counts against the security group's rule quota
+(60 by default), *not* the number of entries actually present — and it counts
+once per referencing rule. That is why it is computed with `Fn::Length` instead
+of hardcoded. The group carries four rules (22, 80, 443, 6443), so two CIDRs
+cost 8 of the 60 — where a fixed `MaxEntries: 5` would cost 20 whether or not
+the slots were used.
+
+### Source/destination check
+
+EC2 discards packets whose source or destination address is not the instance's
+own. That is fine for VM traffic leaving the cluster, which `natOutgoing` SNATs
+to the node address — but reaching VM addresses **from** the VPC requires the
+node to forward for the overlay CIDR, which the check blocks. The packets simply
+disappear; nothing logs anything.
+
+The `DisableSourceDestCheck` parameter reads as **"disable the check"**, not as the
+EC2 property of the same name — `true` disables it, `false` leaves EC2's normal
+behaviour in place. It defaults to `true`, because that is what a cluster
+running an overlay needs, and applies to node 1's ENI and to every other node's
+instance. Set it to `false` if you are not routing an overlay CIDR to these
+nodes.
+
+This replaces the manual `modify-instance-attribute --no-source-dest-check` step
+the script-based path needs.
+
+### Parameter sections
+
+The console renders each `ParameterGroup` as its own labelled section —
+Image, Placement, Cluster shape, Addresses, Storage, Advanced. CloudFormation
+has no real multi-page form, so that is as close as it gets.
+
+### It must use a launch template
+
+`AWS::EC2::Instance`'s `CpuOptions` does **not** expose `NestedVirtualization` —
+only `AWS::EC2::LaunchTemplate`'s does. Confirm for yourself:
+
+```bash
+aws cloudformation describe-type --type RESOURCE \
+  --type-name AWS::EC2::Instance --query Schema --output text | grep -c NestedVirtualization
+```
+
+Without it the nodes boot, fail `preflight.KVMHostCheck`, and KubeVirt has no
+`/dev/kvm`. So the CPU options live in launch templates and the instances
+reference them. There are three, differing only in user-data: `create` for node
+1, `join` for nodes 2-3, and `worker` for nodes 4-5 (which add
+`install.role=worker` so they are never promoted).
+
+### No wait conditions
+
+`DependsOn` is present on every joining node for a tidy event order, but nothing
+relies on it. CloudFormation calls an instance `CREATE_COMPLETE` once it is
+*running* — about 30 seconds, against the 15–25 minutes a bootstrap takes — so
+`DependsOn` cannot express "wait for the cluster".
+
+It does not need to. `rancherd.service` sets `TimeoutStartSec=0` and retries the
+join indefinitely, and rke2-agent retries every ~22 seconds. A node that starts
+before the cluster is up converges on its own. This was verified the hard way: a
+joining node sat in that loop for about two hours across three separate failures
+and completed as soon as each was fixed, with no restart.
+
+That avoids `AWS::CloudFormation::WaitCondition`, which would otherwise have
+meant signalling from inside the node — `cfn-signal` is a Python package that
+will not install on the immutable SLE Micro base, leaving a raw `curl -X PUT` to
+a presigned handle URL as the only option.
+
+### What the template does not do
+
+* **Build the AMI.** Phases 0–2, by hand.
+* **Create the VPC or subnet.** Both are parameters. The template assumes a
+  working subnet with outbound access.
+* **Validate the AMI or instance type.** CloudFormation cannot query EC2 for
+  boot mode or `nested-virtualization` support. Phase 3 does check both, so a
+  `./03-launch-instance.sh --dry-run` against the same AMI and instance type is
+  a worthwhile preflight before creating the stack.
+* **Set up kube-ovn.** The addon, the NAD and the Subnet are in-cluster
+  configuration applied after bootstrap — see
+  [VM networking on EC2](#vm-networking-on-ec2).
+* **Provide VIP failover.** The VIP is a secondary address on node 1's ENI and
+  stays there. See [The VIP does not fail over](#the-vip-does-not-fail-over).
+
+### Parameters worth thinking about
+
+| | |
+|---|---|
+| `NodeCount` | 1, 3 or 5. Two is not useful — promotion needs three. At 5, nodes 4 and 5 launch with `install.role=worker` so the management trio is nodes 1–3 by construction, not whichever three the controller picks. |
+| `InstanceType` | A dropdown restricted to nested-virtualization types that clear Harvester's 32 GiB floor. Regenerate it with `describe-instance-types --filters Name=processor-info.supported-features,Values=nested-virtualization`. |
+| `ReplicaCount` | Fixed at bootstrap. Use 3 for a cluster; 1 only for `NodeCount=1`. |
+| `Mtu` | Defaults to 1500. Do not remove it — see [MTU](#mtu-set-it-explicitly). |
+| `VipAddress` | The only address you pick. Node 1's own private address is assigned by EC2 as normal — the ENI declares just the VIP as a secondary. `PrivateIpAddressSpecification` requires both `PrivateIpAddress` and `Primary` on each *entry*, but does not require a `Primary: true` entry to be present. |
+| `AdminCidrs` | Comma-separated, **maximum 5**. Anything past the fifth is silently ignored. |
+| `AmiIdOverride` | Optional literal `ami-…`, bypassing the SSM lookup for a one-off image. |
+| `DisableSourceDestCheck` | Reads as *disable the check*: `true` (the default) disables it, `false` leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
 
 ---
 
@@ -810,6 +892,96 @@ easy mistake: `splitDHCPOptions()` never splits inside braces, so the result is
 one malformed option, `strings.Split(option, "=")` returns three parts,
 `parseDHCPOptions()` drops it, and you are back to no DNS with nothing logged.
 
+**5b. Set the subnet MTU explicitly.** kube-ovn derives the guest MTU from the
+**node interface MTU at daemon start**, minus the tunnel overhead
+(`pkg/daemon/config.go`):
+
+```go
+mtu = iface.MTU
+...
+config.MTU = mtu - util.GeneveHeaderLength   // GeneveHeaderLength = 100
+```
+
+That is a snapshot. If the kube-ovn daemon started while `mgmt-br` was still at
+ENA's 9001 — which is what happens when the node MTU was never set, see
+[MTU](#mtu-set-it-explicitly) — guests are handed **8901** over DHCP and then
+black-hole anything large on a path that only carries 1500. Fixing the node MTU
+afterwards does **not** recompute it.
+
+When this is wrong, the failure is **size-dependent**: small requests succeed
+and large transfers stall. That is the signature to look for. A failure that
+hits every packet size equally is *not* this — see
+[natOutgoing](#natoutgoing-is-not-set-by-the-ui), which presents as a total
+loss of off-node connectivity regardless of size.
+
+Pin it on the Subnet, which overrides the computed value
+(`pkg/controller/subnet.go`: `if subnet.Spec.Mtu > 0 { mtu = int(subnet.Spec.Mtu) }`)
+and flows into the DHCP options:
+
+```yaml
+spec:
+  mtu: 1400          # node MTU 1500 - 100 GENEVE overhead
+```
+
+Check what a guest actually got, from inside the VM:
+
+```bash
+ip link show            # look for the overlay NIC's mtu
+ping -M do -s 1372 1.1.1.1    # 1400-byte frame: should work
+ping -M do -s 8873 1.1.1.1    # 8901-byte frame: should fail
+```
+
+and from the cluster:
+
+```bash
+kubectl get subnet <name> -o jsonpath='{.spec.mtu}{"\n"}'
+```
+
+Guests need a new lease to pick up a changed value — reboot the VM, or renew
+its DHCP lease.
+
+### natOutgoing is not set by the UI
+
+**Create the Subnet with `kubectl`, not through the Harvester UI.** The UI's
+overlay network flow neither sets `natOutgoing` nor exposes it, so a subnet
+created that way comes up with NAT disabled and VMs cannot reach anything off
+the node:
+
+```
+NAME          PROVIDER                      CIDR            PRIVATE   NAT
+ovn-default   ovn                           10.54.0.0/16    false     true
+vm-overlay    overlay-network.default.ovn   10.60.0.0/24    false     false   <-- broken
+```
+
+The symptom pattern is distinctive, and worth learning because it looks like an
+MTU problem until you test more than one packet size:
+
+| From the VM to | Result |
+|---|---|
+| another node's IP | **works** |
+| the VPC resolver (`x.x.0.2`) | times out |
+| anything on the internet, **any packet size** | times out |
+| — and the same URLs work fine from an SSH session on the node | |
+
+A VM packet to another node is GENEVE-encapsulated, so what reaches the wire
+carries the *node's* address as the outer source and AWS is happy. A packet to
+the internet or to the VPC resolver is not an overlay destination, so it egresses
+`eth0` as an ordinary IP packet — and without SNAT it leaves with a `10.60.0.x`
+source, which Nitro drops because that address is not registered on the ENI. It
+is the same source-address enforcement that makes bridged networking impossible.
+
+The tell that separates this from an MTU black hole is that it is **completely
+size-independent**: a 500-byte ping fails exactly like a 1400-byte one.
+
+```bash
+kubectl get subnet -o wide                    # check the NAT column
+kubectl patch subnet <name> --type=merge -p '{"spec":{"natOutgoing":true}}'
+```
+
+The patch takes effect immediately — it is a router NAT rule, not something the
+guest holds, so no reboot and no new DHCP lease. Make sure your Subnet manifest
+carries `natOutgoing: true` as well, or re-applying it will quietly undo the fix.
+
 **6. Create a VM on that network.** Harvester's VM mutating webhook swaps the
 NIC's binding to `managedtap`
 (`harvester/pkg/webhook/resources/virtualmachine/mutator.go`) when the NAD is an
@@ -834,6 +1006,9 @@ aws ec2 create-route --route-table-id rtb-xxxxxxxx \
 
 aws ec2 modify-instance-attribute --instance-id i-xxxxxxxx --no-source-dest-check
 ```
+
+The CloudFormation template does the second part for you — see
+[Source/destination check](#sourcedestination-check).
 
 This works — but note it pins the overlay to one node's ENI, so it does not
 survive that node being replaced, and it does not load-balance across a cluster.
@@ -1113,34 +1288,3 @@ plus routes, which this repo does not set up.
 **Jumbo frames.** ENA defaults to MTU 9001, but `checkMTU()` caps
 `install.management_interface.mtu` at 9000, so you cannot match it exactly.
 Leaving it unset gives a 1500 MTU bond and bridge, which works fine.
-
----
-
-## What changed from the original attempt
-
-The previous version got the hard part right — building with `mode=install` and
-patching the ESP and GRUB — but nothing ever configured the node:
-
-* **Nothing produced `/oem/userdata.yaml`**, so the installer had nothing to act
-  on and sat at the TUI. This was the whole reason bootstrap never started.
-* `harvester-post-bootstrap.sh` tried to `helm install harvester` directly,
-  which skips the Fleet `ManagedChart` machinery and every prerequisite in
-  `rancherd-10-harvester.yaml` — it could start but never finish. It was also
-  never actually executed; `99_aws.yaml` copied it and printed "Bootstrap
-  triggered successfully" without running it.
-* **There was no network on first boot.** The image ships `no-auto-default=*`
-  and a `mode=install` image has no connection profiles, so `nmcli device
-  connect eth0` had nothing to activate and IMDS was unreachable.
-* `02-customize-instance.sh` referenced an undefined `$HVST_CFG` under `set -u`,
-  so it aborted partway through step 5 — the `tty`, `silent`, `replicacount`
-  and hostname edits and steps 6–7 never ran on any image.
-* The `sed` patches targeted a schema that doesn't exist: `sans: []` is not a
-  field of `Install`, and `s|mode: .*|mode: create|` also rewrites the
-  `vipmode:` line, producing an invalid vip mode.
-* `--cpu-options NestedVirtualization=enabled` was missing, so there would have
-  been no `/dev/kvm` regardless.
-* `OS_PASSWORD="rancher"` produced an unusable `/etc/shadow` entry.
-* kube-vip was patched to `vip_interface=eth0`; the correct interface is
-  `mgmt-br`, and the chart auto-detects it.
-
-`01-build-instace-bios.sh` stays deleted — Harvester requires UEFI.

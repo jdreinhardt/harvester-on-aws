@@ -1,0 +1,13 @@
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: vm-overlay
+spec:
+  vpc: ovn-cluster
+  provider: <overlay-network>.<overlay-namespace>.ovn  #overlay-network.default.ovn
+  cidrBlock: 10.60.0.0/24
+  gateway: 10.60.0.1
+  protocol: IPv4
+  natOutgoing: true # Important. Without it, VMs won't have internet access. This is not exposed in the UI.
+  enableDHCP: true
+  dhcpV4Options: "dns_server=172.31.0.2" # DHCP endpoint for VPC subnet

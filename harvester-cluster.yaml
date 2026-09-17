@@ -1,0 +1,613 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+# AWS::LanguageExtensions provides Fn::Length, which is what lets the admin
+# CIDRs arrive as one comma-separated parameter instead of numbered slots.
+# It is an AWS-provided macro -- nothing to install -- but it does mean the
+# template is only fully checked at change-set/create time, since
+# validate-template does not run transforms.
+Transform: AWS::LanguageExtensions
+
+Description: >-
+  Harvester (SUSE Virtualization) on EC2 -- 1, 3 or 5 nodes. Requires an AMI
+  built by phases 1 and 2 of this repository; the template launches and wires
+  it, it does not build it.
+
+# ---------------------------------------------------------------------------
+# Why launch templates rather than plain AWS::EC2::Instance resources:
+#
+# Harvester needs /dev/kvm, which on EC2 means nested virtualization, which is
+# opt-in per instance via CpuOptions. AWS::EC2::Instance's CpuOptions does NOT
+# expose NestedVirtualization -- only AWS::EC2::LaunchTemplate's does. Without
+# it the nodes boot and fail preflight.KVMHostCheck, and KubeVirt cannot run
+# guests. So CPU options live in launch templates and the instances reference
+# them.
+#
+# Three templates, differing only in user-data:
+#   create  node 1, mode=create, owns the VIP and the storage class
+#   join    nodes 2-3, mode=join, eligible for promotion
+#   worker  nodes 4-5, mode=join plus install.role=worker, never promoted
+# ---------------------------------------------------------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "1. Image"}
+        Parameters: [AmiSsmParameter, AmiIdOverride, InstanceType, KeyName]
+      - Label: {default: "2. Placement"}
+        Parameters: [VpcId, SubnetId]
+      - Label: {default: "3. Cluster shape"}
+        Parameters: [NodeCount, ClusterToken]
+      - Label: {default: "4. Addresses"}
+        Parameters: [VipAddress, AdminCidrs]
+      - Label: {default: "5. Storage"}
+        Parameters: [VolumeSize, ReplicaCount]
+      - Label: {default: "6. Advanced"}
+        Parameters: [DisableSourceDestCheck, Mtu, PasswordHash]
+    ParameterLabels:
+      AmiSsmParameter:          {default: "SSM Parameter Store Value"}
+      AmiIdOverride:  {default: "Raw AMI ID (optional, overrides SSM)"}
+      InstanceType:   {default: "Instance type"}
+      VpcId:          {default: "VPC"}
+      SubnetId:       {default: "Subnet"}
+      KeyName:        {default: "EC2 key pair"}
+      NodeCount:      {default: "Number of nodes"}
+      ClusterToken:   {default: "Cluster token"}
+      VipAddress:     {default: "Management VIP"}
+      AdminCidrs:     {default: "Admin CIDRs"}
+      VolumeSize:     {default: "Root volume size (GiB)"}
+      ReplicaCount:   {default: "Storage replica count"}
+      Mtu:            {default: "Management interface MTU"}
+      DisableSourceDestCheck: {default: "Disable EC2 source/destination check"}
+      PasswordHash:   {default: "OS password hash (optional)"}
+
+Parameters:
+
+  # --- 1. Image -----------------------------------------------------------
+  AmiSsmParameter:
+    # AWS::SSM::Parameter::Value<...> makes CloudFormation resolve this SSM
+    # parameter to an AMI id at deploy time. Plain AWS::EC2::Image::Id would
+    # reject the path -- and validate-template does NOT catch that, because it
+    # does not check defaults against their parameter type. The failure shows up
+    # only when you create the stack.
+    # Publish the id from phase 2.5:
+    #   aws ssm put-parameter --name /harvester/ami/latest \
+    #     --type String --overwrite --value ami-xxxxxxxx
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /harvester/ami/latest
+    Description: >-
+      The SSM Parameter Store value containing the AMI ID generated in phase 2.5.
+
+  AmiIdOverride:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^ami-[0-9a-f]{8,17}$'
+    Description: >-
+      Optional AMI ID string. When set it overrides Parameter Store value.
+
+  # aws ec2 describe-instance-types --filters Name=processor-info.supported-features,Values=nested-virtualization
+  InstanceType:
+    Type: String
+    Default: m8i.4xlarge
+    Description: >-
+      Currently only deploys on nested virtualization. Instance type must support UEFI.
+    AllowedValues:
+      - m8i.2xlarge      # 8 vCPU / 32 GiB -- minimum, installer warns
+      - m8i.4xlarge      # 16 vCPU / 64 GiB -- default
+      - m8i.8xlarge      # 32 vCPU / 128 GiB
+      - m8i.12xlarge     # 48 vCPU / 192 GiB
+      - m8i.16xlarge     # 64 vCPU / 256 GiB
+      - m7i.2xlarge      # 8 vCPU / 32 GiB
+      - m7i.4xlarge      # 16 vCPU / 64 GiB
+      - m7i.8xlarge      # 32 vCPU / 128 GiB
+      - m7i.12xlarge     # 48 vCPU / 192 GiB
+      - m7i.16xlarge     # 64 vCPU / 256 GiB
+      - c8i.4xlarge      # 16 vCPU / 32 GiB
+      - c8i.8xlarge      # 32 vCPU / 64 GiB
+      - c8i.12xlarge     # 48 vCPU / 96 GiB
+      - c8i.16xlarge     # 64 vCPU / 128 GiB
+      - c7i.4xlarge      # 16 vCPU / 32 GiB
+      - c7i.8xlarge      # 32 vCPU / 64 GiB
+      - c7i.12xlarge     # 48 vCPU / 96 GiB
+      - c7i.16xlarge     # 64 vCPU / 128 GiB
+      - r8i.2xlarge      # 8 vCPU / 64 GiB
+      - r8i.4xlarge      # 16 vCPU / 128 GiB
+      - r8i.8xlarge      # 32 vCPU / 256 GiB
+      - r8i.12xlarge     # 48 vCPU / 384 GiB
+      - r8i.16xlarge     # 64 vCPU / 512 GiB
+
+  # --- 2. Placement -------------------------------------------------------
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Where all nodes will be deployed.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Keypair added to allow for SSH into the nodes.
+
+  # --- 3. Cluster shape ---------------------------------------------------
+  NodeCount:
+    Type: String
+    Default: '3'
+    AllowedValues: ['1', '3', '5']
+    Description: >-
+      How large of a cluster to deploy.
+
+  ClusterToken:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Shared secret used for registering nodes with the cluster.
+
+  # --- 4. Addresses -------------------------------------------------------
+  VipAddress:
+    Type: String
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+    Description: >-
+      This is assigned as a SECONDARY private address on node 1.
+      It must be a free address in the subnet.
+
+  AdminCidrs:
+    Type: CommaDelimitedList
+    Description: >-
+      Comma-separated IPs allowed to reach SSH, the UI and the
+      Kubernetes API, e.g. "203.0.113.4/32,198.51.100.0/24".
+      Maximum supported CIDRs is five.
+
+  # --- 5. Storage ---------------------------------------------------------
+  VolumeSize:
+    Type: Number
+    Default: 250
+    MinValue: 250
+    Description: >-
+      Root volume in GiB. Minimum value is 250.
+
+  ReplicaCount:
+    Type: Number
+    Default: 3
+    AllowedValues: [1, 3]
+    Description: >-
+      Storage replicas. For single node clusters set to 1, otherwise leave at 3.
+
+  # --- 6. Advanced --------------------------------------------------------
+  DisableSourceDestCheck:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Will disable Source/Destination checking of packets on all nodes.
+      This is required to make the overlay network addressable on the VPC.
+
+  Mtu:
+    Type: Number
+    Default: 1500
+    MinValue: 576
+    MaxValue: 9000
+    Description: >-
+      Leave unless you know what you're doing. This allows overriding MTU on mgmt-bo.
+
+  PasswordHash:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: >-
+      Sets an OS password for rancher user (mkpasswd -m sha-512) different from the default set in phase 1.
+      Leave empty to use existing password. A plaintext value (not a hash) will effectively disable password login.
+
+Conditions:
+  IsCluster:   !Not [!Equals [!Ref NodeCount, '1']]
+  HasWorkers:  !Equals [!Ref NodeCount, '5']
+  HasPassword: !Not [!Equals [!Ref PasswordHash, '']]
+  # Fn::Length (AWS::LanguageExtensions) resolves at transform time, so each
+  # slot is guarded by "the list is not shorter than this". Without the guard an
+  # out-of-range Fn::Select is a hard error rather than an empty value.
+  HasCidr2:
+    Fn::Not:
+      - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 1]
+  HasCidr3:
+    Fn::Not:
+      - Fn::Or:
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 1]
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 2]
+  HasCidr4:
+    Fn::Not:
+      - Fn::Or:
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 1]
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 2]
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 3]
+  HasCidr5:
+    Fn::Not:
+      - Fn::Or:
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 1]
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 2]
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 3]
+          - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 4]
+  HasAmiOverride: !Not [!Equals [!Ref AmiIdOverride, '']]
+  # true on the parameter means DISABLE the check, so the EC2 property
+  # (which is the check itself) gets the opposite value.
+  DisableSdc:     !Equals [!Ref DisableSourceDestCheck, 'true']
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # Security
+  # -------------------------------------------------------------------------
+  # Admin sources live in a prefix list the stack owns, so the security group
+  # carries three rules regardless of how many CIDRs there are.
+  #
+  # Entries is a variable-length array of objects. Fn::ForEach cannot build it:
+  # it MERGES KEYS INTO THE PARENT OBJECT, so iterating over CIDRs fails with
+  # "Duplicate key 'Cidr' when merging keys to parent object". Fixed slots plus
+  # AWS::NoValue give the same result -- an unused slot removes its element
+  # rather than leaving a blank, so the array shrinks to the number supplied.
+  #
+  # MaxEntries is computed with Fn::Length so it matches what was actually
+  # given. That matters: MaxEntries, NOT the entry count, is what counts against
+  # the security group's rule quota (60 by default), once per referencing rule.
+  # Two CIDRs across three rules costs 6 of the 60; a hardcoded MaxEntries of 5
+  # would cost 15 whether or not the slots were used.
+  AdminPrefixList:
+    Type: AWS::EC2::PrefixList
+    Properties:
+      PrefixListName: !Sub '${AWS::StackName}-admin'
+      AddressFamily: IPv4
+      MaxEntries:
+        Fn::Length: !Ref AdminCidrs
+      Entries:
+        - Cidr: !Select [0, !Ref AdminCidrs]
+          Description: Admin CIDR 1
+        - !If [HasCidr2, {Cidr: !Select [1, !Ref AdminCidrs], Description: Admin CIDR 2}, !Ref 'AWS::NoValue']
+        - !If [HasCidr3, {Cidr: !Select [2, !Ref AdminCidrs], Description: Admin CIDR 3}, !Ref 'AWS::NoValue']
+        - !If [HasCidr4, {Cidr: !Select [3, !Ref AdminCidrs], Description: Admin CIDR 4}, !Ref 'AWS::NoValue']
+        - !If [HasCidr5, {Cidr: !Select [4, !Ref AdminCidrs], Description: Admin CIDR 5}, !Ref 'AWS::NoValue']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-admin'}
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Harvester nodes (${AWS::StackName})'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 22,   ToPort: 22,   SourcePrefixListId: !Ref AdminPrefixList, Description: SSH}
+        - {IpProtocol: tcp, FromPort: 80,   ToPort: 80,   SourcePrefixListId: !Ref AdminPrefixList, Description: Harvester UI HTTP}
+        - {IpProtocol: tcp, FromPort: 443,  ToPort: 443,  SourcePrefixListId: !Ref AdminPrefixList, Description: Harvester UI and API on the VIP}
+        - {IpProtocol: tcp, FromPort: 6443, ToPort: 6443, SourcePrefixListId: !Ref AdminPrefixList, Description: Kubernetes API}
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-nodes'}
+
+  # Node-to-node traffic. A separate resource because a security group cannot
+  # reference itself inside its own SecurityGroupIngress without a circular
+  # dependency. All protocols rather than an enumeration: etcd (2379-2380), the
+  # kubelet (10250), Longhorn (3260, 9500-9504), the RKE2 supervisor (9345) and
+  # kube-ovn's GENEVE tunnels (UDP 6081) all run node to node.
+  NodeSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: All traffic between cluster nodes
+
+  # -------------------------------------------------------------------------
+  # Node 1's ENI, carrying the VIP as a secondary address
+  # -------------------------------------------------------------------------
+  Node1Eni:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref SubnetId
+      GroupSet: [!Ref NodeSecurityGroup]
+      Description: !Sub 'Harvester node 1 (${AWS::StackName}) -- carries the management VIP'
+      # Only the VIP is pinned. A list containing just a Primary:false entry is
+      # accepted -- EC2 assigns node 1's own primary address from the subnet as
+      # it normally would. PrivateIpAddressSpecification requires BOTH fields on
+      # every entry, which is why Primary:false is spelled out rather than left
+      # off; it does not mean a primary entry has to be supplied.
+      SourceDestCheck: !If [DisableSdc, false, true]
+      PrivateIpAddresses:
+        - {PrivateIpAddress: !Ref VipAddress, Primary: false}
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-node-1'}
+
+  # -------------------------------------------------------------------------
+  # Launch templates
+  # -------------------------------------------------------------------------
+  # data_disk_size is fixed at "max" in all three user-data bodies: Longhorn
+  # takes everything left over on the volume, which is what you want in all but
+  # unusual cases. It is a constant rather than a parameter because
+  # CloudFormation has no hidden parameters -- one omitted from ParameterGroups
+  # still shows up under "Other parameters" in the console. Use
+  # 03-launch-instance.sh --data-disk-size when you need a different value.
+  CreateLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-create'
+      LaunchTemplateData:
+        ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        CpuOptions:
+          NestedVirtualization: enabled
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                aws:
+                  data_disk_size: "max"
+                scheme_version: 1
+                token: "${ClusterToken}"
+                install:
+                  automatic: true
+                  mode: create
+                  management_interface:
+                    interfaces:
+                      - name: eth0
+                    method: dhcp
+                    bond_options:
+                      mode: "active-backup"
+                      miimon: "100"
+                      fail_over_mac: "active"
+                    mtu: ${Mtu}
+                  vip: "${VipAddress}"
+                  vip_mode: static
+                  harvester:
+                    storage_class:
+                      replica_count: ${ReplicaCount}
+                ${OsSection}
+              - OsSection: !If
+                  - HasPassword
+                  - !Join ['', ['os:', "\n", '  password: "', !Ref PasswordHash, '"']]
+                  - '# no os overrides'
+
+  # server_url is top-level, not under install: its presence is what makes
+  # rancherd render "role: agent" instead of "role: cluster-init". Port 443 is
+  # required -- harv-update-rke2-server-url only rewrites 443 or 8443 to the
+  # RKE2 supervisor port 9345. No vip, no storage_class: both belong to the
+  # cluster, and genBootstrapResources() only runs for mode=create.
+  JoinLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: IsCluster
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-join'
+      LaunchTemplateData:
+        ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        CpuOptions:
+          NestedVirtualization: enabled
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                aws:
+                  data_disk_size: "max"
+                scheme_version: 1
+                token: "${ClusterToken}"
+                server_url: "https://${VipAddress}:443"
+                install:
+                  automatic: true
+                  mode: join
+                  management_interface:
+                    interfaces:
+                      - name: eth0
+                    method: dhcp
+                    bond_options:
+                      mode: "active-backup"
+                      miimon: "100"
+                      fail_over_mac: "active"
+                    mtu: ${Mtu}
+                ${OsSection}
+              - OsSection: !If
+                  - HasPassword
+                  - !Join ['', ['os:', "\n", '  password: "', !Ref PasswordHash, '"']]
+                  - '# no os overrides'
+
+  # As JoinLaunchTemplate plus install.role=worker. isWorkerPreferredNode() in
+  # promote_controller.go excludes these from promotion, so the three management
+  # nodes are 1-3 by construction rather than whichever three the controller
+  # happens to pick.
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HasWorkers
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-worker'
+      LaunchTemplateData:
+        ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        CpuOptions:
+          NestedVirtualization: enabled
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                aws:
+                  data_disk_size: "max"
+                scheme_version: 1
+                token: "${ClusterToken}"
+                server_url: "https://${VipAddress}:443"
+                install:
+                  automatic: true
+                  mode: join
+                  role: worker
+                  management_interface:
+                    interfaces:
+                      - name: eth0
+                    method: dhcp
+                    bond_options:
+                      mode: "active-backup"
+                      miimon: "100"
+                      fail_over_mac: "active"
+                    mtu: ${Mtu}
+                ${OsSection}
+              - OsSection: !If
+                  - HasPassword
+                  - !Join ['', ['os:', "\n", '  password: "', !Ref PasswordHash, '"']]
+                  - '# no os overrides'
+
+  # -------------------------------------------------------------------------
+  # Instances
+  #
+  # DependsOn gives a tidy stack event order, but nothing relies on it:
+  # CloudFormation calls an instance CREATE_COMPLETE once it is running, ~30
+  # seconds, against the 15-25 minutes a bootstrap takes. No WaitCondition is
+  # used because rancherd retries the join indefinitely (rancherd.service sets
+  # TimeoutStartSec=0) and rke2-agent retries every ~22s, so a node that starts
+  # before the cluster is up converges on its own.
+  # -------------------------------------------------------------------------
+  Node1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref CreateLaunchTemplate
+        Version: !GetAtt CreateLaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref Node1Eni
+          DeviceIndex: 0
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-node-1'}
+        - {Key: HarvesterRole, Value: create}
+
+  Node2:
+    Type: AWS::EC2::Instance
+    Condition: IsCluster
+    DependsOn: Node1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref JoinLaunchTemplate
+        Version: !GetAtt JoinLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref NodeSecurityGroup]
+      SourceDestCheck: !If [DisableSdc, false, true]
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-node-2'}
+        - {Key: HarvesterRole, Value: join}
+
+  Node3:
+    Type: AWS::EC2::Instance
+    Condition: IsCluster
+    DependsOn: Node1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref JoinLaunchTemplate
+        Version: !GetAtt JoinLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref NodeSecurityGroup]
+      SourceDestCheck: !If [DisableSdc, false, true]
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-node-3'}
+        - {Key: HarvesterRole, Value: join}
+
+  Node4:
+    Type: AWS::EC2::Instance
+    Condition: HasWorkers
+    DependsOn: Node1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref NodeSecurityGroup]
+      SourceDestCheck: !If [DisableSdc, false, true]
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-node-4'}
+        - {Key: HarvesterRole, Value: worker}
+
+  Node5:
+    Type: AWS::EC2::Instance
+    Condition: HasWorkers
+    DependsOn: Node1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref NodeSecurityGroup]
+      SourceDestCheck: !If [DisableSdc, false, true]
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-node-5'}
+        - {Key: HarvesterRole, Value: worker}
+
+Outputs:
+  DashboardUrl:
+    Description: Harvester UI, once the bootstrap finishes (admin / admin on first login)
+    Value: !Sub 'https://${VipAddress}'
+
+  Vip:
+    Description: Management VIP -- a secondary private address on node 1's ENI
+    Value: !Ref VipAddress
+
+  SecurityGroupId:
+    Value: !Ref NodeSecurityGroup
+
+  AdminPrefixListId:
+    Description: Prefix list holding the admin CIDRs. Edit via a stack update.
+    Value: !Ref AdminPrefixList
+
+  AmiInUse:
+    Description: The AMI the nodes were launched from
+    Value: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
+
+  Node1InstanceId:
+    Value: !Ref Node1
+
+  Node2InstanceId:
+    Condition: IsCluster
+    Value: !Ref Node2
+
+  Node3InstanceId:
+    Condition: IsCluster
+    Value: !Ref Node3
+
+  Node4InstanceId:
+    Condition: HasWorkers
+    Value: !Ref Node4
+
+  Node5InstanceId:
+    Condition: HasWorkers
+    Value: !Ref Node5
+
+  WatchBootstrap:
+    Description: Follow the first node coming up
+    Value: !Sub './follow-console.sh --instance-id ${Node1} --tee console.txt'
+
+  CheckCluster:
+    Description: Run on node 1. Promotion to control-plane,etcd only happens at three nodes.
+    Value: 'sudo kubectl get nodes'
+
+  GuestMtuReminder:
+    Description: kube-ovn derives the guest MTU from the node interface MTU minus 100 at daemon start
+    Value: !Sub 'Expected guest MTU on the overlay: ${Mtu} - 100'
