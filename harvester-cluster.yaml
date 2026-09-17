@@ -38,7 +38,7 @@ Metadata:
       - Label: {default: "3. Cluster shape"}
         Parameters: [NodeCount, ClusterToken]
       - Label: {default: "4. Addresses"}
-        Parameters: [VipAddress, AdminCidrs]
+        Parameters: [VipAddress, AdminCidrs, ManagementNlb]
       - Label: {default: "5. Storage"}
         Parameters: [VolumeSize, ReplicaCount]
       - Label: {default: "6. Advanced"}
@@ -54,6 +54,7 @@ Metadata:
       ClusterToken:   {default: "Cluster token"}
       VipAddress:     {default: "Management VIP"}
       AdminCidrs:     {default: "Admin CIDRs"}
+      ManagementNlb:  {default: "Management endpoints NLB"}
       VolumeSize:     {default: "Root volume size (GiB)"}
       ReplicaCount:   {default: "Storage replica count"}
       Mtu:            {default: "Management interface MTU"}
@@ -157,6 +158,15 @@ Parameters:
       Kubernetes API, e.g. "203.0.113.4/32,198.51.100.0/24".
       Maximum supported CIDRs is five.
 
+  ManagementNlb:
+    Type: String
+    Default: internet-facing
+    AllowedValues: [internet-facing, internal, none]
+    Description: >-
+      Deploys a NLB in front of the cluster to hande failover of both the web UI and
+      Kubernetes API.
+      internet-facing allocates an Elastic IP. none skips the load balancer.
+
   # --- 5. Storage ---------------------------------------------------------
   VolumeSize:
     Type: Number
@@ -229,6 +239,8 @@ Conditions:
   # true on the parameter means DISABLE the check, so the EC2 property
   # (which is the check itself) gets the opposite value.
   DisableSdc:     !Equals [!Ref DisableSourceDestCheck, 'true']
+  NlbEnabled:     !Not [!Equals [!Ref ManagementNlb, 'none']]
+  NlbPublic:      !Equals [!Ref ManagementNlb, 'internet-facing']
 
 Resources:
 
@@ -313,6 +325,160 @@ Resources:
         - {Key: Name, Value: !Sub '${AWS::StackName}-node-1'}
 
   # -------------------------------------------------------------------------
+  # Management endpoint
+  #
+  # Both 443 (UI) and 6443 (Kubernetes API) are balanced across the management
+  # nodes.
+  #
+  # harvester-installer writes the RKE2 server config carrying tls-san only on
+  # the bootstrap node (`if config.ServerURL == ""`), which suggests joined nodes
+  # would lack the SAN -- but that is not what happens. Inspecting a live
+  # three-node cluster, every node's kube-apiserver certificate carries the VIP:
+  #
+  #   node-1  SANs: ... IP Address:172.31.31.31, IP Address:172.31.22.206 ...
+  #   node-2  SANs: ... IP Address:172.31.31.31, IP Address:172.31.19.4  ...
+  #   node-3  SANs: ... IP Address:172.31.31.31, IP Address:172.31.16.19 ...
+  #
+  # RKE2 carries cluster-level tls-san to every server, so the value set once on
+  # node 1 reaches the rest. That is why `sans` below only needs to go into the
+  # create node's user-data, and why balancing 6443 is safe.
+  # -------------------------------------------------------------------------
+  NlbEip:
+    Type: AWS::EC2::EIP
+    Condition: NlbPublic
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-mgmt'}
+
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: NlbEnabled
+    Properties:
+      GroupDescription: !Sub 'Harvester management NLB (${AWS::StackName})'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443,  ToPort: 443,  SourcePrefixListId: !Ref AdminPrefixList, Description: Harvester UI}
+        - {IpProtocol: tcp, FromPort: 6443, ToPort: 6443, SourcePrefixListId: !Ref AdminPrefixList, Description: Kubernetes API}
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-nlb'}
+
+  # Health checks originate from the load balancer's own addresses, not from the
+  # client, so they need their own rule -- the AdminCidrs rules do not cover
+  # them. Client traffic still arrives with the real source address (client IP
+  # preservation is on by default for instance targets), so AdminCidrs remains
+  # the actual access control at the node.
+  NodeNlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbEnabled
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: NLB health checks (UI)
+
+  NodeNlbApiIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbEnabled
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6443
+      ToPort: 6443
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: NLB health checks (API)
+
+  ManagementLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: NlbEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-mgmt'
+      Type: network
+      Scheme: !If [NlbPublic, internet-facing, internal]
+      SecurityGroups: [!Ref NlbSecurityGroup]
+      SubnetMappings:
+        - SubnetId: !Ref SubnetId
+          AllocationId: !If [NlbPublic, !GetAtt NlbEip.AllocationId, !Ref 'AWS::NoValue']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-mgmt'}
+
+  # Only the management nodes are targets. Workers are excluded: promotion keeps
+  # the management plane on nodes 1-3 by construction, and that is where the UI
+  # is guaranteed to be served.
+  UiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: NlbEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-ui'
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 443
+      TargetType: instance
+      # An HTTPS probe rather than a TCP connect: the port is open long before
+      # Rancher is actually serving, and a bare connect would mark a node
+      # healthy mid-bootstrap.
+      HealthCheckProtocol: HTTPS
+      HealthCheckPath: /ping
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: {HttpCode: '200'}
+      Targets:
+        - Id: !Ref Node1
+        - !If [IsCluster, {Id: !Ref Node2}, !Ref 'AWS::NoValue']
+        - !If [IsCluster, {Id: !Ref Node3}, !Ref 'AWS::NoValue']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-ui'}
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: NlbEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 6443
+      TargetType: instance
+      # 401 is the healthy response. Every kube-apiserver endpoint -- /readyz,
+      # /livez, /healthz, /version -- requires authentication and answers 401
+      # unauthenticated, so matching 401 proves the apiserver is actually serving.
+      # A TCP connect would pass on a wedged apiserver that still holds the port.
+      HealthCheckProtocol: HTTPS
+      HealthCheckPath: /readyz
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: {HttpCode: '401'}
+      Targets:
+        - Id: !Ref Node1
+        - !If [IsCluster, {Id: !Ref Node2}, !Ref 'AWS::NoValue']
+        - !If [IsCluster, {Id: !Ref Node3}, !Ref 'AWS::NoValue']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-api'}
+
+  ApiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NlbEnabled
+    Properties:
+      LoadBalancerArn: !Ref ManagementLoadBalancer
+      Protocol: TCP
+      Port: 6443
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref ApiTargetGroup}
+
+  UiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NlbEnabled
+    Properties:
+      LoadBalancerArn: !Ref ManagementLoadBalancer
+      Protocol: TCP
+      Port: 443
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref UiTargetGroup}
+
+  # -------------------------------------------------------------------------
   # Launch templates
   # -------------------------------------------------------------------------
   # data_disk_size is fixed at "max" in all three user-data bodies: Longhorn
@@ -349,6 +515,7 @@ Resources:
                   data_disk_size: "max"
                 scheme_version: 1
                 token: "${ClusterToken}"
+                ${SansBlock}
                 install:
                   automatic: true
                   mode: create
@@ -371,6 +538,16 @@ Resources:
                   - HasPassword
                   - !Join ['', ['os:', "\n", '  password: "', !Ref PasswordHash, '"']]
                   - '# no os overrides'
+                # Extra TLS SANs for the load-balanced endpoint. Set only here:
+                # RKE2 propagates cluster-level tls-san to every server, so node
+                # 1's value covers nodes 2 and 3 once they are promoted.
+                SansBlock: !If
+                  - NlbEnabled
+                  - !If
+                    - NlbPublic
+                    - !Join ['', ['sans:', "\n", '  - ', !GetAtt ManagementLoadBalancer.DNSName, "\n", '  - ', !Ref NlbEip]]
+                    - !Join ['', ['sans:', "\n", '  - ', !GetAtt ManagementLoadBalancer.DNSName]]
+                  - '# no extra SANs'
 
   # server_url is top-level, not under install: its presence is what makes
   # rancherd render "role: agent" instead of "role: cluster-init". Port 443 is
@@ -599,6 +776,16 @@ Outputs:
   Node5InstanceId:
     Condition: HasWorkers
     Value: !Ref Node5
+
+  ManagementUrl:
+    Condition: NlbEnabled
+    Description: Load-balanced management endpoint -- survives losing a node
+    Value: !Sub 'https://${ManagementLoadBalancer.DNSName}'
+
+  ManagementPublicIp:
+    Condition: NlbPublic
+    Description: Fixed public address of the management endpoint
+    Value: !Ref NlbEip
 
   WatchBootstrap:
     Description: Follow the first node coming up

@@ -566,9 +566,12 @@ redundancy, but the management endpoint is still a single point of failure.
 Failing over means moving the secondary private IP between ENIs via the EC2 API
 (`unassign-private-ip-addresses` then `assign-private-ip-addresses`), which
 needs something watching the cluster with IAM permissions — or putting a network
-load balancer in front of the nodes' primary IPs on 443/6443 and treating *that*
-as the management endpoint. The NLB is the cleaner answer and is a natural fit
-for a CloudFormation template alongside the VPC, subnet and security group.
+load balancer in front of the nodes and treating *that* as the management
+endpoint.
+
+The CloudFormation template takes the second approach; see
+[Management endpoint](#management-endpoint). The VIP still does not move, but it
+stops being the thing you connect to.
 
 ---
 
@@ -723,6 +726,70 @@ meant signalling from inside the node — `cfn-signal` is a Python package that
 will not install on the immutable SLE Micro base, leaving a raw `curl -X PUT` to
 a presigned handle URL as the only option.
 
+### Management endpoint
+
+`ManagementNlb` puts a network load balancer in front of the nodes on 443 and 6443, which
+is what makes the management endpoint survive losing a node. Three values:
+
+| | |
+|---|---|
+| `internet-facing` (default) | Load balancer plus an Elastic IP, so the address is fixed and reachable from outside the VPC |
+| `internal` | Load balancer on a private address only |
+| `none` | No load balancer; the VIP stays the only endpoint |
+
+Every node runs the ingress and API, so any of them can serve the UI or respond to Kubernetes API requests.
+
+**Access control.** The prefix list is applied twice — once on the load
+balancer's own security group and again on the nodes. Client IP preservation is
+on by default for instance targets, so the nodes see the real client address and
+`AdminCidrs` is still what actually gates access. Health checks come from the
+load balancer's addresses rather than the client's, so they get their own rule
+referencing the load balancer's security group.
+
+With `internet-facing`, the UI is reachable from the internet by anyone inside
+`AdminCidrs`. Putting `0.0.0.0/0` there would publish it.
+
+**Health checks are HTTPS, not TCP connects.** Port 443 accepts connections well
+before Rancher is serving, so a bare connect would mark a node healthy part-way
+through its bootstrap. 443 probes `/ping` for a `200`.
+
+6443 probes `/readyz` for a **401**. Every kube-apiserver endpoint — `/readyz`,
+`/livez`, `/healthz`, `/version` — requires authentication and answers 401
+unauthenticated, so a 401 is proof the apiserver is actually serving. Matching
+200 would never pass; a TCP connect would pass even on a wedged apiserver still
+holding the port.
+
+**Production direction: ALB for the UI, NLB for the API.**
+
+The API must stay on a network load balancer. kubectl authenticates with
+**client certificates**, and an application load balancer terminates TLS — which
+ends the mTLS session at the load balancer and leaves the apiserver with no
+client certificate to authenticate. TLS passthrough is a requirement there.
+
+The UI has no such constraint, and an ALB buys real things for a production
+deployment:
+
+* An ACM certificate on a name you own, so the browser warning goes away and
+  renewal is automatic — the one thing this setup cannot fix today.
+* Authentication at the edge. An ALB can require OIDC or Cognito sign-in before
+  traffic ever reaches Rancher, which is a stronger control than a CIDR list.
+* Access logs and WAF, neither of which a network load balancer offers.
+* Separate exposure for each endpoint — the UI reachable by a wider group, the
+  API restricted to operators — instead of the single `AdminCidrs` list that
+  currently gates both.
+
+**One thing to fix at the same time.** `sans` currently carries the load
+balancer's AWS-generated hostname, which is **not stable** — replace the load
+balancer and the name changes, leaving a certificate SAN that no longer matches
+and a `kubectl` that fails until node 1's RKE2 config is corrected. A Route 53
+record in front of the endpoint, with *that* name in `sans`, survives load
+balancer replacement and is worth doing before anything depends on it.
+
+**What it does not fix:** all nodes are in one subnet, so this survives a node
+failure, not an availability zone failure. Spreading nodes across AZs would need
+the subnet list to become a parameter and would put Longhorn replication across
+zones — a separate decision.
+
 ### What the template does not do
 
 * **Build the AMI.** Phases 0–2, by hand.
@@ -735,8 +802,9 @@ a presigned handle URL as the only option.
 * **Set up kube-ovn.** The addon, the NAD and the Subnet are in-cluster
   configuration applied after bootstrap — see
   [VM networking on EC2](#vm-networking-on-ec2).
-* **Provide VIP failover.** The VIP is a secondary address on node 1's ENI and
-  stays there. See [The VIP does not fail over](#the-vip-does-not-fail-over).
+* **Make the VIP itself fail over.** It stays a secondary address on node 1's
+  ENI. The load balancer sidesteps this by becoming the endpoint instead — see
+  [Management endpoint](#management-endpoint).
 
 ### Parameters worth thinking about
 
@@ -749,6 +817,7 @@ a presigned handle URL as the only option.
 | `VipAddress` | The only address you pick. Node 1's own private address is assigned by EC2 as normal — the ENI declares just the VIP as a secondary. `PrivateIpAddressSpecification` requires both `PrivateIpAddress` and `Primary` on each *entry*, but does not require a `Primary: true` entry to be present. |
 | `AdminCidrs` | Comma-separated, **maximum 5**. Anything past the fifth is silently ignored. |
 | `AmiIdOverride` | Optional literal `ami-…`, bypassing the SSM lookup for a one-off image. |
+| `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 and 6443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
 | `DisableSourceDestCheck` | Reads as *disable the check*: `true` (the default) disables it, `false` leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
 
 ---
