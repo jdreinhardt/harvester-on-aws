@@ -3,6 +3,9 @@ artifacts/
 *.raw
 *.raw.zst
 .make/
-terraform/.terraform/
-terraform/*.tfstate*
-terraform/*.tfplan
+
+# terraform / opentofu -- these appear wherever you run it, not just in terraform/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan

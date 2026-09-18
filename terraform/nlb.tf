@@ -42,11 +42,14 @@ locals {
   # 6443 matches 401, not 200. Every kube-apiserver endpoint requires
   # authentication and answers 401 unauthenticated, so a 401 proves it is
   # serving; 200 would never pass. 9345 /ping answers 200 "pong" unauthenticated.
+  # No 9345 listener. The RKE2 supervisor's only clients are joining nodes, and
+  # those are registered targets, which cannot reach this load balancer at all --
+  # so the listener would have no reachable consumer. server_url uses the VIP for
+  # exactly that reason.
   target_groups = merge(
     { ui = { port = 443, path = "/ping", matcher = "200" } },
     local.cp_via_nlb ? {
-      api        = { port = 6443, path = "/readyz", matcher = "401" }
-      supervisor = { port = 9345, path = "/ping", matcher = "200" }
+      api = { port = 6443, path = "/readyz", matcher = "401" }
     } : {}
   )
 }

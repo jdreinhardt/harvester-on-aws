@@ -871,15 +871,38 @@ is what makes the management endpoint survive losing a node. Three values:
 
 Every node runs the ingress, so any of them can serve the UI.
 
-**The control plane needs `ControlPlaneViaNlb=true`, and an AMI that supports
-it.** With it on, the load balancer also gets a **6443** listener for kubectl, a
-**9345** listener for the RKE2 supervisor, and joining nodes point `server_url`
-at the load balancer instead of the VIP — so cluster expansion stops depending
-on node 1 being alive.
+**A load balancer cannot serve the cluster's own nodes.** This is the hard
+limit, and it was learned the expensive way.
 
-All three need the same thing: every node's certificates must carry the load
-balancer's name. harvester-installer writes the RKE2 config carrying `tls-san`
-only on the bootstrap node:
+A Network Load Balancer does not support hairpinning: **a registered target
+cannot connect to the load balancer it belongs to.** Disabling client IP
+preservation does *not* lift it — verified on a live cluster, where a joining
+node timed out on `https://<nlb>/cacerts` both before and after, while the
+identical request from outside the VPC returned instantly.
+
+Two consequences, both baked into the templates:
+
+* **`server_url` always points at the VIP**, never the load balancer. Joining
+  nodes are targets, so they cannot reach it. Cluster expansion therefore still
+  depends on node 1 being alive.
+* **There is no 9345 listener.** The RKE2 supervisor's only clients are joining
+  nodes, and those are targets — the listener would have no reachable consumer.
+
+`ControlPlaneViaNlb` therefore does something narrower than its name suggests:
+it adds a **6443** listener so the Kubernetes API is reachable **from outside
+the VPC** on an address that survives losing a node. It changes nothing for the
+nodes themselves.
+
+The broader conclusion is worth stating plainly, because it rules out a whole
+class of fix: a load balancer can give *external* clients an address that
+outlives any single node, but it can never give that to the **cluster's own
+members**. Anything cluster-internal — joins, the supervisor — needs an address
+that genuinely moves. That makes
+[`aws-vpc-move-ip`](#natoutgoing--check-it-is-set) the only mechanism that can
+work for it, not one option among several.
+
+**6443 still needs an AMI with the tls-san drop-in.** harvester-installer writes
+the RKE2 config carrying `tls-san` only on the bootstrap node:
 
 ```go
 if config.ServerURL == "" {
@@ -887,97 +910,27 @@ if config.ServerURL == "" {
 }
 ```
 
-Measured on a live three-node cluster with the installer's `sans` set, that
-leaves joined nodes short:
+Measured on a live cluster, the VIP reaches every node by some other,
+special-cased route, but SANs set through `sans` reach only node 1. Seeing the
+VIP everywhere is **not** evidence that extra SANs propagate. `configure.sh`
+fixes it by writing the drop-in itself on every node, from `aws.tls_sans` in
+user-data — with the VIP listed first, because an explicit `tls-san` replaces
+whatever supplies it implicitly and omitting it silently drops the VIP from a
+joined node's certificate.
 
-```
-node-1  ... DNS:<nlb>, IP:<eip>, IP:<vip> ...
-node-2  ... IP:<vip> ...     <- no load balancer name, no eip
-node-3  ... IP:<vip> ...     <- no load balancer name, no eip
-```
+Because the template cannot tell which AMI you are launching, 6443 is behind
+`ControlPlaneViaNlb`, default `false`.
 
-The VIP reaches every node; the SANs we set reach only node 1. Seeing the VIP
-everywhere is **not** evidence that extra SANs propagate — it arrives by some
-other, special-cased route.
+**Adding a node by hand.** Both templates emit ready-made join user-data —
+`JoinUserData` in CloudFormation, `join_user_data` and `worker_user_data` in
+Terraform — with the real VIP, TLS SANs, MTU and bond options already filled in.
+The cluster token is a **placeholder**: CloudFormation outputs have no `NoEcho`
+equivalent, so anything there is readable by anyone with `DescribeStacks`.
+Whoever is adding a node already has the token.
 
-`configure.sh` fixes this by writing the drop-in itself on **every** node before
-RKE2 first starts, from `aws.tls_sans` in user-data. Verified on a rebuilt
-image: all three nodes carry the VIP, the load balancer name and the Elastic IP,
-with no manual step.
-
-**The VIP must be in that list explicitly.** An explicit `tls-san` replaces
-whatever supplies it implicitly on a joined node — a drop-in listing only the
-load balancer names silently *removed* the VIP from that node's certificate.
-RKE2's own additions (`localhost`, the node name and IP, the service IP, the
-`kubernetes.*` names) are unaffected.
-
-Two useful things fell out of measuring rather than assuming:
-
-* The **supervisor certificate on 9345 is cluster-wide**, not per-node. Every
-  node presents an identical `CN=rke2` certificate listing all nodes plus the
-  extra SANs — which is why the 9345 listener works.
-* `/ping` on 9345 answers `200 pong` unauthenticated, so it gets an ordinary
-  health check. 6443 does not: every kube-apiserver endpoint requires
-  authentication and answers **401**, which is what that target group matches.
-  Matching 200 there would never pass, and a bare TCP connect would pass on a
-  wedged apiserver still holding the port.
-
-Because the template cannot tell which AMI you are launching, this is behind a
-switch, default `false`.
-
-**The template stays backward compatible at default settings.** `aws.tls_sans`
-is emitted whenever a load balancer exists, but an older `configure.sh` reads
-only `.aws.data_disk_size` and then `yq -i 'del(.aws)'` removes the whole block —
-so an unknown key is dropped silently and nothing breaks.
-
-| | image without the drop-in | image with it |
-|---|---|---|
-| `ControlPlaneViaNlb=false` (default) | works — `tls_sans` ignored, 443 only, `server_url` is the VIP | works |
-| `ControlPlaneViaNlb=true` | **fails** | works |
-
-The failure is at least a clean one. The installer's top-level `sans` is no
-longer set, so on an older image **no** node gets the load balancer's name —
-not even node 1 — and 6443 fails for every connection rather than only for the
-ones the balancer happens to route past node 1.
-
-To tell whether a running node has the fix:
-
-```bash
-ls -l /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml
-```
-
-Mind that `AmiSsmParameter` and `ControlPlaneViaNlb` sit in different sections of
-the console form, so a mismatch is easy to make. Keeping `/harvester/ami/latest`
-pointed at the newest working build — and version-pinned parameters beside it for
-anything older — is what makes the default combination correct.
-
-With the switch off, 443 still carries the Kubernetes API through Rancher's
-proxy at `/k8s/clusters/local`.
-
-**Retrofitting a running cluster** is the same drop-in by hand, one node at a
-time, waiting for each to come back:
-
-```bash
-sudo mkdir -p /etc/rancher/rke2/config.yaml.d
-sudo tee /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml >/dev/null <<'EOF'
-tls-san:
-  - 172.31.31.31          # the VIP -- omitting it drops the VIP from the cert
-  - my-nlb.elb.amazonaws.com
-  - 203.0.113.9
-EOF
-sudo rm -f /var/lib/rancher/rke2/server/tls/serving-kube-apiserver.crt /var/lib/rancher/rke2/server/tls/serving-kube-apiserver.key
-sudo systemctl restart rke2-server
-```
-
-Deleting the serving certificate is what forces regeneration; RKE2 will not
-rewrite an existing one just because the SAN list grew.
-
-**One caveat on the names.** The template puts the load balancer's generated
-`*.elb.amazonaws.com` hostname into the certificates. That name changes if the
-load balancer is replaced, silently invalidating every node's certificate and
-meaning the manual procedure above. A Route 53 record you control avoids that,
-and is the only route to a publicly trusted certificate — see
-[Production direction](#production-direction-alb-for-the-ui-nlb-for-the-api).
+The instance still needs the same AMI, nested virtualization enabled, IMDSv2,
+the cluster's security group and subnet, and a root volume of at least
+`VolumeSize`.
 
 **Access control.** The prefix list is applied twice — once on the load
 balancer's own security group and again on the nodes. Client IP preservation is

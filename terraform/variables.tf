@@ -125,11 +125,15 @@ variable "management_nlb" {
 variable "control_plane_via_nlb" {
   description = <<-EOT
     Also put 6443 (kubectl) and 9345 (RKE2 supervisor) behind the load balancer,
-    and point joining nodes at it so cluster expansion stops depending on node 1.
+    for reaching the Kubernetes API from OUTSIDE the VPC on an address that
+    survives losing a node.
+    It does NOT change where joining nodes point. A Network Load Balancer cannot
+    be reached by its own registered targets -- verified, and not fixable by
+    disabling client IP preservation -- so server_url always uses the VIP, and
+    cluster expansion still depends on node 1.
     Requires an AMI whose configure.sh writes the RKE2 tls-san drop-in on every
-    node. Without it no node carries the load balancer's name and both kubectl
-    and joins fail certificate verification. Nothing here can detect which AMI
-    you are using, hence the flag.
+    node; without it the nodes' certificates lack the load balancer's name and
+    kubectl fails verification whenever the balancer does not pick node 1.
   EOT
   type        = bool
   default     = false
@@ -199,7 +203,15 @@ variable "password_hash" {
 }
 
 variable "name_prefix" {
-  description = "Prefix for resource names and tags."
+  description = "Prefix for resource names and tags. Must be unique per deployment: several of these names are account-unique."
   type        = string
   default     = "harvester"
+
+  validation {
+    # Target group names are capped at 32 characters and the longest suffix this
+    # module appends is "-supervisor" (11). Without this the failure arrives at
+    # apply time, from AWS, after most of the cluster already exists.
+    condition     = length(var.name_prefix) <= 21
+    error_message = "name_prefix must be 21 characters or fewer (target group names are capped at 32, and \"-supervisor\" takes 11)."
+  }
 }

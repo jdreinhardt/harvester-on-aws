@@ -32,10 +32,18 @@ locals {
     local.nlb_public ? [aws_eip.nlb[0].public_ip] : []
   ) : []
 
-  # harv-update-rke2-server-url rewrites this host's port from 443 to 9345 for
-  # rke2-agent, so the load balancer needs both listeners -- which is what
-  # control_plane_via_nlb adds.
-  join_endpoint = local.cp_via_nlb ? "https://${aws_lb.mgmt[0].dns_name}:443" : "https://${var.vip_address}:443"
+  # Always the VIP, never the load balancer. A Network Load Balancer does not
+  # support hairpinning: a registered target cannot connect to the load balancer
+  # it belongs to, and disabling client IP preservation does NOT lift that --
+  # verified on a live cluster, where a joining node timed out on
+  # https://<nlb>/cacerts either way while the same request from outside the VPC
+  # succeeded.
+  #
+  # So joining nodes must reach the control plane directly, which means the VIP,
+  # which means cluster expansion still depends on node 1 being alive. Fixing
+  # that needs an address that can actually move -- see the aws-vpc-move-ip note
+  # in the readme -- not a load balancer.
+  join_endpoint = "https://${var.vip_address}:443"
 }
 
 data "aws_ssm_parameter" "ami" {
@@ -106,6 +114,28 @@ resource "aws_vpc_security_group_ingress_rule" "overlay_clients" {
   description       = "Clients allowed to reach overlay VMs"
 }
 
+# Terraform's aws_security_group REMOVES the default allow-all egress rule when
+# no egress block is declared -- unlike CloudFormation's AWS::EC2::SecurityGroup,
+# which leaves AWS's default in place. Without these the cluster fails in a
+# thoroughly confusing way: node 1 comes up fine (inbound works, and its images
+# are preloaded in the AMI so it needs nothing outbound), while nodes 2 and 3
+# never join and every load balancer health check fails.
+resource "aws_vpc_security_group_egress_rule" "nodes" {
+  security_group_id = aws_security_group.nodes.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "All outbound"
+}
+
+resource "aws_vpc_security_group_egress_rule" "nlb" {
+  count = local.nlb_enabled ? 1 : 0
+
+  security_group_id = aws_security_group.nlb[0].id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "All outbound -- health checks to the targets"
+}
+
 resource "aws_security_group" "nlb" {
   count = local.nlb_enabled ? 1 : 0
 
@@ -116,7 +146,7 @@ resource "aws_security_group" "nlb" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "nlb_ports" {
-  for_each = local.nlb_enabled ? { for p in concat([443], local.cp_via_nlb ? [6443, 9345] : []) : tostring(p) => p } : {}
+  for_each = local.nlb_enabled ? { for p in concat([443], local.cp_via_nlb ? [6443] : []) : tostring(p) => p } : {}
 
   security_group_id = aws_security_group.nlb[0].id
   ip_protocol       = "tcp"
@@ -131,7 +161,7 @@ resource "aws_vpc_security_group_ingress_rule" "nlb_ports" {
 # address (client IP preservation is on by default for instance targets), so
 # admin_cidrs remains the actual access control at the node.
 resource "aws_vpc_security_group_ingress_rule" "nlb_health" {
-  for_each = local.nlb_enabled ? { for p in concat([443], local.cp_via_nlb ? [6443, 9345] : []) : tostring(p) => p } : {}
+  for_each = local.nlb_enabled ? { for p in concat([443], local.cp_via_nlb ? [6443] : []) : tostring(p) => p } : {}
 
   security_group_id            = aws_security_group.nodes.id
   ip_protocol                  = "tcp"

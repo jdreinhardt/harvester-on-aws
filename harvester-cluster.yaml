@@ -200,7 +200,7 @@ Parameters:
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      Put the control plane ports (6443 and 9345) behind the NLB as well as the UI. Also sets the server_url to the NLB IP for failover.
+      Put the Kubernetes API port (6443) behind the NLB as well as the UI.
 
   DisableSourceDestCheck:
     Type: String
@@ -399,7 +399,6 @@ Resources:
       SecurityGroupIngress:
         - {IpProtocol: tcp, FromPort: 443, ToPort: 443, SourcePrefixListId: !Ref AdminPrefixList, Description: Harvester UI and API}
         - !If [ControlPlaneNlb, {IpProtocol: tcp, FromPort: 6443, ToPort: 6443, SourcePrefixListId: !Ref AdminPrefixList, Description: Kubernetes API}, !Ref 'AWS::NoValue']
-        - !If [ControlPlaneNlb, {IpProtocol: tcp, FromPort: 9345, ToPort: 9345, SourcePrefixListId: !Ref AdminPrefixList, Description: RKE2 supervisor}, !Ref 'AWS::NoValue']
       Tags:
         - {Key: Name, Value: !Sub '${AWS::StackName}-nlb'}
 
@@ -429,17 +428,6 @@ Resources:
       ToPort: 6443
       SourceSecurityGroupId: !Ref NlbSecurityGroup
       Description: NLB health checks (API)
-
-  NodeNlbSupervisorIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Condition: ControlPlaneNlb
-    Properties:
-      GroupId: !Ref NodeSecurityGroup
-      IpProtocol: tcp
-      FromPort: 9345
-      ToPort: 9345
-      SourceSecurityGroupId: !Ref NlbSecurityGroup
-      Description: NLB health checks (supervisor)
 
   ManagementLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
@@ -508,40 +496,6 @@ Resources:
         - !If [IsCluster, {Id: !Ref Node3}, !Ref 'AWS::NoValue']
       Tags:
         - {Key: Name, Value: !Sub '${AWS::StackName}-api'}
-
-  SupervisorTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Condition: ControlPlaneNlb
-    Properties:
-      Name: !Sub '${AWS::StackName}-sup'
-      VpcId: !Ref VpcId
-      Protocol: TCP
-      Port: 9345
-      TargetType: instance
-      # /ping on the supervisor answers 200 "pong" unauthenticated (measured),
-      # so unlike 6443 this gets an ordinary 200 check.
-      HealthCheckProtocol: HTTPS
-      HealthCheckPath: /ping
-      HealthCheckIntervalSeconds: 10
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 2
-      Matcher: {HttpCode: '200'}
-      Targets:
-        - Id: !Ref Node1
-        - !If [IsCluster, {Id: !Ref Node2}, !Ref 'AWS::NoValue']
-        - !If [IsCluster, {Id: !Ref Node3}, !Ref 'AWS::NoValue']
-      Tags:
-        - {Key: Name, Value: !Sub '${AWS::StackName}-sup'}
-
-  SupervisorListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: ControlPlaneNlb
-    Properties:
-      LoadBalancerArn: !Ref ManagementLoadBalancer
-      Protocol: TCP
-      Port: 9345
-      DefaultActions:
-        - {Type: forward, TargetGroupArn: !Ref SupervisorTargetGroup}
 
   ApiListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -694,14 +648,13 @@ Resources:
                 # first because an explicit tls-san replaces whatever supplies it
                 # implicitly on a joined node -- omitting it silently drops the
                 # VIP from that node's certificate (measured on a live cluster).
-                # harv-update-rke2-server-url rewrites this host's port from 443
-                # to 9345 for rke2-agent, so the load balancer needs both
-                # listeners. Pointing at it means a joining node no longer
-                # depends on node 1 being alive.
-                JoinEndpoint: !If
-                  - ControlPlaneNlb
-                  - !Join ['', ['https://', !GetAtt ManagementLoadBalancer.DNSName, ':443']]
-                  - !Join ['', ['https://', !Ref VipAddress, ':443']]
+                # Always the VIP, never the load balancer. A Network Load
+                # Balancer does not support hairpinning: a registered target
+                # cannot reach the load balancer it belongs to, and disabling
+                # client IP preservation does NOT lift that -- verified on a
+                # live cluster. Joins therefore still depend on node 1; only an
+                # address that can actually move fixes that.
+                JoinEndpoint: !Join ['', ['https://', !Ref VipAddress, ':443']]
                 TlsSansBlock: !If
                   - NlbEnabled
                   - !If
@@ -768,14 +721,13 @@ Resources:
                 # first because an explicit tls-san replaces whatever supplies it
                 # implicitly on a joined node -- omitting it silently drops the
                 # VIP from that node's certificate (measured on a live cluster).
-                # harv-update-rke2-server-url rewrites this host's port from 443
-                # to 9345 for rke2-agent, so the load balancer needs both
-                # listeners. Pointing at it means a joining node no longer
-                # depends on node 1 being alive.
-                JoinEndpoint: !If
-                  - ControlPlaneNlb
-                  - !Join ['', ['https://', !GetAtt ManagementLoadBalancer.DNSName, ':443']]
-                  - !Join ['', ['https://', !Ref VipAddress, ':443']]
+                # Always the VIP, never the load balancer. A Network Load
+                # Balancer does not support hairpinning: a registered target
+                # cannot reach the load balancer it belongs to, and disabling
+                # client IP preservation does NOT lift that -- verified on a
+                # live cluster. Joins therefore still depend on node 1; only an
+                # address that can actually move fixes that.
+                JoinEndpoint: !Join ['', ['https://', !Ref VipAddress, ':443']]
                 TlsSansBlock: !If
                   - NlbEnabled
                   - !If
@@ -915,6 +867,47 @@ Outputs:
     Condition: NlbPublic
     Description: Fixed public address of the management endpoint
     Value: !Ref NlbEip
+
+  # Ready-made user-data for adding a node by hand.
+  #
+  # The token is a PLACEHOLDER, deliberately. CloudFormation outputs have no
+  # NoEcho equivalent -- anything here is readable by anyone with
+  # DescribeStacks -- and ClusterToken is NoEcho as a parameter precisely so it
+  # does not leak. Whoever adds a node already has it.
+  #
+  # NOTE: this repeats the user-data body that the three launch templates carry
+  # inline. If you change one, change this too.
+  JoinUserData:
+    Description: >-
+      User-data for manually adding a management node (replace the token). The
+      instance also needs the same AMI, nested virtualization enabled, IMDSv2,
+      this security group and subnet, and a root volume of at least VolumeSize.
+    Value: !Sub
+      - |
+        aws:
+          data_disk_size: "max"${TlsSansBlock}
+        scheme_version: 1
+        token: "REPLACE_WITH_CLUSTER_TOKEN"
+        server_url: "https://${VipAddress}:443"
+        install:
+          automatic: true
+          mode: join
+          management_interface:
+            interfaces:
+              - name: eth0
+            method: dhcp
+            bond_options:
+              mode: "active-backup"
+              miimon: "100"
+              fail_over_mac: "active"
+            mtu: ${Mtu}
+      - TlsSansBlock: !If
+          - NlbEnabled
+          - !If
+            - NlbPublic
+            - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName, "\n", '    - ', !Ref NlbEip]]
+            - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName]]
+          - ''
 
   WatchBootstrap:
     Description: Follow the first node coming up
