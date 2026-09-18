@@ -2,3 +2,4 @@ console*.txt
 artifacts/
 *.raw
 *.raw.zst
+.make/

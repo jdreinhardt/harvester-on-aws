@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Run this as root on the helper instance.
 #
-#   sudo ./01b-write-image.sh \
+#   sudo ./scripts/01b-write-image.sh \
 #       --source s3://suse-virtualization-testing/harvester-v1.8.2-amd64.raw.zst \
 #       --device /dev/nvme1n1
 #
@@ -275,5 +275,5 @@ cat <<DONE
 Image written and verified
 =============================================
 
-Next: sudo ./02-customize-instance.sh $DEVICE
+Next: sudo ./scripts/02-customize-instance.sh $DEVICE
 DONE

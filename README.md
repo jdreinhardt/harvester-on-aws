@@ -7,6 +7,106 @@ the deployment.
 
 Targets Harvester **v1.8.2**.
 
+For a high-level account of what this does and why — rather than how — see
+[OVERVIEW.md](OVERVIEW.md).
+
+---
+
+## Quick start
+
+```bash
+make ami SUBNET_ID=subnet-xxxxxxxx KEY_NAME=my-key
+```
+
+That builds an AMI end to end — roughly two hours, most of it the install and
+the snapshot — and publishes the id to SSM, where the CloudFormation template
+picks it up. Then:
+
+```bash
+make teardown        # remove the helper instance, volume and security group
+```
+
+The Makefile only fills the gaps between the numbered scripts: AWS resource
+lifecycle, SSH, and snapshot polling. The scripts remain the single source of
+truth, and the phase-by-phase instructions below still work by hand.
+
+Everything happens on the helper instance, **including the QEMU install**.
+`01-build-instance.sh --device` writes straight to the attached EBS volume, so
+there is no raw image file, no `zstd`, and no S3 round trip — phases 1 and 1.5
+collapse into one step, and `01b-write-image.sh` is only needed if you are
+moving a prebuilt image around.
+
+Progress is stamped under `.make/`, so an interrupted run resumes instead of
+repeating the install. That also means **`make ami` is a no-op after a
+successful run** — `.make/ami-id` already exists. To build again:
+
+```bash
+make rebuild        # teardown + clear the stamps
+make ami ...
+```
+
+`rebuild` prints the previous snapshot and AMI ids rather than deleting them, so
+nothing is orphaned silently. `make clean` is the gentler version: it clears the
+build stamps but keeps `snapshot-id` and `ami-id`.
+
+**AMI names are unique per account per region.** `register-image` rejects a
+duplicate rather than overwriting, and it does so at the *very end* of a
+two-hour build. So `AMI_NAME` defaults to
+`harvester-$(HARVESTER_VERSION)-$(BUILD_ID)` with a timestamp, and successive
+builds never collide. If you pin `AMI_NAME` yourself, `make check` verifies it
+is free before anything is created.
+
+| | |
+|---|---|
+| Required | `SUBNET_ID`, `KEY_NAME` |
+| Optional | `HARVESTER_VERSION`, `HELPER_OS`, `HELPER_TYPE`, `HELPER_ROOT_SIZE`, `VOLUME_SIZE`, `SSM_PARAMETER`, `SSH_CIDR`, `KEY_FILE`, `AMI_NAME`, `BUILD_ID` |
+
+`HELPER_ROOT_SIZE` (default 60 GiB) is the helper's **own** disk, not the build
+target. It has to hold the Harvester ISO plus the QEMU and OVMF packages, and
+distro defaults are far too small — AL2023 ships an 8 GiB root, which the ISO
+download fills and fails with `curl: (23) Failure writing output to destination`.
+
+The root device name is read from the AMI rather than assumed, because it
+differs by distro (`/dev/xvda` on AL2023, `/dev/sda1` on Ubuntu). A block device
+mapping that does not match the AMI's root device does not resize the root — it
+silently attaches an **extra** volume and leaves the root at its default size.
+
+`HELPER_OS` is `al2023` (default) or `ubuntu`. Only four things differ between
+them and the Makefile switches all four — package names, the login user, and the
+two OVMF paths, which `01-build-instance.sh` takes as environment variables:
+
+| | al2023 | ubuntu |
+|---|---|---|
+| Packages | `qemu-system-x86 qemu-img edk2-ovmf` | `qemu-system-x86 qemu-utils ovmf` |
+| Login user | `ec2-user` | `ubuntu` |
+| OVMF | `/usr/share/OVMF/OVMF_CODE.fd` | `/usr/share/OVMF/OVMF_CODE_4M.fd` |
+
+**Building a different Harvester version** is just the version variable:
+
+```bash
+make ami SUBNET_ID=subnet-xxxxxxxx KEY_NAME=my-key \
+  HARVESTER_VERSION=v1.9.0 SSM_PARAMETER=/harvester/ami/v1.9.0
+```
+
+Pass `SSM_PARAMETER` as well when you are testing. Left at its default the build
+repoints `/harvester/ami/latest`, which is what the CloudFormation template
+reads — so the next stack deploy would silently pick up the new, untested image.
+
+The version only selects download URLs and file names. Nothing else is pinned to
+a release, but a new one is genuinely untested, and the first things that would
+surface a change are the partition count check at the end of phase 1 (it expects
+six) and the configuration schema (`scheme_version: 1`).
+
+The helper defaults to `m8i.4xlarge` because it needs **nested virtualization**
+for the same reason the Harvester nodes do — the install imports several GB of
+container images through a real RKE2 server, and software emulation turns an
+hour into days. The Makefile launches it with
+`--cpu-options NestedVirtualization=enabled`, which is **launch-time only**: a
+supported instance type still has no `/dev/kvm` without it, and it cannot be
+turned on afterwards. If a helper somehow comes up without it, `make teardown`
+and relaunch — there is no way to fix it in place. `SSH_CIDR` defaults to this machine's public address rather than
+opening SSH to the world.
+
 ---
 
 ## How it works
@@ -118,7 +218,7 @@ harvester-v1.8.2-initrd-amd64
 ## Phase 1 — build the raw image
 
 ```bash
-./01-build-instance.sh
+./scripts/01-build-instance.sh
 ```
 
 Produces `artifacts/harvester-v1.8.2-amd64.raw{,.zst}` — 250 GiB by default,
@@ -129,6 +229,11 @@ the resulting partition table before it compresses. It needs no root.
 
 While QEMU runs, the terminal belongs to the guest. **Ctrl-C goes to the guest;
 Ctrl-A then X aborts.** The script restores the terminal on exit either way.
+
+`--device /dev/nvmeXn1` installs straight onto a block device instead of a raw
+file — what `make ami` uses on the helper instance, and what makes phase 1.5
+unnecessary. It needs root, refuses the machine's own root disk, and skips the
+compression step. The rest of this section describes the file-based path.
 
 `--force` rebuilds over an existing image. Without it the script refuses,
 because a failed *script* is not the same as a failed *install* — if the guest
@@ -179,7 +284,7 @@ Attach a volume of **exactly `DISK_SIZE_GIB`** to a helper instance (250 GiB
 by default). Then:
 
 ```bash
-sudo ./01b-write-image.sh --source s3://your-bucket/harvester-v1.8.2-amd64.raw.zst --device /dev/nvme1n1
+sudo ./scripts/01b-write-image.sh --source s3://your-bucket/harvester-v1.8.2-amd64.raw.zst --device /dev/nvme1n1
 ```
 
 > `01b-write-image.sh` fetches the object in ranged chunks instead. Each chunk
@@ -205,7 +310,7 @@ sudo ./01b-write-image.sh --source s3://your-bucket/harvester-v1.8.2-amd64.raw.z
 ## Phase 2 — customize for AWS
 
 ```bash
-sudo ./02-customize-instance.sh /dev/nvme1n1
+sudo ./scripts/02-customize-instance.sh /dev/nvme1n1
 ```
 
 | | |
@@ -253,8 +358,14 @@ SNAP=$(aws ec2 create-snapshot --volume-id vol-xxxxxxxx \
         --description "harvester-v1.8.2" \
         --query SnapshotId --output text)
 
-# initial snapshot can take up to an hour
-aws ec2 wait snapshot-completed --snapshot-ids "$SNAP"
+# Poll rather than `aws ec2 wait snapshot-completed`. Every EC2 waiter gives up
+# after 40 attempts at 15s -- 10 minutes -- and a first snapshot of a 250 GiB
+# volume routinely takes an hour, so the waiter exits non-zero while the
+# snapshot is still pending.
+until [ "$(aws ec2 describe-snapshots --snapshot-ids "$SNAP" \
+          --query 'Snapshots[0].State' --output text)" = completed ]; do
+  sleep 30
+done
 
 aws ec2 register-image \
   --name "harvester-v1.8.2" \
@@ -274,7 +385,7 @@ aws ec2 register-image \
 ## Phase 3 — launch
 
 ```bash
-./03-launch-instance.sh \
+./scripts/03-launch-instance.sh \
   --ami ami-xxxxxxxx \
   --subnet subnet-xxxxxxxx \
   --sg sg-xxxxxxxx \
@@ -355,7 +466,7 @@ Add nodes with `--join`, pointing at the existing cluster and passing the token
 the first node printed:
 
 ```bash
-./03-launch-instance.sh \
+./scripts/03-launch-instance.sh \
   --ami ami-xxxxxxxx \
   --subnet subnet-xxxxxxxx \
   --sg sg-xxxxxxxx \
@@ -563,6 +674,26 @@ node's ENI.
 In other words: clustering gives you Kubernetes-level and Longhorn-level
 redundancy, but the management endpoint is still a single point of failure.
 
+**There is a second, quieter problem: nothing keeps kube-vip and AWS in sync.**
+
+Two independent facts make the VIP work today:
+
+1. kube-vip elects a leader and binds the VIP on **that** node's `mgmt-br`.
+2. AWS routes the VIP to node 1's ENI, because that is where CloudFormation
+   registered it as a secondary private address at stack creation.
+
+Nothing enforces that these agree. They line up because node 1 won the lease
+first and keeps renewing it. If kube-vip ever re-elects while node 1 is still
+healthy — a pod restart, a missed lease renewal — the VIP ends up bound on one
+node and routed to another, and simply stops answering. No failure event, no
+error, just an address that goes dark. Rebinding it is a kube-vip concern; the
+route is an AWS one, and neither knows about the other.
+
+The load balancer sidesteps this entirely, which is the main reason to treat it
+as the real management endpoint rather than a convenience. An overlay VIP driven
+by an agent (below) would fix it properly, by making the AWS side follow the
+election instead of being set once.
+
 Failing over means moving the secondary private IP between ENIs via the EC2 API
 (`unassign-private-ip-addresses` then `assign-private-ip-addresses`), which
 needs something watching the cluster with IAM permissions — or putting a network
@@ -728,7 +859,7 @@ a presigned handle URL as the only option.
 
 ### Management endpoint
 
-`ManagementNlb` puts a network load balancer in front of the nodes on 443 and 6443, which
+`ManagementNlb` puts a network load balancer in front of the nodes on 443, which
 is what makes the management endpoint survive losing a node. Three values:
 
 | | |
@@ -737,7 +868,115 @@ is what makes the management endpoint survive losing a node. Three values:
 | `internal` | Load balancer on a private address only |
 | `none` | No load balancer; the VIP stays the only endpoint |
 
-Every node runs the ingress and API, so any of them can serve the UI or respond to Kubernetes API requests.
+Every node runs the ingress, so any of them can serve the UI.
+
+**The control plane needs `ControlPlaneViaNlb=true`, and an AMI that supports
+it.** With it on, the load balancer also gets a **6443** listener for kubectl, a
+**9345** listener for the RKE2 supervisor, and joining nodes point `server_url`
+at the load balancer instead of the VIP — so cluster expansion stops depending
+on node 1 being alive.
+
+All three need the same thing: every node's certificates must carry the load
+balancer's name. harvester-installer writes the RKE2 config carrying `tls-san`
+only on the bootstrap node:
+
+```go
+if config.ServerURL == "" {
+    stage.Files = append(... "/etc/rancher/rke2/config.yaml.d/90-harvester-server.yaml" ...)
+}
+```
+
+Measured on a live three-node cluster with the installer's `sans` set, that
+leaves joined nodes short:
+
+```
+node-1  ... DNS:<nlb>, IP:<eip>, IP:<vip> ...
+node-2  ... IP:<vip> ...     <- no load balancer name, no eip
+node-3  ... IP:<vip> ...     <- no load balancer name, no eip
+```
+
+The VIP reaches every node; the SANs we set reach only node 1. Seeing the VIP
+everywhere is **not** evidence that extra SANs propagate — it arrives by some
+other, special-cased route.
+
+`configure.sh` fixes this by writing the drop-in itself on **every** node before
+RKE2 first starts, from `aws.tls_sans` in user-data. Verified on a rebuilt
+image: all three nodes carry the VIP, the load balancer name and the Elastic IP,
+with no manual step.
+
+**The VIP must be in that list explicitly.** An explicit `tls-san` replaces
+whatever supplies it implicitly on a joined node — a drop-in listing only the
+load balancer names silently *removed* the VIP from that node's certificate.
+RKE2's own additions (`localhost`, the node name and IP, the service IP, the
+`kubernetes.*` names) are unaffected.
+
+Two useful things fell out of measuring rather than assuming:
+
+* The **supervisor certificate on 9345 is cluster-wide**, not per-node. Every
+  node presents an identical `CN=rke2` certificate listing all nodes plus the
+  extra SANs — which is why the 9345 listener works.
+* `/ping` on 9345 answers `200 pong` unauthenticated, so it gets an ordinary
+  health check. 6443 does not: every kube-apiserver endpoint requires
+  authentication and answers **401**, which is what that target group matches.
+  Matching 200 there would never pass, and a bare TCP connect would pass on a
+  wedged apiserver still holding the port.
+
+Because the template cannot tell which AMI you are launching, this is behind a
+switch, default `false`.
+
+**The template stays backward compatible at default settings.** `aws.tls_sans`
+is emitted whenever a load balancer exists, but an older `configure.sh` reads
+only `.aws.data_disk_size` and then `yq -i 'del(.aws)'` removes the whole block —
+so an unknown key is dropped silently and nothing breaks.
+
+| | image without the drop-in | image with it |
+|---|---|---|
+| `ControlPlaneViaNlb=false` (default) | works — `tls_sans` ignored, 443 only, `server_url` is the VIP | works |
+| `ControlPlaneViaNlb=true` | **fails** | works |
+
+The failure is at least a clean one. The installer's top-level `sans` is no
+longer set, so on an older image **no** node gets the load balancer's name —
+not even node 1 — and 6443 fails for every connection rather than only for the
+ones the balancer happens to route past node 1.
+
+To tell whether a running node has the fix:
+
+```bash
+ls -l /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml
+```
+
+Mind that `AmiSsmParameter` and `ControlPlaneViaNlb` sit in different sections of
+the console form, so a mismatch is easy to make. Keeping `/harvester/ami/latest`
+pointed at the newest working build — and version-pinned parameters beside it for
+anything older — is what makes the default combination correct.
+
+With the switch off, 443 still carries the Kubernetes API through Rancher's
+proxy at `/k8s/clusters/local`.
+
+**Retrofitting a running cluster** is the same drop-in by hand, one node at a
+time, waiting for each to come back:
+
+```bash
+sudo mkdir -p /etc/rancher/rke2/config.yaml.d
+sudo tee /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml >/dev/null <<'EOF'
+tls-san:
+  - 172.31.31.31          # the VIP -- omitting it drops the VIP from the cert
+  - my-nlb.elb.amazonaws.com
+  - 203.0.113.9
+EOF
+sudo rm -f /var/lib/rancher/rke2/server/tls/serving-kube-apiserver.crt /var/lib/rancher/rke2/server/tls/serving-kube-apiserver.key
+sudo systemctl restart rke2-server
+```
+
+Deleting the serving certificate is what forces regeneration; RKE2 will not
+rewrite an existing one just because the SAN list grew.
+
+**One caveat on the names.** The template puts the load balancer's generated
+`*.elb.amazonaws.com` hostname into the certificates. That name changes if the
+load balancer is replaced, silently invalidating every node's certificate and
+meaning the manual procedure above. A Route 53 record you control avoids that,
+and is the only route to a publicly trusted certificate — see
+[Production direction](#production-direction-alb-for-the-ui-nlb-for-the-api).
 
 **Access control.** The prefix list is applied twice — once on the load
 balancer's own security group and again on the nodes. Client IP preservation is
@@ -753,15 +992,16 @@ With `internet-facing`, the UI is reachable from the internet by anyone inside
 before Rancher is serving, so a bare connect would mark a node healthy part-way
 through its bootstrap. 443 probes `/ping` for a `200`.
 
-6443 probes `/readyz` for a **401**. Every kube-apiserver endpoint — `/readyz`,
-`/livez`, `/healthz`, `/version` — requires authentication and answers 401
-unauthenticated, so a 401 is proof the apiserver is actually serving. Matching
-200 would never pass; a TCP connect would pass even on a wedged apiserver still
-holding the port.
+With `ControlPlaneViaNlb=true`, 6443 probes `/readyz` for a **401**. Every
+kube-apiserver endpoint — `/readyz`, `/livez`, `/healthz`, `/version` — requires
+authentication and answers 401 unauthenticated, so a 401 proves it is serving.
+Matching 200 would never pass, and a TCP connect would pass even on a wedged
+apiserver still holding the port.
 
 **Production direction: ALB for the UI, NLB for the API.**
 
-The API must stay on a network load balancer. kubectl authenticates with
+If the API is ever put behind a load balancer it must be a network one, and it
+needs the SAN problem above solved first. kubectl authenticates with
 **client certificates**, and an application load balancer terminates TLS — which
 ends the mTLS session at the load balancer and leaves the apiserver with no
 client certificate to authenticate. TLS passthrough is a requirement there.
@@ -797,7 +1037,7 @@ zones — a separate decision.
   working subnet with outbound access.
 * **Validate the AMI or instance type.** CloudFormation cannot query EC2 for
   boot mode or `nested-virtualization` support. Phase 3 does check both, so a
-  `./03-launch-instance.sh --dry-run` against the same AMI and instance type is
+  `./scripts/03-launch-instance.sh --dry-run` against the same AMI and instance type is
   a worthwhile preflight before creating the stack.
 * **Set up kube-ovn.** The addon, the NAD and the Subnet are in-cluster
   configuration applied after bootstrap — see
@@ -816,8 +1056,10 @@ zones — a separate decision.
 | `Mtu` | Defaults to 1500. Do not remove it — see [MTU](#mtu-set-it-explicitly). |
 | `VipAddress` | The only address you pick. Node 1's own private address is assigned by EC2 as normal — the ENI declares just the VIP as a secondary. `PrivateIpAddressSpecification` requires both `PrivateIpAddress` and `Primary` on each *entry*, but does not require a `Primary: true` entry to be present. |
 | `AdminCidrs` | Comma-separated, **maximum 5**. Anything past the fifth is silently ignored. |
+| `OverlayClientCidr` | Optional. Opens the nodes to this source on **all** protocols, which is what routing traffic into overlay VMs requires. Empty unless you have added the VPC route. |
 | `AmiIdOverride` | Optional literal `ami-…`, bypassing the SSM lookup for a one-off image. |
-| `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 and 6443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
+| `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
+| `ControlPlaneViaNlb` | Adds 6443 and 9345 to the load balancer and points joining nodes at it. Default `false`; needs an AMI whose `configure.sh` writes the tls-san drop-in. |
 | `DisableSourceDestCheck` | Reads as *disable the check*: `true` (the default) disables it, `false` leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
 
 ---
@@ -1009,12 +1251,17 @@ kubectl get subnet <name> -o jsonpath='{.spec.mtu}{"\n"}'
 Guests need a new lease to pick up a changed value — reboot the VM, or renew
 its DHCP lease.
 
-### natOutgoing is not set by the UI
+### natOutgoing — check it is set
 
-**Create the Subnet with `kubectl`, not through the Harvester UI.** The UI's
-overlay network flow neither sets `natOutgoing` nor exposes it, so a subnet
-created that way comes up with NAT disabled and VMs cannot reach anything off
-the node:
+**v1.9.0 exposes `natOutgoing` in the UI. Earlier releases do not.**
+
+On v1.8.2 the overlay network flow neither sets it nor offers it, so a Subnet
+created through the UI comes up with NAT disabled and VMs cannot reach anything
+off the node. On v1.9.0 you can set it at creation; on anything older, create
+the Subnet with `kubectl` instead.
+
+Either way it is worth checking, because the failure is quiet and the symptom
+is misleading:
 
 ```
 NAME          PROVIDER                      CIDR            PRIVATE   NAT
@@ -1044,7 +1291,7 @@ size-independent**: a 500-byte ping fails exactly like a 1400-byte one.
 
 ```bash
 kubectl get subnet -o wide                    # check the NAT column
-kubectl patch subnet <name> --type=merge -p '{"spec":{"natOutgoing":true}}'
+kubectl patch subnet vm-overlay --type=merge -p '{"spec":{"natOutgoing":true}}'
 ```
 
 The patch takes effect immediately — it is a router NAT rule, not something the
@@ -1076,8 +1323,77 @@ aws ec2 create-route --route-table-id rtb-xxxxxxxx \
 aws ec2 modify-instance-attribute --instance-id i-xxxxxxxx --no-source-dest-check
 ```
 
-The CloudFormation template does the second part for you — see
-[Source/destination check](#sourcedestination-check).
+**That route is a single point of failure, and it is not the VIP.** A VPC route
+targets an ENI, an instance or a gateway — never a bare IP address — so it
+cannot point at the VIP even if you wanted it to. It names one node's interface.
+
+Two consequences, one better than the VIP's situation and one the same:
+
+* **Any node will do.** GENEVE meshes every node, so whichever node the route
+  names can forward to a VM running anywhere in the cluster. It does not have to
+  be the node holding the VIP, and nothing keeps the two together.
+* **If that node dies, inbound traffic to the overlay black-holes.** Outbound is
+  unaffected — `natOutgoing` SNATs through whichever node the VM happens to be
+  on — so this fails asymmetrically: VMs can still reach out, but nothing in the
+  VPC can reach them.
+
+Recovery is one API call, repointing the route at a surviving node:
+
+```bash
+aws ec2 replace-route --route-table-id rtb-xxxxxxxx \
+  --destination-cidr-block 10.60.0.0/24 --network-interface-id eni-yyyyyyyy   # a surviving node
+```
+
+That is cheaper than the VIP, which needs an unassign followed by an assign, but
+it is still manual and still needs something watching to be automatic.
+
+A load balancer does not help here the way it does for the management endpoint.
+Network load balancers can take IP targets, but those must sit inside the VPC
+CIDR (or reach on-premises over Direct Connect or VPN); overlay addresses
+qualify as neither. Exposing individual VM ports through a Kubernetes
+`LoadBalancer` service is the idiomatic alternative, but on Harvester that
+allocates from the VIP pool and inherits the same AWS limitation.
+
+For a proof of concept this is fine — it is one route and one command to repair.
+It is listed here so it is a known limitation rather than a surprise.
+
+**The established fix is the `aws-vpc-move-ip` pattern.** It is an OCF resource
+agent from `resource-agents` (SUSE's own, and widely used for SAP HANA on AWS):
+a cluster agent watches which node is active and rewrites the route table entry
+to point at it. That is precisely this problem — an address AWS will not let you
+move by ARP, moved instead by an API call.
+
+Doing it here means something in-cluster watching node health and calling
+`ec2:ReplaceRoute`, or an EventBridge rule on EC2 state-change driving a Lambda.
+The in-cluster version knows whether the CNI is actually working rather than just
+whether EC2 says the instance is running; the Lambda needs no IAM on the nodes,
+which today have **no instance profile at all** — adding one takes the stack from
+zero IAM resources to `CAPABILITY_IAM`.
+
+Note this does **not** replace the load balancer. An overlay address of this kind
+sits outside the VPC CIDR and is not publicly routable, so it solves east-west
+reachability inside the VPC, not the public management endpoint. See
+[Management endpoint](#management-endpoint).
+
+**Three things are required, and missing any one drops the traffic silently:**
+
+1. The **route**, above — gets packets to a node.
+2. **Source/destination check disabled** — lets that node forward for addresses
+   that are not its own. The template does this by default.
+3. A **security group rule** permitting the traffic inbound. This is the one that
+   is easy to miss: the nodes' group only admits the admin CIDRs and itself, so
+   traffic from elsewhere in the VPC is dropped before it can be forwarded, even
+   with the route and the check in place.
+
+Set `OverlayClientCidr` (usually the VPC or subnet CIDR) and the template adds
+the third. See [Source/destination check](#sourcedestination-check).
+
+Be aware it is **broad by necessity**. Security group rules match on source,
+protocol and port, never on destination, so there is no way to permit "traffic
+bound for the overlay" specifically. Since a VM may serve any port, the rule is
+all-protocols — which also lets those sources reach the **nodes** on any port,
+including etcd, the kubelet and Longhorn. Scope the source as tightly as the
+workload allows rather than reaching for the whole VPC out of habit.
 
 This works — but note it pins the overlay to one node's ENI, so it does not
 survive that node being replaced, and it does not load-balance across a cluster.
@@ -1113,7 +1429,7 @@ Sources: [Setting up Layer 2 Networking on Amazon EC2](https://aws.amazon.com/bl
 Expect 15–25 minutes. Everything logs to the serial console.
 
 ```bash
-./follow-console.sh --instance-id i-xxxxxxxx --tee console.txt
+./scripts/follow-console.sh --instance-id i-xxxxxxxx --tee console.txt
 ```
 
 `get-console-output` is a snapshot API, not a stream — each call returns the
@@ -1215,10 +1531,10 @@ grown in place. `aws/configure.sh` grows it to fill the volume on first boot,
 before the installer runs — automatically, with no configuration:
 
 ```bash
-./01-build-instance.sh                     # 250 GiB image, 150 GiB COS_PERSISTENT
+./scripts/01-build-instance.sh                     # 250 GiB image, 150 GiB COS_PERSISTENT
 
-./03-launch-instance.sh --ami … --volume-size 500    # Longhorn gets ~427 GiB
-./03-launch-instance.sh --ami … --volume-size 250    # Longhorn gets ~77 GiB
+./scripts/03-launch-instance.sh --ami … --volume-size 500    # Longhorn gets ~427 GiB
+./scripts/03-launch-instance.sh --ami … --volume-size 250    # Longhorn gets ~77 GiB
 ```
 
 This costs nothing on the launch side. The AMI's floor ends up at 250 GiB, which
@@ -1255,7 +1571,7 @@ For short-lived test builds where you want the image to move faster, trimming is
 reasonable — just know what you are giving up:
 
 ```bash
-DISK_SIZE_GIB=130 PERSISTENT_SIZE=50Gi ./01-build-instance.sh --force
+DISK_SIZE_GIB=130 PERSISTENT_SIZE=50Gi ./scripts/01-build-instance.sh --force
 ```
 
 Two things bound how small you can go:

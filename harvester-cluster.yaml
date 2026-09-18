@@ -38,11 +38,11 @@ Metadata:
       - Label: {default: "3. Cluster shape"}
         Parameters: [NodeCount, ClusterToken]
       - Label: {default: "4. Addresses"}
-        Parameters: [VipAddress, AdminCidrs, ManagementNlb]
+        Parameters: [VipAddress, AdminCidrs, OverlayClientCidr, ManagementNlb]
       - Label: {default: "5. Storage"}
         Parameters: [VolumeSize, ReplicaCount]
       - Label: {default: "6. Advanced"}
-        Parameters: [DisableSourceDestCheck, Mtu, PasswordHash]
+        Parameters: [ControlPlaneViaNlb, DisableSourceDestCheck, Mtu, PasswordHash]
     ParameterLabels:
       AmiSsmParameter:          {default: "SSM Parameter Store Value"}
       AmiIdOverride:  {default: "Raw AMI ID (optional, overrides SSM)"}
@@ -54,10 +54,12 @@ Metadata:
       ClusterToken:   {default: "Cluster token"}
       VipAddress:     {default: "Management VIP"}
       AdminCidrs:     {default: "Admin CIDRs"}
-      ManagementNlb:  {default: "Management endpoints NLB"}
+      OverlayClientCidr: {default: "CIDR allowed to reach overlay VMs (optional)"}
+      ManagementNlb:  {default: "Management endpoint NLB"}
       VolumeSize:     {default: "Root volume size (GiB)"}
       ReplicaCount:   {default: "Storage replica count"}
       Mtu:            {default: "Management interface MTU"}
+      ControlPlaneViaNlb: {default: "Enable Kubernetes APIs in NLB"}
       DisableSourceDestCheck: {default: "Disable EC2 source/destination check"}
       PasswordHash:   {default: "OS password hash (optional)"}
 
@@ -158,13 +160,23 @@ Parameters:
       Kubernetes API, e.g. "203.0.113.4/32,198.51.100.0/24".
       Maximum supported CIDRs is five.
 
+  OverlayClientCidr:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
+    Description: >-
+      Enable ALL traffic from this CIDR range to reach the overlay network on the
+      cluster. Typically the VPC or subnet CIDR.
+      Only needed if you also add a VPC route to the overlay
+      CIDR. (Requires Source/Dest check disabled)
+
   ManagementNlb:
     Type: String
     Default: internet-facing
     AllowedValues: [internet-facing, internal, none]
     Description: >-
-      Deploys a NLB in front of the cluster to hande failover of both the web UI and
-      Kubernetes API.
+      Deploys a NLB in front of the cluster to hande failover of the web UI (and
+      Kubernetes API if enabled below).
       internet-facing allocates an Elastic IP. none skips the load balancer.
 
   # --- 5. Storage ---------------------------------------------------------
@@ -183,6 +195,13 @@ Parameters:
       Storage replicas. For single node clusters set to 1, otherwise leave at 3.
 
   # --- 6. Advanced --------------------------------------------------------
+  ControlPlaneViaNlb:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Put the control plane ports (6443 and 9345) behind the NLB as well as the UI. Also sets the server_url to the NLB IP for failover.
+
   DisableSourceDestCheck:
     Type: String
     Default: 'true'
@@ -239,8 +258,10 @@ Conditions:
   # true on the parameter means DISABLE the check, so the EC2 property
   # (which is the check itself) gets the opposite value.
   DisableSdc:     !Equals [!Ref DisableSourceDestCheck, 'true']
+  HasOverlayClients: !Not [!Equals [!Ref OverlayClientCidr, '']]
   NlbEnabled:     !Not [!Equals [!Ref ManagementNlb, 'none']]
   NlbPublic:      !Equals [!Ref ManagementNlb, 'internet-facing']
+  ControlPlaneNlb:     !And [!Condition NlbEnabled, !Equals [!Ref ControlPlaneViaNlb, 'true']]
 
 Resources:
 
@@ -304,6 +325,20 @@ Resources:
       SourceSecurityGroupId: !Ref NodeSecurityGroup
       Description: All traffic between cluster nodes
 
+  # Inbound path to overlay VMs. Pairs with a VPC route sending the overlay CIDR
+  # at a node, and with DisableSourceDestCheck: the route gets packets to the
+  # node, the check lets it forward for addresses that are not its own, and this
+  # lets them past the security group. All three are required, and missing any
+  # one drops the traffic silently.
+  NodeOverlayIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasOverlayClients
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      CidrIp: !Ref OverlayClientCidr
+      Description: Clients allowed to reach overlay VMs
+
   # -------------------------------------------------------------------------
   # Node 1's ENI, carrying the VIP as a secondary address
   # -------------------------------------------------------------------------
@@ -327,22 +362,26 @@ Resources:
   # -------------------------------------------------------------------------
   # Management endpoint
   #
-  # Both 443 (UI) and 6443 (Kubernetes API) are balanced across the management
-  # nodes.
+  # 443 only. 6443 is deliberately NOT balanced.
   #
   # harvester-installer writes the RKE2 server config carrying tls-san only on
-  # the bootstrap node (`if config.ServerURL == ""`), which suggests joined nodes
-  # would lack the SAN -- but that is not what happens. Inspecting a live
-  # three-node cluster, every node's kube-apiserver certificate carries the VIP:
+  # the bootstrap node (`if config.ServerURL == ""`). Measured on a live
+  # three-node v1.9.0 cluster with `sans` set from user-data:
   #
-  #   node-1  SANs: ... IP Address:172.31.31.31, IP Address:172.31.22.206 ...
-  #   node-2  SANs: ... IP Address:172.31.31.31, IP Address:172.31.19.4  ...
-  #   node-3  SANs: ... IP Address:172.31.31.31, IP Address:172.31.16.19 ...
+  #   node-1  ... DNS:<nlb>.elb.amazonaws.com, IP:<eip>, IP:<vip> ...
+  #   node-2  ... IP:<vip> ...          <- no load balancer name, no eip
+  #   node-3  ... IP:<vip> ...          <- no load balancer name, no eip
   #
-  # RKE2 carries cluster-level tls-san to every server, so the value set once on
-  # node 1 reaches the rest. That is why `sans` below only needs to go into the
-  # create node's user-data, and why balancing 6443 is safe.
-  # -------------------------------------------------------------------------
+  # The VIP reaches every node by some other, special-cased route; arbitrary SANs
+  # do NOT propagate. Balancing 6443 would therefore succeed only while the load
+  # balancer happened to pick node 1 and fail TLS verification the rest of the
+  # time -- intermittent, which is worse than not offering it.
+  #
+  # 443 has no such problem: every node runs the ingress, and Rancher proxies the
+  # Kubernetes API at /k8s/clusters/local, which is what Harvester's downloaded
+  # kubeconfig uses. Balancing 6443 properly would need every node to carry the
+  # SANs, i.e. configure.sh writing its own RKE2 config drop-in instead of
+  # relying on the installer.
   NlbEip:
     Type: AWS::EC2::EIP
     Condition: NlbPublic
@@ -358,8 +397,9 @@ Resources:
       GroupDescription: !Sub 'Harvester management NLB (${AWS::StackName})'
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        - {IpProtocol: tcp, FromPort: 443,  ToPort: 443,  SourcePrefixListId: !Ref AdminPrefixList, Description: Harvester UI}
-        - {IpProtocol: tcp, FromPort: 6443, ToPort: 6443, SourcePrefixListId: !Ref AdminPrefixList, Description: Kubernetes API}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, SourcePrefixListId: !Ref AdminPrefixList, Description: Harvester UI and API}
+        - !If [ControlPlaneNlb, {IpProtocol: tcp, FromPort: 6443, ToPort: 6443, SourcePrefixListId: !Ref AdminPrefixList, Description: Kubernetes API}, !Ref 'AWS::NoValue']
+        - !If [ControlPlaneNlb, {IpProtocol: tcp, FromPort: 9345, ToPort: 9345, SourcePrefixListId: !Ref AdminPrefixList, Description: RKE2 supervisor}, !Ref 'AWS::NoValue']
       Tags:
         - {Key: Name, Value: !Sub '${AWS::StackName}-nlb'}
 
@@ -381,7 +421,7 @@ Resources:
 
   NodeNlbApiIngress:
     Type: AWS::EC2::SecurityGroupIngress
-    Condition: NlbEnabled
+    Condition: ControlPlaneNlb
     Properties:
       GroupId: !Ref NodeSecurityGroup
       IpProtocol: tcp
@@ -389,6 +429,17 @@ Resources:
       ToPort: 6443
       SourceSecurityGroupId: !Ref NlbSecurityGroup
       Description: NLB health checks (API)
+
+  NodeNlbSupervisorIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ControlPlaneNlb
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9345
+      ToPort: 9345
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: NLB health checks (supervisor)
 
   ManagementLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
@@ -434,17 +485,17 @@ Resources:
 
   ApiTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Condition: NlbEnabled
+    Condition: ControlPlaneNlb
     Properties:
       Name: !Sub '${AWS::StackName}-api'
       VpcId: !Ref VpcId
       Protocol: TCP
       Port: 6443
       TargetType: instance
-      # 401 is the healthy response. Every kube-apiserver endpoint -- /readyz,
-      # /livez, /healthz, /version -- requires authentication and answers 401
-      # unauthenticated, so matching 401 proves the apiserver is actually serving.
-      # A TCP connect would pass on a wedged apiserver that still holds the port.
+      # 401 is the healthy response: every kube-apiserver endpoint requires
+      # authentication and answers 401 unauthenticated, so a 401 proves it is
+      # serving. Matching 200 would never pass, and a bare TCP connect would
+      # pass on a wedged apiserver still holding the port.
       HealthCheckProtocol: HTTPS
       HealthCheckPath: /readyz
       HealthCheckIntervalSeconds: 10
@@ -458,9 +509,43 @@ Resources:
       Tags:
         - {Key: Name, Value: !Sub '${AWS::StackName}-api'}
 
+  SupervisorTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: ControlPlaneNlb
+    Properties:
+      Name: !Sub '${AWS::StackName}-sup'
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 9345
+      TargetType: instance
+      # /ping on the supervisor answers 200 "pong" unauthenticated (measured),
+      # so unlike 6443 this gets an ordinary 200 check.
+      HealthCheckProtocol: HTTPS
+      HealthCheckPath: /ping
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: {HttpCode: '200'}
+      Targets:
+        - Id: !Ref Node1
+        - !If [IsCluster, {Id: !Ref Node2}, !Ref 'AWS::NoValue']
+        - !If [IsCluster, {Id: !Ref Node3}, !Ref 'AWS::NoValue']
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-sup'}
+
+  SupervisorListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: ControlPlaneNlb
+    Properties:
+      LoadBalancerArn: !Ref ManagementLoadBalancer
+      Protocol: TCP
+      Port: 9345
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref SupervisorTargetGroup}
+
   ApiListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: NlbEnabled
+    Condition: ControlPlaneNlb
     Properties:
       LoadBalancerArn: !Ref ManagementLoadBalancer
       Protocol: TCP
@@ -486,7 +571,7 @@ Resources:
   # unusual cases. It is a constant rather than a parameter because
   # CloudFormation has no hidden parameters -- one omitted from ParameterGroups
   # still shows up under "Other parameters" in the console. Use
-  # 03-launch-instance.sh --data-disk-size when you need a different value.
+  # scripts/03-launch-instance.sh --data-disk-size for a different value.
   CreateLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -512,10 +597,9 @@ Resources:
             Fn::Sub:
               - |
                 aws:
-                  data_disk_size: "max"
+                  data_disk_size: "max"${TlsSansBlock}
                 scheme_version: 1
                 token: "${ClusterToken}"
-                ${SansBlock}
                 install:
                   automatic: true
                   mode: create
@@ -538,16 +622,19 @@ Resources:
                   - HasPassword
                   - !Join ['', ['os:', "\n", '  password: "', !Ref PasswordHash, '"']]
                   - '# no os overrides'
-                # Extra TLS SANs for the load-balanced endpoint. Set only here:
-                # RKE2 propagates cluster-level tls-san to every server, so node
-                # 1's value covers nodes 2 and 3 once they are promoted.
-                SansBlock: !If
+                # aws.tls_sans, not the installer's top-level `sans`.
+                # configure.sh turns this into an RKE2 tls-san drop-in on EVERY
+                # node; `sans` reaches only the bootstrap node. The VIP is listed
+                # first because an explicit tls-san replaces whatever supplies it
+                # implicitly on a joined node -- omitting it silently drops the
+                # VIP from that node's certificate (measured on a live cluster).
+                TlsSansBlock: !If
                   - NlbEnabled
                   - !If
                     - NlbPublic
-                    - !Join ['', ['sans:', "\n", '  - ', !GetAtt ManagementLoadBalancer.DNSName, "\n", '  - ', !Ref NlbEip]]
-                    - !Join ['', ['sans:', "\n", '  - ', !GetAtt ManagementLoadBalancer.DNSName]]
-                  - '# no extra SANs'
+                    - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName, "\n", '    - ', !Ref NlbEip]]
+                    - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName]]
+                  - ''
 
   # server_url is top-level, not under install: its presence is what makes
   # rancherd render "role: agent" instead of "role: cluster-init". Port 443 is
@@ -580,10 +667,10 @@ Resources:
             Fn::Sub:
               - |
                 aws:
-                  data_disk_size: "max"
+                  data_disk_size: "max"${TlsSansBlock}
                 scheme_version: 1
                 token: "${ClusterToken}"
-                server_url: "https://${VipAddress}:443"
+                server_url: "${JoinEndpoint}"
                 install:
                   automatic: true
                   mode: join
@@ -601,6 +688,27 @@ Resources:
                   - HasPassword
                   - !Join ['', ['os:', "\n", '  password: "', !Ref PasswordHash, '"']]
                   - '# no os overrides'
+                # aws.tls_sans, not the installer's top-level `sans`.
+                # configure.sh turns this into an RKE2 tls-san drop-in on EVERY
+                # node; `sans` reaches only the bootstrap node. The VIP is listed
+                # first because an explicit tls-san replaces whatever supplies it
+                # implicitly on a joined node -- omitting it silently drops the
+                # VIP from that node's certificate (measured on a live cluster).
+                # harv-update-rke2-server-url rewrites this host's port from 443
+                # to 9345 for rke2-agent, so the load balancer needs both
+                # listeners. Pointing at it means a joining node no longer
+                # depends on node 1 being alive.
+                JoinEndpoint: !If
+                  - ControlPlaneNlb
+                  - !Join ['', ['https://', !GetAtt ManagementLoadBalancer.DNSName, ':443']]
+                  - !Join ['', ['https://', !Ref VipAddress, ':443']]
+                TlsSansBlock: !If
+                  - NlbEnabled
+                  - !If
+                    - NlbPublic
+                    - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName, "\n", '    - ', !Ref NlbEip]]
+                    - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName]]
+                  - ''
 
   # As JoinLaunchTemplate plus install.role=worker. isWorkerPreferredNode() in
   # promote_controller.go excludes these from promotion, so the three management
@@ -632,10 +740,10 @@ Resources:
             Fn::Sub:
               - |
                 aws:
-                  data_disk_size: "max"
+                  data_disk_size: "max"${TlsSansBlock}
                 scheme_version: 1
                 token: "${ClusterToken}"
-                server_url: "https://${VipAddress}:443"
+                server_url: "${JoinEndpoint}"
                 install:
                   automatic: true
                   mode: join
@@ -654,6 +762,27 @@ Resources:
                   - HasPassword
                   - !Join ['', ['os:', "\n", '  password: "', !Ref PasswordHash, '"']]
                   - '# no os overrides'
+                # aws.tls_sans, not the installer's top-level `sans`.
+                # configure.sh turns this into an RKE2 tls-san drop-in on EVERY
+                # node; `sans` reaches only the bootstrap node. The VIP is listed
+                # first because an explicit tls-san replaces whatever supplies it
+                # implicitly on a joined node -- omitting it silently drops the
+                # VIP from that node's certificate (measured on a live cluster).
+                # harv-update-rke2-server-url rewrites this host's port from 443
+                # to 9345 for rke2-agent, so the load balancer needs both
+                # listeners. Pointing at it means a joining node no longer
+                # depends on node 1 being alive.
+                JoinEndpoint: !If
+                  - ControlPlaneNlb
+                  - !Join ['', ['https://', !GetAtt ManagementLoadBalancer.DNSName, ':443']]
+                  - !Join ['', ['https://', !Ref VipAddress, ':443']]
+                TlsSansBlock: !If
+                  - NlbEnabled
+                  - !If
+                    - NlbPublic
+                    - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName, "\n", '    - ', !Ref NlbEip]]
+                    - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName]]
+                  - ''
 
   # -------------------------------------------------------------------------
   # Instances
@@ -789,7 +918,7 @@ Outputs:
 
   WatchBootstrap:
     Description: Follow the first node coming up
-    Value: !Sub './follow-console.sh --instance-id ${Node1} --tee console.txt'
+    Value: !Sub './scripts/follow-console.sh --instance-id ${Node1} --tee console.txt'
 
   CheckCluster:
     Description: Run on node 1. Promotion to control-plane,etcd only happens at three nodes.

@@ -92,12 +92,21 @@ OS_PASSWORD="${OS_PASSWORD:-rancher}"
 OS_PASSWORD_HASH="${OS_PASSWORD_HASH:-}"
 
 FORCE="false"
+DEVICE=""
 
 usage() {
     cat <<USAGE
-Usage: $0 [--force]
+Usage: $0 [--force] [--device /dev/nvmeXn1]
 
   --force       Rebuild even if ${RAW_IMAGE_PATH} already exists.
+  --device DEV  Install straight onto a block device instead of a raw file.
+                This is what the Makefile does on the helper instance: QEMU
+                writes the install directly to the EBS volume that will be
+                snapshotted, so there is no image file, no zstd, and no S3
+                round trip -- phases 1 and 1.5 collapse into one step.
+                Requires root, and the device must be at least
+                ${DISK_SIZE_GIB} GiB. --force is not needed (and is ignored):
+                the device is written unconditionally.
                 Without this the script refuses to overwrite a previous build.
 
 Environment overrides:
@@ -117,6 +126,7 @@ USAGE
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force|-f) FORCE="true"; shift ;;
+        --device)   DEVICE="$2"; shift 2 ;;
         -h|--help)  usage; exit 0 ;;
         *)          echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -135,7 +145,7 @@ done
 
 command -v qemu-system-x86_64 >/dev/null || { echo "ERROR: qemu-system-x86_64 not found" >&2; exit 1; }
 command -v qemu-img          >/dev/null || { echo "ERROR: qemu-img not found" >&2; exit 1; }
-command -v zstd              >/dev/null || { echo "ERROR: zstd not found" >&2; exit 1; }
+[ -n "$DEVICE" ] || command -v zstd >/dev/null || { echo "ERROR: zstd not found" >&2; exit 1; }
 
 if [ ! -w /dev/kvm ]; then
     echo "ERROR: /dev/kvm is not writable. The Harvester installer preloads" >&2
@@ -146,7 +156,37 @@ fi
 # Do not silently destroy a previous build. A failed *script* does not
 # necessarily mean a failed *install* -- if the installer powered the VM off,
 # the image on disk is good even if a later step errored out.
-if [ -e "$RAW_IMAGE_PATH" ] && [ "$FORCE" != "true" ]; then
+if [ -n "$DEVICE" ]; then
+    # --- installing straight onto a block device --------------------------
+    [ "$(id -u)" -eq 0 ] || { echo "ERROR: --device needs root." >&2; exit 1; }
+    [ -b "$DEVICE" ] || { echo "ERROR: $DEVICE is not a block device." >&2; exit 1; }
+
+    # Never scribble on the machine doing the building.
+    ROOT_SRC="$(findmnt -no SOURCE / 2>/dev/null || true)"
+    if [ -n "$ROOT_SRC" ]; then
+        ROOT_DISK="/dev/$(lsblk -no pkname "$ROOT_SRC" 2>/dev/null || true)"
+        if [ "$ROOT_DISK" = "$DEVICE" ]; then
+            echo "ERROR: $DEVICE is this machine's root disk. Refusing." >&2
+            exit 1
+        fi
+    fi
+    if lsblk -no MOUNTPOINT "$DEVICE" 2>/dev/null | grep -q .; then
+        echo "ERROR: $DEVICE has mounted partitions. Unmount them first." >&2
+        exit 1
+    fi
+
+    DEV_BYTES="$(lsblk --bytes --nodeps --noheadings --output SIZE "$DEVICE" | tr -d ' ')"
+    NEED_BYTES=$(( DISK_SIZE_GIB * 1073741824 ))
+    if [ "${DEV_BYTES:-0}" -lt "$NEED_BYTES" ]; then
+        echo "ERROR: $DEVICE is $(( DEV_BYTES / 1073741824 )) GiB; need at least ${DISK_SIZE_GIB}." >&2
+        exit 1
+    fi
+
+    TARGET="$DEVICE"
+    echo "Installing directly onto ${DEVICE} ($(( DEV_BYTES / 1073741824 )) GiB)."
+    echo "Everything currently on it will be destroyed."
+    echo ""
+elif [ -e "$RAW_IMAGE_PATH" ] && [ "$FORCE" != "true" ]; then
     echo "ERROR: $RAW_IMAGE_PATH already exists." >&2
     echo "" >&2
     echo "       If the previous run got as far as 'Powering off.' on the guest" >&2
@@ -211,9 +251,12 @@ fi
 restore_tty() { [ -t 0 ] && stty sane 2>/dev/null || true; }
 trap restore_tty EXIT
 
-echo "Creating ${DISK_SIZE_GIB}GiB raw disk..."
-rm -f "$RAW_IMAGE_PATH"
-qemu-img create -f raw -o size="${DISK_SIZE_GIB}G" "$RAW_IMAGE_PATH"
+if [ -z "$DEVICE" ]; then
+    echo "Creating ${DISK_SIZE_GIB}GiB raw disk..."
+    rm -f "$RAW_IMAGE_PATH"
+    qemu-img create -f raw -o size="${DISK_SIZE_GIB}G" "$RAW_IMAGE_PATH"
+    TARGET="$RAW_IMAGE_PATH"
+fi
 
 cat <<BANNER
 
@@ -273,7 +316,7 @@ QEMU_ARGS=(
     -serial chardev:char0
     -mon chardev=char0,mode=readline
     -nic none
-    -drive file="$RAW_IMAGE_PATH",if=virtio,cache=none,discard=unmap,format=raw
+    -drive file="$TARGET",if=virtio,cache=none,discard=unmap,format=raw
     -drive file="${ISO_PATH}",if=virtio,media=cdrom,readonly=on
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}"
     -drive if=pflash,format=raw,file="${OVMF_LOCAL_VARS}"
@@ -307,8 +350,12 @@ echo "---"
 if [ "$QEMU_RC" -eq 124 ]; then
     echo "ERROR: QEMU was killed after ${QEMU_TIMEOUT}s. The install hung." >&2
     echo "       Console log: ${INSTALL_LOG}" >&2
-    echo "       The partial image is left at ${RAW_IMAGE_PATH}; re-run with" >&2
-    echo "       --force once you have addressed the cause." >&2
+    if [ -n "$DEVICE" ]; then
+        echo "       ${DEVICE} now holds a partial install; just re-run." >&2
+    else
+        echo "       The partial image is left at ${RAW_IMAGE_PATH}; re-run with" >&2
+        echo "       --force once you have addressed the cause." >&2
+    fi
     exit 1
 fi
 
@@ -367,7 +414,7 @@ fi
 
 # Partition table check. sfdisk reads image files fine without root.
 if command -v sfdisk >/dev/null; then
-    PART_COUNT="$(sfdisk --json "$RAW_IMAGE_PATH" 2>/dev/null \
+    PART_COUNT="$(sfdisk --json "$TARGET" 2>/dev/null \
         | grep -c '"node"' || true)"
     if [ "${PART_COUNT:-0}" -ge 6 ]; then
         echo "  partition table has ${PART_COUNT} partitions (expected 6)"
@@ -381,15 +428,25 @@ else
     echo "  sfdisk not available; skipping partition table check"
 fi
 
-echo ""
-echo "Compressing with zstd (this reads the whole ${DISK_SIZE_GIB} GiB image)..."
-zstd -T0 --force "$RAW_IMAGE_PATH"
+if [ -n "$DEVICE" ]; then
+    echo ""
+    echo "Phase 1 complete (installed directly onto ${DEVICE})."
+    echo "  Console log: ${INSTALL_LOG}"
+    echo ""
+    echo "Next: ./scripts/02-customize-instance.sh ${DEVICE}"
+    echo "      No compression, upload or 01b step is needed -- the volume this"
+    echo "      device belongs to is what gets snapshotted."
+else
+    echo ""
+    echo "Compressing with zstd (this reads the whole ${DISK_SIZE_GIB} GiB image)..."
+    zstd -T0 --force "$RAW_IMAGE_PATH"
 
-echo ""
-echo "Phase 1 complete."
-echo "  Raw image:   ${RAW_IMAGE_PATH}  (${DISK_SIZE_GIB} GiB)"
-echo "  Compressed:  ${RAW_IMAGE_PATH}.zst"
-echo "  Console log: ${INSTALL_LOG}"
-echo ""
-echo "Next: upload the .zst to S3, write it to a ${DISK_SIZE_GIB} GiB EBS volume on a"
-echo "      helper instance, then run 02-customize-instance.sh against that volume."
+    echo ""
+    echo "Phase 1 complete."
+    echo "  Raw image:   ${RAW_IMAGE_PATH}  (${DISK_SIZE_GIB} GiB)"
+    echo "  Compressed:  ${RAW_IMAGE_PATH}.zst"
+    echo "  Console log: ${INSTALL_LOG}"
+    echo ""
+    echo "Next: upload the .zst to S3, write it to a ${DISK_SIZE_GIB} GiB EBS volume on a"
+    echo "      helper instance, then run 02-customize-instance.sh against that volume."
+fi

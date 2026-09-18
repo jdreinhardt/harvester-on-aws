@@ -7,7 +7,7 @@ set -euo pipefail
 # Run this as root on an EC2 helper instance, against the EBS volume you wrote
 # the phase 1 raw image to.
 #
-#   sudo ./02-customize-instance.sh /dev/nvme1n1
+#   sudo ./scripts/02-customize-instance.sh /dev/nvme1n1
 #
 # What it does, and why each piece is needed:
 #
@@ -799,7 +799,40 @@ case "$PASSWD" in
         ;;
 esac
 
-# --- 6. Stage it -----------------------------------------------------------
+# --- 6. Extra TLS SANs for every node --------------------------------------
+# harvester-installer writes the RKE2 server config carrying tls-san ONLY on the
+# bootstrap node:
+#
+#   if config.ServerURL == "" { ...write 90-harvester-server.yaml... }
+#
+# so a node that joined and was later promoted serves an API certificate without
+# any of the extra names on it. Putting a load balancer in front of 6443 then
+# fails certificate verification whenever it does not pick node 1 -- verified on
+# a live cluster.
+#
+# Writing the drop-in here fixes that: it runs on EVERY node, before RKE2 has
+# ever started, so the certificate is generated correctly the first time and no
+# cert deletion or restart is needed.
+#
+# The VIP must be in the list explicitly. An explicit tls-san REPLACES whatever
+# implicitly supplied it on a joined node -- measured: adding only the load
+# balancer names silently dropped the VIP from that node's certificate. RKE2's
+# own additions (localhost, the node name and IP, the service IP, the
+# kubernetes.* names) are unaffected.
+TLS_SANS="$(yq -r '.aws.tls_sans // [] | .[]' "$WORK/user-data.yaml" 2>/dev/null || true)"
+if [ -n "$TLS_SANS" ]; then
+    mkdir -p /etc/rancher/rke2/config.yaml.d
+    {
+        echo "tls-san:"
+        printf '%s\n' "$TLS_SANS" | while IFS= read -r san; do
+            [ -n "$san" ] && echo "  - ${san}"
+        done
+    } > /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml
+    chmod 0600 /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml
+    say "wrote 95-aws-tls-san.yaml ($(printf '%s' "$TLS_SANS" | tr '\n' ' '))"
+fi
+
+# --- 7. Stage it -----------------------------------------------------------
 # `aws.*` is ours, not Harvester's. Remove it so the installer only ever sees a
 # clean Harvester configuration file.
 yq -i 'del(.aws)' "$WORK/merged.yaml"
