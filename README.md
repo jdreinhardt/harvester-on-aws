@@ -5,7 +5,7 @@ self-bootstrapping Harvester cluster — one node, or three to five with an HA
 control plane. Scripts for the image build and a CloudFormation template for
 the deployment.
 
-Targets Harvester **v1.8.2+**.
+Current default targets Harvester **v1.9.0**.
 
 For a high-level account of what this does and why — rather than how — see
 [OVERVIEW.md](OVERVIEW.md).
@@ -85,7 +85,7 @@ two OVMF paths, which `01-build-instance.sh` takes as environment variables:
 
 ```bash
 make ami SUBNET_ID=subnet-xxxxxxxx KEY_NAME=my-key \
-  HARVESTER_VERSION=v1.9.0 SSM_PARAMETER=/harvester/ami/v1.9.0
+  HARVESTER_VERSION=v1.8.2 SSM_PARAMETER=/harvester/ami/v1.8.2
 ```
 
 Pass `SSM_PARAMETER` as well when you are testing. Left at its default the build
@@ -172,6 +172,44 @@ rancherd  ->  RKE2  ->  Rancher  ->  harvester / harvester-crd ManagedCharts
 
 ---
 
+## What has been tested
+
+This is a proof of concept. This table shows what has and has not been tested. Anything
+not listed may work, but known state is unclear.
+
+**Harvester versions**
+
+| | Image build | Bootstrap | Clustering | VM networking | Notes |
+|---|---|---|---|---|---|
+| **v1.9.0** | yes | yes | 3 nodes | yes | The default. Validated end to end, via both CloudFormation and Terraform. |
+| **v1.8.2** | yes | yes | 3 nodes | yes | Works, but `natOutgoing` is not exposed in the UI — see [natOutgoing](#natoutgoing--check-it-is-set). |
+
+Nothing in the tooling is version-aware, so a newer release will most likely
+build. The two checks that would catch a breaking change are the partition count
+at the end of phase 1 (it expects six) and the configuration schema
+(`scheme_version: 1`).
+
+**Deployment paths**
+
+| | Tested against | Notes |
+|---|---|---|
+| `make ami` | v1.8.2, v1.9.0 | Built the current published AMI. |
+| Manual scripts (`01`/`02`/`03`) | v1.8.2, v1.9.0 | The original path; the Makefile wraps it. |
+| CloudFormation | v1.8.2, v1.9.0 | Deployed, 3 nodes. On v1.9.0 with `ControlPlaneViaNlb`, `tls-san` verified on all three nodes' certificates. |
+| Terraform | v1.9.0 | Deployed, 3 nodes, with the NLB. |
+
+**Configurations**
+
+| | Tested | Untested |
+|---|---|---|
+| Node count | 3 | 1 and 5 are implemented and allowed, but never deployed |
+| Instance type | `m8i.4xlarge` | Every other allowed value. They are filtered on nested virtualization support, not verified |
+| Node role | `default` (1-3) | `worker` (nodes 4-5 at `node_count = 5`), `witness` — the script warns on the latter |
+| Availability zone | single | Multi-AZ is not implemented |
+| Region | `us-east-2` | Nothing is region-specific except the AMI, which is per-region by construction |
+
+---
+
 ## Requirements
 
 **Instance type must support nested virtualization and boot UEFI.**
@@ -210,9 +248,9 @@ Download from the [Harvester releases](https://github.com/harvester/harvester/re
 into `./artifacts/`:
 
 ```
-harvester-v1.8.2-amd64.iso
-harvester-v1.8.2-vmlinuz-amd64
-harvester-v1.8.2-initrd-amd64
+harvester-v<version>-amd64.iso
+harvester-v<version>-vmlinuz-amd64
+harvester-v<version>-initrd-amd64
 ```
 
 ## Phase 1 — build the raw image
@@ -221,7 +259,7 @@ harvester-v1.8.2-initrd-amd64
 ./scripts/01-build-instance.sh
 ```
 
-Produces `artifacts/harvester-v1.8.2-amd64.raw{,.zst}` — 250 GiB by default,
+Produces `artifacts/harvester-v<version>-amd64.raw{,.zst}` — 250 GiB by default,
 UEFI, with
 `mode: install` in `/oem/harvester.config`. The whole guest console is copied to
 `artifacts/harvester-install-console.log`, and the script checks that log and
@@ -240,7 +278,7 @@ because a failed *script* is not the same as a failed *install* — if the guest
 reached `Powering off.` the image is complete and only needs compressing:
 
 ```bash
-zstd -T0 --force artifacts/harvester-v1.8.2-amd64.raw
+zstd -T0 --force artifacts/harvester-v<version>-amd64.raw
 ```
 
 Override with env vars: `HARVESTER_VERSION`, `DISK_SIZE_GIB`,
@@ -277,14 +315,14 @@ while the installer writes, starving the guest.
 Upload:
 
 ```bash
-aws s3 cp artifacts/harvester-v1.8.2-amd64.raw.zst s3://your-bucket/
+aws s3 cp artifacts/harvester-v<version>-amd64.raw.zst s3://your-bucket/
 ```
 
 Attach a volume of **exactly `DISK_SIZE_GIB`** to a helper instance (250 GiB
 by default). Then:
 
 ```bash
-sudo ./scripts/01b-write-image.sh --source s3://your-bucket/harvester-v1.8.2-amd64.raw.zst --device /dev/nvme1n1
+sudo ./scripts/01b-write-image.sh --source s3://your-bucket/harvester-v<version>-amd64.raw.zst --device /dev/nvme1n1
 ```
 
 > `01b-write-image.sh` fetches the object in ranged chunks instead. Each chunk
@@ -355,7 +393,7 @@ no console at all.
 ```bash
 # after detaching the volume from the helper instance
 SNAP=$(aws ec2 create-snapshot --volume-id vol-xxxxxxxx \
-        --description "harvester-v1.8.2" \
+        --description "harvester-v<version>" \
         --query SnapshotId --output text)
 
 # Poll rather than `aws ec2 wait snapshot-completed`. Every EC2 waiter gives up
@@ -368,7 +406,7 @@ until [ "$(aws ec2 describe-snapshots --snapshot-ids "$SNAP" \
 done
 
 aws ec2 register-image \
-  --name "harvester-v1.8.2" \
+  --name "harvester-v<version>" \
   --architecture x86_64 \
   --virtualization-type hvm \
   --boot-mode uefi \

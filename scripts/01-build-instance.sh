@@ -40,7 +40,7 @@ set -euo pipefail
 # Ctrl-C goes to the guest; to abort the build press Ctrl-A then X.
 # =============================================================================
 
-HARVESTER_VERSION="${HARVESTER_VERSION:-v1.8.2}"
+HARVESTER_VERSION="${HARVESTER_VERSION:-v1.9.0}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-./artifacts}"
 
 PROJECT_PREFIX="harvester-${HARVESTER_VERSION}"

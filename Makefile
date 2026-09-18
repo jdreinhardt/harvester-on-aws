@@ -20,7 +20,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-HARVESTER_VERSION ?= v1.8.2
+HARVESTER_VERSION ?= v1.9.0
 VOLUME_SIZE       ?= 250
 SSM_PARAMETER     ?= /harvester/ami/latest
 # AMI names must be unique per account per region: register-image rejects a
