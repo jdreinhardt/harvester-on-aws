@@ -18,13 +18,14 @@ What does work:
 * A repeatable image build.
 * A CloudFormation template that deploys one, three, or five nodes.
 * VM networking that works, with internet access.
-* A high-availability three-node control plane.
-* A high-availability kubernetes management endpoint.
+* A high-availability management endpoint.
+* A high-availability kubernetes control plane.
 
 What doesn't work:
 
-* Bridge or VLAN networks
-* VIP failover
+* Bridge or VLAN networks.
+* VIP failover. See [the readme](README.md#the-vip-does-not-fail-over) for
+  what this impacts.
 
 ---
 
@@ -137,7 +138,7 @@ reached in return.
 |---|---|
 | Availability zone | All nodes share one AZ. Survives node failure, not zone failure. |
 | Certificates | The UI certificate is self-signed. Getting rid of the browser warning needs a domain. |
-| Floating address | The cluster's own floating address is pinned to one node by AWS, while the software that owns it may move it to another. They agree today, but nothing enforces it. The load balancer avoids depending on it. |
+| Floating address | The cluster's own floating address is pinned to one node by AWS, while the software that owns it may move it to another. They agree today, but nothing enforces it. The load balancer avoids depending on it for access; the cluster still depends on it to add nodes. |
 | VM networking | Bridged and VLAN networking will never work on AWS. |
 | Inbound to VMs | Reaching overlay VMs from the VPC needs a route pinned to one node's interface. If that node fails, inbound breaks while outbound keeps working. Manual workaround available. |
 | Image build | Still a manual, out-of-band process. |

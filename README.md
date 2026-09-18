@@ -690,10 +690,10 @@ node and routed to another, and simply stops answering. No failure event, no
 error, just an address that goes dark. Rebinding it is a kube-vip concern; the
 route is an AWS one, and neither knows about the other.
 
-The load balancer sidesteps this entirely, which is the main reason to treat it
-as the real management endpoint rather than a convenience. An overlay VIP driven
-by an agent (below) would fix it properly, by making the AWS side follow the
-election instead of being set once.
+The load balancer sidesteps this for external clients, which is the main reason
+to treat it as the real management endpoint rather than a convenience. An
+overlay VIP driven by an agent (below) would fix it properly, by making the AWS
+side follow the election instead of being set once.
 
 Failing over means moving the secondary private IP between ENIs via the EC2 API
 (`unassign-private-ip-addresses` then `assign-private-ip-addresses`), which
@@ -703,7 +703,13 @@ endpoint.
 
 The CloudFormation template takes the second approach; see
 [Management endpoint](#management-endpoint). The VIP still does not move, but it
-stops being the thing you connect to.
+stops being the thing *you* connect to.
+
+**It does not stop being the thing the cluster connects to.** A load balancer
+cannot serve its own targets, so `server_url` still points at the VIP and a
+joining node still resolves it to node 1's ENI. Losing that node leaves the
+cluster running and the UI reachable, but no further nodes can join until the
+address is moved by hand. The measurement behind that is in the same section.
 
 ---
 
@@ -1176,7 +1182,7 @@ afterwards does **not** recompute it.
 When this is wrong, the failure is **size-dependent**: small requests succeed
 and large transfers stall. That is the signature to look for. A failure that
 hits every packet size equally is *not* this — see
-[natOutgoing](#natoutgoing-is-not-set-by-the-ui), which presents as a total
+[natOutgoing](#natoutgoing--check-it-is-set), which presents as a total
 loss of off-node connectivity regardless of size.
 
 Pin it on the Subnet, which overrides the computed value
