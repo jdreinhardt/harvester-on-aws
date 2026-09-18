@@ -1,0 +1,42 @@
+%{ if length(tls_sans) > 0 ~}
+aws:
+  data_disk_size: "max"
+  tls_sans:
+%{ for san in tls_sans ~}
+    - ${san}
+%{ endfor ~}
+%{ else ~}
+aws:
+  data_disk_size: "max"
+%{ endif ~}
+scheme_version: 1
+token: "${cluster_token}"
+%{ if server_url != "" ~}
+server_url: "${server_url}"
+%{ endif ~}
+install:
+  automatic: true
+  mode: ${mode}
+%{ if role != "" ~}
+  role: ${role}
+%{ endif ~}
+  management_interface:
+    interfaces:
+      - name: eth0
+    method: dhcp
+    bond_options:
+      mode: "active-backup"
+      miimon: "100"
+      fail_over_mac: "active"
+    mtu: ${mtu}
+%{ if mode == "create" ~}
+  vip: "${vip}"
+  vip_mode: static
+  harvester:
+    storage_class:
+      replica_count: ${replica_count}
+%{ endif ~}
+%{ if password_hash != "" ~}
+os:
+  password: "${password_hash}"
+%{ endif ~}

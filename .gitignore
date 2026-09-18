@@ -3,3 +3,6 @@ artifacts/
 *.raw
 *.raw.zst
 .make/
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/*.tfplan
