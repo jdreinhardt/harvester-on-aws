@@ -4,7 +4,7 @@ metadata:
   name: vm-overlay
 spec:
   vpc: ovn-cluster
-  provider: <overlay-network>.<overlay-namespace>.ovn  #overlay-network.default.ovn
+  provider: <overlay-network-name>.<overlay-namespace>.ovn  #overlay-network.default.ovn
   cidrBlock: 10.60.0.0/24
   gateway: 10.60.0.1
   protocol: IPv4

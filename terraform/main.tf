@@ -1,7 +1,7 @@
 # =============================================================================
 # Harvester (SUSE Virtualization) on EC2 -- 1, 3 or 5 nodes.
 #
-# Equivalent to harvester-cluster.yaml, but Terraform expresses two things more
+# Equivalent to cloudformation.yaml, but Terraform expresses two things more
 # directly than CloudFormation can:
 #
 #   * admin_cidrs has no cap. CloudFormation cannot build a variable-length list

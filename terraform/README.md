@@ -1,6 +1,6 @@
 # Terraform module
 
-Equivalent to `harvester-cluster.yaml`. Same cluster, same decisions, expressed
+Equivalent to `cloudformation.yaml`. Same cluster, same decisions, expressed
 where Terraform is more direct. See the [main readme](../README.md) for why any
 of it is shaped the way it is — everything there about MTU, TLS SANs, promotion
 and the overlay applies unchanged.

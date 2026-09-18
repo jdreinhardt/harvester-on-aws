@@ -456,7 +456,7 @@ template:
 
 ```bash
 aws cloudformation create-change-set --stack-name probe --change-set-name probe \
-  --change-set-type CREATE --template-body file://harvester-cluster.yaml \
+  --change-set-type CREATE --template-body file://cloudformation.yaml \
   --capabilities CAPABILITY_AUTO_EXPAND --parameters ...
 aws cloudformation get-template --stack-name probe --change-set-name probe \
   --template-stage Processed
@@ -753,14 +753,14 @@ address is moved by hand. The measurement behind that is in the same section.
 
 ## CloudFormation
 
-`harvester-cluster.yaml` deploys 1, 3 or 5 nodes from an AMI you have already
+`cloudformation.yaml` deploys 1, 3 or 5 nodes from an AMI you have already
 built. It does not build the AMI — phases 0–2 still run by
 hand, and the AMI id is a parameter.
 
 ```bash
 aws cloudformation create-stack \
   --stack-name harvester \
-  --template-body file://harvester-cluster.yaml \
+  --template-body file://cloudformation.yaml \
   --parameters \
     ParameterKey=AmiSsmParameter,ParameterValue=/harvester/ami/latest \
     ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
@@ -1170,6 +1170,10 @@ spec:
   enableDHCP: true
   dhcpV4Options: "dns_server=172.31.0.2"
 ```
+
+The same manifest, with the MTU from 5b already set and each field annotated, is
+in [`examples/ovn-subnet.yml`](examples/ovn-subnet.yml) — edit `provider` and
+`dhcpV4Options`, then apply it.
 
 **`dhcpV4Options` is not optional.** With `enableDHCP: true` and nothing else,
 the guest gets an address and a gateway but `/etc/resolv.conf` comes back
