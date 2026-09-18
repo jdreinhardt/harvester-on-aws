@@ -8,7 +8,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::LanguageExtensions
 
 Description: >-
-  Harvester (SUSE Virtualization) on EC2 -- 1, 3 or 5 nodes. Requires an AMI
+  Harvester on EC2 -- 1, 3 or 5 nodes. Requires an AMI
   built by phases 1 and 2 of this repository; the template launches and wires
   it, it does not build it.
 

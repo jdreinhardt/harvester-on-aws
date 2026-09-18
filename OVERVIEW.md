@@ -8,7 +8,7 @@ see [the readme](README.md).
 
 ## Goal and result
 
-The goal was Harvester (SUSE Virtualization) running on EC2. More than just
+The goal was Harvester running on EC2. More than just
 running, it needed to *feel* cloud-native in its deployment. That meant
 deployment should be simple, clustering included, along with the expected
 functionality of deploying and running virtual machines.

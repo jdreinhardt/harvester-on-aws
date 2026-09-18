@@ -1,11 +1,11 @@
-# Harvester (SUSE Virtualization) on AWS EC2
+# Harvester on AWS EC2
 
 Builds an EC2 AMI from a stock Harvester ISO and boots it into a working,
 self-bootstrapping Harvester cluster — one node, or three to five with an HA
 control plane. Scripts for the image build and a CloudFormation template for
 the deployment.
 
-Targets Harvester **v1.8.2**.
+Targets Harvester **v1.8.2+**.
 
 For a high-level account of what this does and why — rather than how — see
 [OVERVIEW.md](OVERVIEW.md).
@@ -407,7 +407,8 @@ existing one, use `--join` — see [Clustering](#clustering).
 `--dry-run` prints the configuration and launch parameters without creating
 anything, and makes no API calls beyond the read-only preflight.
 
-The whole stack can also be deployed through a CloudFormation template found in this repository.
+The whole stack can also be deployed through a CloudFormation template found in this repository,
+or the equivalent [Terraform module](terraform/README.md).
 
 **`validate-template` is a weak check.** It does not run transforms, and it does
 not check parameter defaults against their type. It will happily pass a template
