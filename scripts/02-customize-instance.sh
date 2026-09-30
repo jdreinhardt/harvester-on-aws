@@ -12,8 +12,10 @@ set -euo pipefail
 # What it does, and why each piece is needed:
 #
 #   1. Repair the GPT backup header if the volume is larger than the image.
-#   2. Force the ESP boot path to /EFI/BOOT/BOOTX64.EFI, which is the removable
-#      media path AWS firmware boots for an AMI registered from a snapshot.
+#   2. Force the ESP boot path to /EFI/BOOT/BOOTX64.EFI (amd64) or
+#      /EFI/BOOT/BOOTAA64.EFI (arm64), the removable media path AWS firmware
+#      boots for an AMI registered from a snapshot. Which one is needed is read
+#      off the image, not assumed.
 #   3. Point the installed system's console at ttyS0 only, so the EC2 serial
 #      console shows GRUB, the kernel, systemd, the Harvester installer and
 #      later the Harvester dashboard. Also force net.ifnames=0 so the ENA
@@ -219,13 +221,14 @@ fi
 # =============================================================================
 echo "[2/7] Normalising EFI boot path..."
 
-# elemental writes EFI/BOOT/bootx64.efi (see elemental-toolkit
-# pkg/utils/grub.go: writeShim := "bootx64.efi"). UEFI is supposed to match
+# elemental writes EFI/BOOT/bootx64.efi on amd64 and EFI/BOOT/bootaa64.efi on
+# arm64 (see elemental-toolkit pkg/utils/grub.go: writeShim). UEFI is supposed to match
 # FAT paths case-insensitively, but AWS's firmware boots the removable media
 # path and there is no NVRAM boot entry in an AMI registered from a snapshot,
 # so make the name exactly what the spec calls for. FAT cannot rename in place
 # across case, hence the copy-out/copy-back.
 EFI_DIR="$MNT_GRUB/EFI"
+BOOT_EFI=""
 
 normalize_name() {
     # $1 = parent dir, $2 = wanted name
@@ -264,7 +267,29 @@ normalize_name() {
 if [ -d "$EFI_DIR" ]; then
     normalize_name "$EFI_DIR" "BOOT"
     if [ -d "$EFI_DIR/BOOT" ]; then
-        normalize_name "$EFI_DIR/BOOT" "BOOTX64.EFI"
+        # Read the architecture off the image rather than assuming it, or
+        # taking it from the helper's uname: this phase is pure file
+        # manipulation, so a helper of either architecture can customize
+        # either image, and the loader elemental actually wrote is the
+        # authoritative answer. -iname because it is written lowercase.
+        BOOT_EFI=""
+        for cand in BOOTX64.EFI BOOTAA64.EFI; do
+            if find "$EFI_DIR/BOOT" -maxdepth 1 -iname "$cand" | grep -q .; then
+                BOOT_EFI="$cand"
+                break
+            fi
+        done
+        if [ -n "$BOOT_EFI" ]; then
+            echo "  removable-media loader for this image: ${BOOT_EFI}"
+            normalize_name "$EFI_DIR/BOOT" "$BOOT_EFI"
+        else
+            echo "" >&2
+            echo "ERROR: no BOOTX64.EFI or BOOTAA64.EFI under ${EFI_DIR}/BOOT." >&2
+            echo "       Without the removable-media path AWS firmware has" >&2
+            echo "       nothing to boot, since an AMI registered from a" >&2
+            echo "       snapshot carries no NVRAM boot entry." >&2
+            exit 1
+        fi
     fi
     echo "  ESP contents:"
     ls -la "$EFI_DIR/BOOT/" | sed 's/^/    /'
@@ -947,7 +972,7 @@ cat <<SUMMARY
 Phase 2 complete
 =============================================
 
-COS_GRUB   EFI/BOOT/BOOTX64.EFI
+COS_GRUB   EFI/BOOT/${BOOT_EFI}
 COS_STATE  active.img + passive.img -> console=ttyS0 only, net.ifnames=0
            grubcustom -> same, as an upgrade-proof fallback
 COS_OEM    99_aws.yaml            -> runs aws/stage-initramfs.sh each boot

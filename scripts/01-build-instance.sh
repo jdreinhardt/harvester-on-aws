@@ -30,11 +30,18 @@ set -euo pipefail
 # single-use.
 #
 # Prerequisites:
-#   - qemu-system-x86_64 with KVM
-#   - OVMF UEFI firmware (UEFI only -- Harvester dropped legacy BIOS support,
-#     and AWS needs an ESP at /EFI/BOOT/BOOTX64.EFI to boot the AMI)
-#   - Harvester ISO, vmlinuz and initrd in ./artifacts/
+#   - qemu-system-x86_64 (amd64) or qemu-system-aarch64 (arm64), with KVM
+#   - UEFI firmware: OVMF on amd64, AAVMF/edk2-aarch64 on arm64. UEFI only --
+#     Harvester dropped legacy BIOS support, and AWS needs an ESP at
+#     /EFI/BOOT/BOOTX64.EFI (amd64) or /EFI/BOOT/BOOTAA64.EFI (arm64) to boot
+#     the AMI. Phase 2 normalises that name.
+#   - Harvester ISO, vmlinuz and initrd for the target arch in ./artifacts/
 #   - openssl (to hash the OS password -- see note below)
+#
+# Architecture is taken from the host, because --enable-kvm cannot cross-
+# emulate: an arm64 image has to be built on an arm64 machine. On AWS that
+# means a Graviton *bare metal* instance, since no virtualized Graviton type
+# offers nested virtualization.
 #
 # While QEMU is running the terminal belongs to the guest serial console.
 # Ctrl-C goes to the guest; to abort the build press Ctrl-A then X.
@@ -43,21 +50,104 @@ set -euo pipefail
 HARVESTER_VERSION="${HARVESTER_VERSION:-v1.9.0}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-./artifacts}"
 
+# --- Architecture ---------------------------------------------------------
+# KVM cannot cross-emulate, so the guest arch is the host arch. ARCH exists as
+# an override only so the failure is a clear message rather than a confusing
+# QEMU error.
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+    x86_64|amd64)  HOST_ARCH="amd64" ;;
+    aarch64|arm64) HOST_ARCH="arm64" ;;
+    *) echo "ERROR: unsupported host architecture: ${HOST_ARCH}" >&2; exit 1 ;;
+esac
+ARCH="${ARCH:-$HOST_ARCH}"
+
+if [ "$ARCH" != "$HOST_ARCH" ]; then
+    echo "ERROR: ARCH=${ARCH} but this host is ${HOST_ARCH}." >&2
+    echo "       The install runs under KVM, which cannot emulate a foreign" >&2
+    echo "       architecture. Build ${ARCH} images on an ${ARCH} machine." >&2
+    exit 1
+fi
+
+# Per-architecture QEMU and firmware settings.
+#
+#   machine   aarch64 has no q35. Its `virt` machine also cannot fall back to
+#             GICv2 on a Graviton host -- the host kernel reports
+#             "GICv3: no GICV resource entry / disabling GICv2 emulation" --
+#             so gic-version=3 is required, not preferred.
+#   cpu       +topoext is an AMD SMT topology flag with no aarch64 equivalent.
+#   tty       QEMU's `virt` machine provides a PL011 at ttyAMA0; q35 provides a
+#             16550 at ttyS0. This is the BUILD console only. The installed
+#             system's console is set by phase 2, and on EC2 that is ttyS0 for
+#             both architectures -- Nitro presents a 16550 even on Graviton.
+#   pflash    See the padding note further down.
+case "$ARCH" in
+    amd64)
+        QEMU_BIN="qemu-system-x86_64"
+        QEMU_MACHINE="q35,smm=off"
+        QEMU_CPU="host,+topoext"
+        GUEST_TTY="ttyS0"
+        # biosdevname is a Dell x86 NIC-naming scheme; no aarch64 equivalent.
+        EXTRA_KARGS="biosdevname=0"
+        # OVMF paths -- adjust for your distro
+        #   openSUSE:  /usr/share/qemu/ovmf-x86_64-code.bin  or  /usr/share/OVMF/x64/OVMF_CODE.4m.fd
+        #   Fedora:    /usr/share/edk2/ovmf/OVMF_CODE.fd
+        #   Debian:    /usr/share/OVMF/OVMF_CODE_4M.fd
+        FW_CODE_DEFAULT="/usr/share/OVMF/x64/OVMF_CODE.4m.fd"
+        FW_VARS_DEFAULT="/usr/share/OVMF/x64/OVMF_VARS.4m.fd"
+        FW_PFLASH_SIZE=0
+        ;;
+    arm64)
+        QEMU_BIN="qemu-system-aarch64"
+        QEMU_MACHINE="virt,gic-version=3"
+        QEMU_CPU="host"
+        GUEST_TTY="ttyAMA0"
+        EXTRA_KARGS=""
+        # AAVMF paths -- adjust for your distro
+        #   AL2023/Fedora: /usr/share/edk2/aarch64/QEMU_EFI.fd
+        #   Debian/Ubuntu: /usr/share/AAVMF/AAVMF_CODE.fd
+        FW_CODE_DEFAULT="/usr/share/edk2/aarch64/QEMU_EFI.fd"
+        FW_VARS_DEFAULT="/usr/share/edk2/aarch64/QEMU_VARS.fd"
+        FW_PFLASH_SIZE=67108864   # 64 MiB, exactly
+        ;;
+    *)
+        echo "ERROR: unsupported ARCH: ${ARCH} (expected amd64 or arm64)" >&2
+        exit 1
+        ;;
+esac
+
+# The INSTALLED system's console, which is NOT the same as GUEST_TTY above.
+#
+#   GUEST_TTY   where the build-time installer TUI and kernel messages go,
+#               under QEMU. Per-arch: q35 gives a 16550 at ttyS0, virt gives a
+#               PL011 at ttyAMA0.
+#   TARGET_TTY  what harvester.install.tty becomes -- HARVESTER_TTY, which
+#               harv-install's update_grub_settings() writes into
+#               /etc/cos/bootargs.cfg on the installed system. That system
+#               boots on EC2, not under QEMU, and Nitro presents a 16550 as
+#               ttyS0 on Graviton as well as x86 (confirmed from /proc/cmdline
+#               on a c6g.metal instance). So this is ttyS0 for both arches.
+#
+# These coincide on amd64, which is why a single value worked until arm64.
+# Passing GUEST_TTY here bakes ttyAMA0 into /oem/harvester.config, which then
+# disagrees with the bootargs phase 2 writes -- harmless until something
+# regenerates them from the config, at which point the console disappears.
+TARGET_TTY="ttyS0"
+
 PROJECT_PREFIX="harvester-${HARVESTER_VERSION}"
-RAW_IMAGE_NAME="${PROJECT_PREFIX}-amd64.raw"
-ISO_PATH="${ARTIFACTS_DIR}/${PROJECT_PREFIX}-amd64.iso"
-VMLINUZ_PATH="${ARTIFACTS_DIR}/${PROJECT_PREFIX}-vmlinuz-amd64"
-INITRD_PATH="${ARTIFACTS_DIR}/${PROJECT_PREFIX}-initrd-amd64"
+RAW_IMAGE_NAME="${PROJECT_PREFIX}-${ARCH}.raw"
+ISO_PATH="${ARTIFACTS_DIR}/${PROJECT_PREFIX}-${ARCH}.iso"
+VMLINUZ_PATH="${ARTIFACTS_DIR}/${PROJECT_PREFIX}-vmlinuz-${ARCH}"
+INITRD_PATH="${ARTIFACTS_DIR}/${PROJECT_PREFIX}-initrd-${ARCH}"
 RAW_IMAGE_PATH="${ARTIFACTS_DIR}/${RAW_IMAGE_NAME}"
 INSTALL_LOG="${ARTIFACTS_DIR}/harvester-install-console.log"
 
-# OVMF paths -- adjust for your distro
-#   openSUSE:  /usr/share/qemu/ovmf-x86_64-code.bin  or  /usr/share/OVMF/x64/OVMF_CODE.4m.fd
-#   Fedora:    /usr/share/edk2/ovmf/OVMF_CODE.fd
-#   Debian:    /usr/share/OVMF/OVMF_CODE_4M.fd
-OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/x64/OVMF_CODE.4m.fd}"
-OVMF_VARS_TEMPLATE="${OVMF_VARS_TEMPLATE:-/usr/share/OVMF/x64/OVMF_VARS.4m.fd}"
-OVMF_LOCAL_VARS="${ARTIFACTS_DIR}/OVMF_VARS.4m.fd"
+# The Makefile passes these in as OVMF_* for both architectures; on arm64 they
+# point at AAVMF/edk2-aarch64 images despite the name.
+OVMF_CODE="${OVMF_CODE:-$FW_CODE_DEFAULT}"
+OVMF_VARS_TEMPLATE="${OVMF_VARS_TEMPLATE:-$FW_VARS_DEFAULT}"
+# Per-arch so amd64 and arm64 builds can share an artifacts directory.
+OVMF_LOCAL_VARS="${ARTIFACTS_DIR}/uefi-vars-${ARCH}.fd"
 
 # 250 GiB is the minimum Harvester accepts for a single-disk install
 # (config.SingleDiskMinSizeGiB). Keep this EXACTLY equal to the EBS volume size
@@ -111,6 +201,7 @@ Usage: $0 [--force] [--device /dev/nvmeXn1]
 
 Environment overrides:
   HARVESTER_VERSION   default ${HARVESTER_VERSION}
+  ARCH                default ${ARCH} (from the host; amd64 or arm64)
   ARTIFACTS_DIR       default ${ARTIFACTS_DIR}
   DISK_SIZE_GIB       default ${DISK_SIZE_GIB}
   PERSISTENT_SIZE     default ${PERSISTENT_SIZE}
@@ -119,7 +210,8 @@ Environment overrides:
   QEMU_TIMEOUT        default ${QEMU_TIMEOUT} seconds (0 disables)
   OS_PASSWORD         default ${OS_PASSWORD}
   OS_PASSWORD_HASH    a SHA-512 crypt hash, used instead of hashing OS_PASSWORD
-  OVMF_CODE, OVMF_VARS_TEMPLATE
+  OVMF_CODE           default ${OVMF_CODE}
+  OVMF_VARS_TEMPLATE  default ${OVMF_VARS_TEMPLATE}
 USAGE
 }
 
@@ -132,7 +224,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== Phase 1: Build pre-installed Harvester raw image (${HARVESTER_VERSION}) ==="
+echo "=== Phase 1: Build pre-installed Harvester raw image (${HARVESTER_VERSION}, ${ARCH}) ==="
 echo ""
 
 # --- Validation ---
@@ -143,7 +235,7 @@ for f in "$ISO_PATH" "$VMLINUZ_PATH" "$INITRD_PATH" "$OVMF_CODE"; do
     fi
 done
 
-command -v qemu-system-x86_64 >/dev/null || { echo "ERROR: qemu-system-x86_64 not found" >&2; exit 1; }
+command -v "$QEMU_BIN" >/dev/null || { echo "ERROR: ${QEMU_BIN} not found" >&2; exit 1; }
 command -v qemu-img          >/dev/null || { echo "ERROR: qemu-img not found" >&2; exit 1; }
 [ -n "$DEVICE" ] || command -v zstd >/dev/null || { echo "ERROR: zstd not found" >&2; exit 1; }
 
@@ -235,14 +327,56 @@ esac
 
 mkdir -p "${ARTIFACTS_DIR}"
 
-# Writable copy of the OVMF variable store
-if [ ! -f "$OVMF_LOCAL_VARS" ]; then
+# --- UEFI firmware images -------------------------------------------------
+#
+# The variable store always needs a writable copy. On aarch64 BOTH pflash
+# images additionally have to be padded to exactly 64 MiB, because the `virt`
+# machine declares two fixed-size flash banks and refuses anything else:
+#
+#   cfi.pflash01 device '/machine/virt.flash0' requires 67108864 bytes,
+#   pflash0 block backend provides 3145728 bytes
+#
+# Distro edk2-aarch64 packages ship a 3 MiB code image and a 768 KiB variable
+# store, so both are rejected as shipped. x86's q35 sizes its pflash to the
+# backing file, which is why the amd64 path never needed this.
+#
+# The padded copies live in ARTIFACTS_DIR rather than overwriting the packaged
+# files, which a package update would revert anyway.
+install_pflash() {
+    # $1 = source, $2 = destination. Pads when FW_PFLASH_SIZE is non-zero.
+    local src="$1" dst="$2"
+    cp "$src" "$dst"
+    if [ "$FW_PFLASH_SIZE" -gt 0 ]; then
+        truncate -s "$FW_PFLASH_SIZE" "$dst"
+    fi
+}
+
+# A copy left over from an interrupted run may be the wrong size; regenerate
+# rather than handing QEMU something it will reject.
+pflash_ok() {
+    [ -f "$1" ] || return 1
+    [ "$FW_PFLASH_SIZE" -eq 0 ] && return 0
+    [ "$(wc -c < "$1" 2>/dev/null || echo 0)" -eq "$FW_PFLASH_SIZE" ]
+}
+
+if [ "$FW_PFLASH_SIZE" -gt 0 ]; then
+    command -v truncate >/dev/null || {
+        echo "ERROR: truncate not found; needed to pad ${ARCH} pflash images." >&2
+        exit 1
+    }
+    FW_CODE="${ARTIFACTS_DIR}/uefi-code-${ARCH}.fd"
+    pflash_ok "$FW_CODE" || install_pflash "$OVMF_CODE" "$FW_CODE"
+else
+    FW_CODE="$OVMF_CODE"
+fi
+
+if ! pflash_ok "$OVMF_LOCAL_VARS"; then
     if [ ! -f "$OVMF_VARS_TEMPLATE" ]; then
-        echo "ERROR: OVMF_VARS template not found at $OVMF_VARS_TEMPLATE" >&2
+        echo "ERROR: UEFI variable store template not found at $OVMF_VARS_TEMPLATE" >&2
         echo "       Set OVMF_VARS_TEMPLATE for your distro." >&2
         exit 1
     fi
-    cp "$OVMF_VARS_TEMPLATE" "$OVMF_LOCAL_VARS"
+    install_pflash "$OVMF_VARS_TEMPLATE" "$OVMF_LOCAL_VARS"
 fi
 
 # QEMU puts the terminal into raw mode for the guest serial console. If the
@@ -261,6 +395,7 @@ fi
 cat <<BANNER
 
 Starting Harvester install (UEFI, install-mode-only).
+  arch:    ${ARCH} on ${QEMU_BIN}, -machine ${QEMU_MACHINE}
   guest:   ${SMP}, ${MEMORY_MIB} MiB
   console: below, and copied to ${INSTALL_LOG}
   abort:   Ctrl-A then X   (plain Ctrl-C goes to the guest)
@@ -273,13 +408,17 @@ BANNER
 
 # Kernel arguments, and why:
 #
-#   console=ttyS0,115200n8   Installer TUI and kernel messages on the serial
+#   console=<tty>,115200n8   Installer TUI and kernel messages on the serial
 #                            port. /sys/class/tty/console/active lists the
 #                            *preferred* console last, and both
 #                            setup-installer.sh and console.isFirstConsoleTTY()
-#                            key off the FIRST entry -- so ttyS0 must come
-#                            before any tty1 for the installer to land on
-#                            serial. Here there is no tty1 at all.
+#                            key off the FIRST entry -- so the serial console
+#                            must come before any tty1 for the installer to
+#                            land on it. Here there is no tty1 at all.
+#                            ttyS0 on amd64 (q35's 16550), ttyAMA0 on arm64
+#                            (virt's PL011). BUILD console only -- phase 2
+#                            rewrites the installed system's console to ttyS0,
+#                            which is what EC2 presents on both arches.
 #   net.ifnames=0            Predictable eth0. AWS ENA would otherwise be ens5,
 #                            and the management interface is named in config.
 #   rd.cos.disable           Don't run the cOS/elemental initrd logic for the
@@ -294,10 +433,14 @@ BANNER
 #   harvester.install.skipchecks=true
 #                            The build VM is virtualized and under-specced
 #                            relative to Harvester's production preflight.
-#   harvester.install.tty=ttyS0
+#   harvester.install.tty=${TARGET_TTY}
 #                            Becomes HARVESTER_TTY, which harv-install's
 #                            update_grub_settings() uses to patch
 #                            /etc/cos/bootargs.cfg on the installed system.
+#                            Deliberately TARGET_TTY, not GUEST_TTY: this
+#                            describes where the node's console will be on
+#                            EC2, not where the installer is drawing right
+#                            now. See the TARGET_TTY note above.
 #
 # Disk options:
 #   cache=none    O_DIRECT. With cache=writeback a 250 GiB image fills the host
@@ -307,8 +450,8 @@ BANNER
 #   discard=unmap Keep the sparse file sparse.
 QEMU_ARGS=(
     --enable-kvm -nographic
-    -machine q35,smm=off
-    -cpu host,+topoext -smp "${SMP}" -m "${MEMORY_MIB}"
+    -machine "${QEMU_MACHINE}"
+    -cpu "${QEMU_CPU}" -smp "${SMP}" -m "${MEMORY_MIB}"
     # Equivalent to -serial mon:stdio, but also copies the console to a file so
     # a failed install can be read after the fact instead of scraped out of
     # terminal scrollback.
@@ -318,18 +461,18 @@ QEMU_ARGS=(
     -nic none
     -drive file="$TARGET",if=virtio,cache=none,discard=unmap,format=raw
     -drive file="${ISO_PATH}",if=virtio,media=cdrom,readonly=on
-    -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}"
+    -drive if=pflash,format=raw,readonly=on,file="${FW_CODE}"
     -drive if=pflash,format=raw,file="${OVMF_LOCAL_VARS}"
     -kernel "${VMLINUZ_PATH}"
     -initrd "${INITRD_PATH}"
     -append "root=live:CDLABEL=COS_LIVE rd.live.dir=/ rd.live.ram=1 rd.live.squashimg=rootfs.squashfs \
-console=ttyS0,115200n8 net.ifnames=0 biosdevname=0 rd.cos.disable \
+console=${GUEST_TTY},115200n8 net.ifnames=0 ${EXTRA_KARGS} rd.cos.disable \
 harvester.install.mode=install \
 harvester.install.device=/dev/vda \
 harvester.install.automatic=true \
 harvester.install.powerOff=true \
 harvester.install.skipchecks=true \
-harvester.install.tty=ttyS0 \
+harvester.install.tty=${TARGET_TTY} \
 harvester.install.persistentPartitionSize=${PERSISTENT_SIZE} \
 harvester.os.password=${OS_PASSWORD_HASH} \
 harvester.scheme_version=1"
@@ -338,9 +481,9 @@ harvester.scheme_version=1"
 QEMU_RC=0
 if [ "${QEMU_TIMEOUT}" -gt 0 ] && command -v timeout >/dev/null; then
     timeout --foreground -k 30 "${QEMU_TIMEOUT}" \
-        qemu-system-x86_64 "${QEMU_ARGS[@]}" || QEMU_RC=$?
+        "$QEMU_BIN" "${QEMU_ARGS[@]}" || QEMU_RC=$?
 else
-    qemu-system-x86_64 "${QEMU_ARGS[@]}" || QEMU_RC=$?
+    "$QEMU_BIN" "${QEMU_ARGS[@]}" || QEMU_RC=$?
 fi
 restore_tty
 
