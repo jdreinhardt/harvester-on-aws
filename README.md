@@ -2,10 +2,13 @@
 
 Builds an EC2 AMI from a stock Harvester ISO and boots it into a working,
 self-bootstrapping Harvester cluster — one node, or three to five with an HA
-control plane. Scripts for the image build and a CloudFormation template for
-the deployment.
+control plane, on x86 or Arm. Scripts for the image build, plus a CloudFormation
+template and a Terraform module for the deployment.
 
-Current default targets Harvester **v1.9.0**.
+Current default targets Harvester **v1.9.0** on **amd64**. See
+[What has been tested](#what-has-been-tested) before assuming another version,
+architecture or configuration works — notably, Arm guest VMs do not boot on
+v1.9.0 due to an upstream firmware bug.
 
 For a high-level account of what this does and why — rather than how — see
 [OVERVIEW.md](OVERVIEW.md).
@@ -18,12 +21,31 @@ For a high-level account of what this does and why — rather than how — see
 make ami SUBNET_ID=subnet-xxxxxxxx KEY_NAME=my-key
 ```
 
-That builds an AMI end to end — roughly two hours, most of it the install and
-the snapshot — and publishes the id to SSM, where the CloudFormation template
-picks it up. Then:
+That builds an **amd64** AMI end to end — roughly two hours, most of it the
+install and the snapshot — and publishes the id to
+`/harvester/ami/amd64/latest`, where the CloudFormation template picks it up.
+
+For arm64, which runs on Graviton bare metal:
 
 ```bash
-make teardown        # remove the helper instance, volume and security group
+make ami ARCH=arm64 SUBNET_ID=subnet-xxxxxxxx KEY_NAME=my-key
+```
+
+Or both at once. Nothing is shared between them — separate helper instance,
+volume, security group, state directory, AMI name and SSM path — so they run in
+parallel with no terminal multiplexer and no `-j`:
+
+```bash
+make ami-all SUBNET_ID=subnet-xxxxxxxx KEY_NAME=my-key
+```
+
+Each build logs to `.make/<arch>/build.log` rather than interleaving on one
+terminal; follow with `tail -f`. Then:
+
+```bash
+make teardown                   # remove the helper instance, volume and security group
+make teardown ARCH=arm64        # the arm64 build's resources
+make teardown-all               # both
 ```
 
 The Makefile only fills the gaps between the numbered scripts: AWS resource
@@ -36,9 +58,9 @@ there is no raw image file, no `zstd`, and no S3 round trip — phases 1 and 1.5
 collapse into one step, and `01b-write-image.sh` is only needed if you are
 moving a prebuilt image around.
 
-Progress is stamped under `.make/`, so an interrupted run resumes instead of
-repeating the install. That also means **`make ami` is a no-op after a
-successful run** — `.make/ami-id` already exists. To build again:
+Progress is stamped under `.make/<arch>/`, so an interrupted run resumes instead
+of repeating the install. That also means **`make ami` is a no-op after a
+successful run** — `.make/<arch>/ami-id` already exists. To build again:
 
 ```bash
 make rebuild        # teardown + clear the stamps
@@ -52,7 +74,7 @@ build stamps but keeps `snapshot-id` and `ami-id`.
 **AMI names are unique per account per region.** `register-image` rejects a
 duplicate rather than overwriting, and it does so at the *very end* of a
 two-hour build. So `AMI_NAME` defaults to
-`harvester-$(HARVESTER_VERSION)-$(BUILD_ID)` with a timestamp, and successive
+`harvester-$(HARVESTER_VERSION)-$(ARCH)-$(BUILD_ID)` with a timestamp, and successive
 builds never collide. If you pin `AMI_NAME` yourself, `make check` verifies it
 is free before anything is created.
 
@@ -71,40 +93,65 @@ differs by distro (`/dev/xvda` on AL2023, `/dev/sda1` on Ubuntu). A block device
 mapping that does not match the AMI's root device does not resize the root — it
 silently attaches an **extra** volume and leaves the root at its default size.
 
-`HELPER_OS` is `al2023` (default) or `ubuntu`. Only four things differ between
-them and the Makefile switches all four — package names, the login user, and the
-two OVMF paths, which `01-build-instance.sh` takes as environment variables:
+`HELPER_OS` is `al2023` (default) or `ubuntu`. What differs is the helper AMI,
+the package names, the login user and the firmware paths — and those vary by
+architecture as well, so it is four combinations. The Makefile switches all of
+them; `01-build-instance.sh` takes the firmware paths as environment variables,
+still named `OVMF_*` on both architectures even though on arm64 they point at
+AAVMF images.
 
 | | al2023 | ubuntu |
 |---|---|---|
-| Packages | `qemu-system-x86 qemu-img edk2-ovmf` | `qemu-system-x86 qemu-utils ovmf` |
 | Login user | `ec2-user` | `ubuntu` |
-| OVMF | `/usr/share/OVMF/OVMF_CODE.fd` | `/usr/share/OVMF/OVMF_CODE_4M.fd` |
+| Packages (amd64) | `qemu-system-x86 qemu-img edk2-ovmf` | `qemu-system-x86 qemu-utils ovmf` |
+| Packages (arm64) | `qemu-system-aarch64 qemu-img edk2-aarch64` | `qemu-system-arm qemu-utils qemu-efi-aarch64` |
+| Firmware (amd64) | `/usr/share/OVMF/OVMF_CODE.fd` | `/usr/share/OVMF/OVMF_CODE_4M.fd` |
+| Firmware (arm64) | `/usr/share/edk2/aarch64/QEMU_EFI.fd` | `/usr/share/AAVMF/AAVMF_CODE.fd` |
+
+**arm64 firmware needs padding, and the script does it for you.** QEMU's
+aarch64 `virt` machine declares two **fixed 64 MiB** pflash banks and refuses
+any backing file of a different size. Distro `edk2-aarch64` packages ship a
+3 MiB code image and a 768 KiB variable store, so both are rejected as shipped.
+`01-build-instance.sh` writes padded copies into `artifacts/` rather than
+touching the packaged files. x86's q35 sizes its pflash to the file, which is
+why the amd64 path never needed this.
 
 **Building a different Harvester version** is just the version variable:
 
 ```bash
 make ami SUBNET_ID=subnet-xxxxxxxx KEY_NAME=my-key \
-  HARVESTER_VERSION=v1.8.2 SSM_PARAMETER=/harvester/ami/v1.8.2
+  HARVESTER_VERSION=v1.8.2 SSM_PARAMETER=/harvester/ami/amd64/v1.8.2
 ```
 
 Pass `SSM_PARAMETER` as well when you are testing. Left at its default the build
-repoints `/harvester/ami/latest`, which is what the CloudFormation template
-reads — so the next stack deploy would silently pick up the new, untested image.
+repoints `/harvester/ami/$(ARCH)/latest`, which is what the CloudFormation
+template and the Terraform module read — so the next deploy would silently pick
+up the new, untested image. The architecture is its own path segment precisely
+so an arm64 build can never repoint the parameter an amd64 stack reads.
 
 The version only selects download URLs and file names. Nothing else is pinned to
 a release, but a new one is genuinely untested, and the first things that would
 surface a change are the partition count check at the end of phase 1 (it expects
 six) and the configuration schema (`scheme_version: 1`).
 
-The helper defaults to `m8i.4xlarge` because it needs **nested virtualization**
-for the same reason the Harvester nodes do — the install imports several GB of
-container images through a real RKE2 server, and software emulation turns an
-hour into days. The Makefile launches it with
+The helper needs real `/dev/kvm` for the same reason the Harvester nodes do —
+the install imports several GB of container images through a real RKE2 server,
+and software emulation turns an hour into days. So the helper's architecture
+must match what it is building, and it gets KVM the same way a node of that
+architecture does:
+
+| `ARCH` | Helper default | How it gets `/dev/kvm` |
+|---|---|---|
+| `amd64` | `m8i.4xlarge` | nested virtualization, opt-in at launch |
+| `arm64` | `c6g.metal` | bare metal, native |
+
+On amd64 the Makefile launches it with
 `--cpu-options NestedVirtualization=enabled`, which is **launch-time only**: a
 supported instance type still has no `/dev/kvm` without it, and it cannot be
 turned on afterwards. If a helper somehow comes up without it, `make teardown`
-and relaunch — there is no way to fix it in place. `SSH_CIDR` defaults to this machine's public address rather than
+and relaunch — there is no way to fix it in place. On a `.metal` helper the flag
+is omitted entirely, because metal rejects it rather than ignoring it; the
+Makefile decides from `.metal` in the instance type, not from `ARCH`. `SSH_CIDR` defaults to this machine's public address rather than
 opening SSH to the world.
 
 ---
@@ -177,12 +224,51 @@ rancherd  ->  RKE2  ->  Rancher  ->  harvester / harvester-crd ManagedCharts
 This is a proof of concept. This table shows what has and has not been tested. Anything
 not listed may work, but known state is unclear.
 
+**Architectures**
+
+| | Image build | Bootstrap | Clustering | VM networking | Guest VMs |
+|---|---|---|---|---|---|
+| **amd64** | yes | yes | 3 nodes | yes | yes |
+| **arm64** | yes | yes | 3 nodes | yes | v1.8.2 yes; **v1.9.0 no** — see below |
+
+arm64 runs on Graviton bare metal (`c7g.metal` tested, `c6g.metal` used as the
+build helper). Nodes, clustering, promotion, TLS SANs and overlay VM networking
+all behave the same as on amd64.
+
+**Guest VMs do not boot on arm64 Harvester v1.9.0.** Its `virt-launcher` ships
+`qemu-uefi-aarch64-202502`, which carries an upstream edk2 bug: a DSC
+include-ordering fault resolves `ArmTrngLib` to the NULL implementation, so
+`RngDxe` asserts and dead-loops the firmware the moment the Linux EFI stub asks
+for randomness. The guest console ends at:
+
+```
+EFI stub: Booting Linux Kernel...
+ASSERT [RngDxe] BaseArmTrngLibNull.c(86): ((BOOLEAN)(0==1))
+```
+
+Isolated by swapping only the firmware file with QEMU, the machine type and the
+guest held constant: `202408` (shipped by v1.8.2, SLE 15.7) boots; `202502`
+hangs. It is not CPU-dependent — Graviton2, 3 and 4 all fail identically, and
+RNDR is irrelevant because the assert is in the SMCCC Arm TRNG path, not the
+RNDR instruction path. Fixed upstream by
+[edk2 PR #11052](https://github.com/tianocore/edk2/pull/11052) (merged
+2025-05-12, first in `edk2-stable202505`); needs a SUSE package rebuild to
+reach Harvester. **Until then, v1.8.2 is the working arm64 baseline.**
+
+Diagnose any guest hang from the serial log, never the web console — VNC looks
+identical whether the firmware is dead-looping or the guest booted and stopped
+drawing to the framebuffer:
+
+```bash
+kubectl logs -n default -l kubevirt.io=virt-launcher -c guest-console-log --tail=20
+```
+
 **Harvester versions**
 
 | | Image build | Bootstrap | Clustering | VM networking | Notes |
 |---|---|---|---|---|---|
-| **v1.9.0** | yes | yes | 3 nodes | yes | The default. Validated end to end, via both CloudFormation and Terraform. |
-| **v1.8.2** | yes | yes | 3 nodes | yes | Works, but `natOutgoing` is not exposed in the UI — see [natOutgoing](#natoutgoing--check-it-is-set). |
+| **v1.9.0** | yes | yes | 3 nodes | yes | The default. Validated end to end on amd64, via both CloudFormation and Terraform. On arm64, nodes work but guest VMs do not — see above. |
+| **v1.8.2** | yes | yes | 3 nodes | yes | Works on both architectures, including arm64 guest VMs. But `natOutgoing` is not exposed in the UI — see [natOutgoing](#natoutgoing--check-it-is-set). |
 
 Nothing in the tooling is version-aware, so a newer release will most likely
 build. The two checks that would catch a breaking change are the partition count
@@ -191,43 +277,71 @@ at the end of phase 1 (it expects six) and the configuration schema
 
 **Deployment paths**
 
-| | Tested against | Notes |
-|---|---|---|
-| `make ami` | v1.8.2, v1.9.0 | Built the current published AMI. |
-| Manual scripts (`01`/`02`/`03`) | v1.8.2, v1.9.0 | The original path; the Makefile wraps it. |
-| CloudFormation | v1.8.2, v1.9.0 | Deployed, 3 nodes. On v1.9.0 with `ControlPlaneViaNlb`, `tls-san` verified on all three nodes' certificates. |
-| Terraform | v1.9.0 | Deployed, 3 nodes, with the NLB. |
+| | amd64 | arm64 | Notes |
+|---|---|---|---|
+| `make ami` | v1.8.2, v1.9.0 | v1.8.2, v1.9.0 | Built every currently published AMI. `make ami-all` builds both architectures in parallel. |
+| Manual scripts (`01`/`02`/`03`) | v1.8.2, v1.9.0 | v1.8.2, v1.9.0 | Phases 1 and 2 run by hand on a `c6g.metal` helper. Phase 3 launched a `c7g.metal` node that reached the installer — `CpuOptions.NestedVirtualization` correctly absent, VIP auto-selected and assigned as a secondary. |
+| CloudFormation | v1.8.2, v1.9.0 | v1.8.2, v1.9.0 | amd64: 3 nodes, `tls-san` verified on all three certificates with `ControlPlaneViaNlb`. arm64: 1 and 3 nodes. |
+| Terraform | v1.8.2, v1.9.0 | v1.8.2, v1.9.0 | amd64: 3 nodes with the NLB. arm64: 1 node on `c7g.metal` with the NLB, `cpu_options` correctly omitted. Single-node, so it does not exercise `tls-san` propagation — that was verified on arm64 via CloudFormation instead. |
 
 **Configurations**
 
 | | Tested | Untested |
 |---|---|---|
-| Node count | 3 | 1 and 5 are implemented and allowed, but never deployed |
-| Instance type | `m8i.4xlarge` | Every other allowed value. They are filtered on nested virtualization support, not verified |
+| Node count | 1 and 3 | 5 is implemented and allowed, but never deployed |
+| Instance type | `m8i.4xlarge` (amd64), `c7g.metal` and `m8g.metal-24xl` (arm64) | Every other allowed value. x86 types are filtered on nested-virtualization support and arm64 on being `*.metal`, neither verified by launching |
 | Node role | `default` (1-3) | `worker` (nodes 4-5 at `node_count = 5`), `witness` — the script warns on the latter |
 | Availability zone | single | Multi-AZ is not implemented |
 | Region | `us-east-2` | Nothing is region-specific except the AMI, which is per-region by construction |
+
+**One published AMI is known stale.** `/harvester/ami/amd64/v1.8.2` points at an
+image built before the `tls-san` drop-in was added to `configure.sh`. It is fine
+for a plain deploy, but under `ControlPlaneViaNlb` the 6443 listener fails on
+nodes 2 and 3, because their API server certificates do not carry the load
+balancer's name — and the failure is intermittent by design, appearing only when
+the balancer does not happen to pick node 1. Use `/harvester/ami/amd64/latest`,
+or rebuild v1.8.2 from current sources. The arm64 v1.8.2 image was built later
+and is not affected.
 
 ---
 
 ## Requirements
 
-**Instance type must support nested virtualization and boot UEFI.**
+**Instance type must give Harvester `/dev/kvm` and boot UEFI.**
 
 Harvester needs `/dev/kvm` (`preflight.KVMHostCheck`) or KubeVirt cannot run
-guests. Two separate constraints collide on EC2:
+guests, and it dropped legacy BIOS (`preflight.BIOSCheck`). There are two ways
+to satisfy both, and which one you use depends on the architecture.
 
-* All current x86_64 **bare metal** instances are legacy BIOS only, and
-  Harvester dropped BIOS support (`preflight.BIOSCheck`).
-* **Nested virtualization** on virtualized instances is supported on M7i, M7i-flex,
-  M8i, M8id, M8i-flex, C7i, C7i-flex, C8i, C8id, C8i-flex, R7i, R7iz, R8i,
-  R8id, R8i-flex, X8i, I7i and I7ie — and those are UEFI.
-
-So: `m8i.4xlarge` (the default). It must be launched with
+**x86_64 — nested virtualization on a virtualized instance.** Supported on M7i,
+M7i-flex, M8i, M8id, M8i-flex, C7i, C7i-flex, C8i, C8id, C8i-flex, R7i, R7iz,
+R8i, R8id, R8i-flex, X8i, I7i and I7ie — and those are UEFI. Default:
+`m8i.4xlarge`. It must be launched with
 `--cpu-options NestedVirtualization=enabled`; **it is opt-in per instance**, and
 without it there is no `/dev/kvm` even on a supported type.
-`03-launch-instance.sh` checks both the AMI boot mode and the instance type
-before it launches anything.
+
+x86_64 **bare metal** is not an alternative here: those types are legacy BIOS
+only, so Harvester will not boot on them at all.
+
+**arm64 — bare metal.** No virtualized Graviton type offers nested
+virtualization, so arm64 runs on `*.metal`. That works precisely because the
+BIOS problem is x86-specific: ARM server platforms are UEFI-native (SBBR
+mandates it), so Graviton metal boots UEFI and has the real CPU, needing no
+opt-in at all. Default: `c7g.metal`.
+
+**Metal capacity is per-AZ and can simply run out.** A `c7g.metal` launch in
+`us-east-2b` was refused with `InsufficientInstanceCapacity` while `us-east-2a`
+had capacity the same minute. Bare metal pools are far thinner than virtualized
+ones, so pin the subnet to an AZ that actually has the type, and expect to move
+if it dries up — all the more reason to want multi-AZ eventually.
+
+Metal **rejects** `--cpu-options NestedVirtualization` rather than ignoring it,
+so every launch path omits the flag on metal types — keyed off `.metal` in the
+instance type rather than off an architecture setting, which keeps it correct
+even if you point an x86 build at a metal type.
+
+`03-launch-instance.sh` checks the AMI boot mode, the instance type, and that
+the AMI's architecture matches the instance type, before launching anything.
 
 **Build host** — Linux with KVM, QEMU, OVMF, `zstd`. The build VM defaults to
 **8 vCPU / 16 GiB**, matching what Harvester's own CI uses
@@ -245,13 +359,21 @@ have; `fdisk` is used as a fallback.
 ## Phase 0 — artifacts
 
 Download from the [Harvester releases](https://github.com/harvester/harvester/releases)
-into `./artifacts/`:
+into `./artifacts/`, matching the architecture you are building:
 
 ```
-harvester-v<version>-amd64.iso
-harvester-v<version>-vmlinuz-amd64
-harvester-v<version>-initrd-amd64
+harvester-v<version>-<arch>.iso
+harvester-v<version>-vmlinuz-<arch>
+harvester-v<version>-initrd-<arch>
 ```
+
+`<arch>` is `amd64` or `arm64`, exactly as the release names them —
+`01-build-instance.sh` derives these filenames from `ARCH`, which it takes from
+the host because KVM cannot cross-emulate. `make ami` downloads them for you.
+
+Mixing architectures here is an easy mistake with a confusing failure: an
+x86 initrd beside an arm64 kernel gets you a QEMU error about a missing file
+rather than anything about architecture.
 
 ## Phase 1 — build the raw image
 
@@ -406,7 +528,7 @@ until [ "$(aws ec2 describe-snapshots --snapshot-ids "$SNAP" \
 done
 
 aws ec2 register-image \
-  --name "harvester-v<version>" \
+  --name "harvester-v<version>-<arch>" \
   --architecture x86_64 \
   --virtualization-type hvm \
   --boot-mode uefi \
@@ -416,6 +538,11 @@ aws ec2 register-image \
   --sriov-net-support simple \
   --imds-support v2.0
 ```
+
+For an arm64 image: `--architecture arm64`, and drop `--sriov-net-support`
+(that is the legacy x86 ixgbevf path; Graviton is ENA-only). Everything else is
+identical, including `--boot-mode uefi` and `/dev/sda1`. `make ami` handles this
+from `ARCH`.
 
 `--virtualization-type hvm` is not optional: the CLI defaults to `paravirtual`.
 `--boot-mode uefi` is not optional either — phase 3 refuses to launch otherwise.
@@ -431,8 +558,10 @@ aws ec2 register-image \
 ```
 
 This picks a free VIP from the subnet if you don't pass `--vip`, generates a
-token, builds the Harvester configuration, launches with nested virtualization
-enabled, and assigns the VIP as a secondary private IP on the instance's ENI.
+token, builds the Harvester configuration, launches the instance, and assigns
+the VIP as a secondary private IP on its ENI. Nested virtualization is enabled
+on virtualized instance types and omitted on `.metal` ones. It also refuses to
+launch if the AMI's architecture does not match the instance type's.
 
 `--mtu` defaults to 1500 and you should leave it there. What matters is that it
 is set *at all* — an unset MTU produces a node that cannot talk to other nodes.
@@ -762,7 +891,7 @@ aws cloudformation create-stack \
   --stack-name harvester \
   --template-body file://cloudformation.yaml \
   --parameters \
-    ParameterKey=AmiSsmParameter,ParameterValue=/harvester/ami/latest \
+    ParameterKey=AmiSsmParameter,ParameterValue=/harvester/ami/amd64/latest \
     ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
     ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx \
     ParameterKey=KeyName,ParameterValue=aws-testing \
@@ -780,13 +909,18 @@ Note the escaped comma in `AdminCidrs`: the CLI splits `ParameterValue` on
 commas, so each comma *inside* the value must be `\,`.
 
 `AmiSsmParameter` is the **name of an SSM parameter**, not an AMI id — it
-defaults to `/harvester/ami/latest`, so deploying never involves pasting an AMI.
-Publish it once at the end of phase 2.5:
+defaults to `/harvester/ami/amd64/latest`, so deploying never involves pasting an
+AMI. `make ami` publishes it for you; by hand, at the end of phase 2.5:
 
 ```bash
-aws ssm put-parameter --name /harvester/ami/latest \
+aws ssm put-parameter --name /harvester/ami/amd64/latest \
   --type String --overwrite --value ami-xxxxxxxx
 ```
+
+For an arm64 stack, point it at `/harvester/ami/arm64/latest` **and** pick a
+Graviton `.metal` instance type. The two must agree; CloudFormation cannot
+derive one parameter from another, so a mismatch surfaces only at stack
+creation.
 
 The parameter type is `AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>`, which
 resolves the name to an AMI id at deploy time. It will **not** accept a literal
@@ -972,9 +1106,10 @@ The cluster token is a **placeholder**: CloudFormation outputs have no `NoEcho`
 equivalent, so anything there is readable by anyone with `DescribeStacks`.
 Whoever is adding a node already has the token.
 
-The instance still needs the same AMI, nested virtualization enabled, IMDSv2,
-the cluster's security group and subnet, and a root volume of at least
-`VolumeSize`.
+The instance still needs the same AMI (so the same architecture), IMDSv2, the
+cluster's security group and subnet, and a root volume of at least `VolumeSize`.
+On a virtualized x86 type it also needs nested virtualization enabled; on a
+Graviton `.metal` type that flag must be **omitted**, because metal rejects it.
 
 **Access control.** The prefix list is applied twice — once on the load
 balancer's own security group and again on the nodes. Client IP preservation is
@@ -1049,7 +1184,7 @@ zones — a separate decision.
 | | |
 |---|---|
 | `NodeCount` | 1, 3 or 5. Two is not useful — promotion needs three. At 5, nodes 4 and 5 launch with `install.role=worker` so the management trio is nodes 1–3 by construction, not whichever three the controller picks. |
-| `InstanceType` | A dropdown restricted to nested-virtualization types that clear Harvester's 32 GiB floor. Regenerate it with `describe-instance-types --filters Name=processor-info.supported-features,Values=nested-virtualization`. |
+| `InstanceType` | A dropdown of types that can give Harvester `/dev/kvm` and clear its 32 GiB floor: x86 nested-virtualization types, plus Graviton `.metal` types for arm64. Regenerate the x86 half with `describe-instance-types --filters Name=processor-info.supported-features,Values=nested-virtualization`. Must match `AmiSsmParameter`'s architecture. Adding a metal type means adding it to the `IsGravitonMetal` condition too — `Fn::Or` caps at 10 entries and 8 are used. |
 | `ReplicaCount` | Fixed at bootstrap. Use 3 for a cluster; 1 only for `NodeCount=1`. |
 | `Mtu` | Defaults to 1500. Do not remove it — see [MTU](#mtu-set-it-explicitly). |
 | `VipAddress` | The only address you pick. Node 1's own private address is assigned by EC2 as normal — the ENI declares just the VIP as a secondary. `PrivateIpAddressSpecification` requires both `PrivateIpAddress` and `Primary` on each *entry*, but does not require a `Primary: true` entry to be present. |
@@ -1057,7 +1192,7 @@ zones — a separate decision.
 | `OverlayClientCidr` | Optional. Opens the nodes to this source on **all** protocols, which is what routing traffic into overlay VMs requires. Empty unless you have added the VPC route. |
 | `AmiIdOverride` | Optional literal `ami-…`, bypassing the SSM lookup for a one-off image. |
 | `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
-| `ControlPlaneViaNlb` | Adds 6443 and 9345 to the load balancer and points joining nodes at it. Default `false`; needs an AMI whose `configure.sh` writes the tls-san drop-in. |
+| `ControlPlaneViaNlb` | Adds **6443 only** to the load balancer, for reaching the Kubernetes API from outside the VPC. It does **not** change where joining nodes point — a load balancer cannot be reached by its own registered targets, so `server_url` stays on the VIP. There is deliberately no 9345 listener. Default `false`; needs an AMI whose `configure.sh` writes the tls-san drop-in. |
 | `DisableSourceDestCheck` | Reads as *disable the check*: `true` (the default) disables it, `false` leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
 
 ---
@@ -1097,9 +1232,10 @@ This applies to **bare metal instances too**. The enforcement lives in the Nitro
 Card for VPC, which is the network dataplane for every Nitro instance; bare
 metal gives you direct access to the CPU and memory, not to that card. (AWS
 publishes no explicit metal-vs-virtual comparison for this specific check, so
-that is an architectural inference, not a quoted guarantee — but bare metal is
-moot for Harvester on AWS today anyway, since the x86_64 `.metal` types are
-legacy BIOS and Harvester requires UEFI.)
+that is an architectural inference, not a quoted guarantee.) This matters more
+than it used to: arm64 nodes run on `*.metal` by necessity, so "just use bare
+metal" is a real configuration here rather than a hypothetical — and it still
+does not buy you bridged or VLAN VM networking.
 
 One thing that *does* work regardless: traffic between VMs **on the same node**
 over a bridge never reaches the ENI, so it is not subject to any of this. It is

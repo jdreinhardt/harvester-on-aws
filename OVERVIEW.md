@@ -15,8 +15,10 @@ functionality of deploying and running virtual machines.
 
 What does work:
 
-* A repeatable image build.
+* A repeatable image build, for x86 and Arm.
 * A CloudFormation template that deploys one, three, or five nodes.
+* A Terraform module that does the same.
+* Nodes on both x86 and Arm (Graviton) instances.
 * VM networking that works, with internet access.
 * A high-availability management endpoint.
 * A high-availability kubernetes control plane.
@@ -70,15 +72,23 @@ Harvester was designed for bare metal, and not all of the design decisions work
 the same with EC2.
 
 **Hardware virtualization.** Harvester runs VMs, so it needs CPU virtualization
-support. On EC2 that means nested virtualization, which is recent, opt-in per
-instance, and only available on certain instance types. Without it a node
-installs cleanly and then can't start a single VM. CloudFormation can only
-enable it through a launch template, not a plain instance, so the template is
-built around that.
+support. On an Intel or AMD instance that means nested virtualization, which is
+recent, opt-in per instance, and only available on certain instance types.
+Without it a node installs cleanly and then can't start a single VM.
+CloudFormation can only enable it through a launch template, not a plain
+instance, so the template is built around that.
 
-**UEFI boot.** Harvester dropped legacy BIOS. AWS bare-metal instances are
-BIOS-only, which rules out the obvious "just use bare metal" answer and leaves
-nested virtualization as the only current path.
+**UEFI boot, and why Arm is different.** Harvester dropped legacy BIOS. Intel
+and AMD bare-metal instances are BIOS-only, which rules out the obvious "just
+use bare metal" answer for them and leaves nested virtualization as the only
+path.
+
+Arm is the exception, and it inverts the problem. No virtualized Graviton
+instance offers nested virtualization at all — but Arm server platforms are
+required by their own specification to boot UEFI, so Graviton *bare metal*
+works where Intel bare metal cannot. The deployment is the mirror image: Arm
+nodes run on real hardware and need no virtualization opt-in, and in fact
+reject the request for it.
 
 **Network bonding.** Harvester always puts a bond underneath its management
 bridge, and bonding normally rewrites the NIC's MAC address. The ENA adapter
@@ -136,10 +146,11 @@ reached in return.
 
 | | |
 |---|---|
-| Availability zone | All nodes share one AZ. Survives node failure, not zone failure. |
+| Availability zone | All nodes share one AZ. Survives node failure, not zone failure. For Arm this bites harder than it sounds: bare metal capacity is per-zone and genuinely runs out, so the choice of zone is not always free. |
 | Certificates | The UI certificate is self-signed. Getting rid of the browser warning needs a domain. |
 | Floating address | The cluster's own floating address is pinned to one node by AWS, while the software that owns it may move it to another. They agree today, but nothing enforces it. The load balancer avoids depending on it for access; the cluster still depends on it to add nodes. |
 | VM networking | Bridged and VLAN networking will never work on AWS. |
 | Inbound to VMs | Reaching overlay VMs from the VPC needs a route pinned to one node's interface. If that node fails, inbound breaks while outbound keeps working. Manual workaround available. |
-| Image build | Still a manual, out-of-band process. |
-| Performance | VMs run nested, which costs something versus bare metal. |
+| Image build | Automated end to end by a single command, but it still has to be run deliberately — it is not continuous integration, and it takes about two hours per architecture. |
+| Performance | On Intel and AMD, VMs run nested, which costs something versus bare metal. Arm nodes run on bare metal and do not pay that cost. |
+| Arm guest VMs | Work on v1.8.2. On v1.9.0 the guest firmware has an upstream defect that stops any VM booting; the nodes themselves are unaffected. Fixed upstream, awaiting a packaging rebuild. |
