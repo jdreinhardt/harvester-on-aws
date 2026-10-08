@@ -1,10 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
-# AWS::LanguageExtensions provides Fn::Length, which is what lets the admin
-# CIDRs arrive as one comma-separated parameter instead of numbered slots.
-# It is an AWS-provided macro -- nothing to install -- but it does mean the
-# template is only fully checked at change-set/create time, since
-# validate-template does not run transforms.
 Transform: AWS::LanguageExtensions
 
 Description: >-
@@ -15,12 +10,21 @@ Description: >-
 # ---------------------------------------------------------------------------
 # Why launch templates rather than plain AWS::EC2::Instance resources:
 #
-# Harvester needs /dev/kvm, which on EC2 means nested virtualization, which is
-# opt-in per instance via CpuOptions. AWS::EC2::Instance's CpuOptions does NOT
-# expose NestedVirtualization -- only AWS::EC2::LaunchTemplate's does. Without
-# it the nodes boot and fail preflight.KVMHostCheck, and KubeVirt cannot run
-# guests. So CPU options live in launch templates and the instances reference
-# them.
+# Harvester needs /dev/kvm. On a VIRTUALIZED x86 instance that means nested
+# virtualization, which is opt-in per instance via CpuOptions.
+# AWS::EC2::Instance's CpuOptions does NOT expose NestedVirtualization -- only
+# AWS::EC2::LaunchTemplate's does. Without it the nodes boot and fail
+# preflight.KVMHostCheck, and KubeVirt cannot run guests. So CPU options live
+# in launch templates and the instances reference them.
+#
+# Graviton (arm64) is different on both counts. No virtualized Graviton type
+# offers nested virtualization, so arm64 runs on BARE METAL, which has the real
+# CPU and needs no opt-in -- and REJECTS the flag rather than ignoring it. The
+# IsGravitonMetal condition below omits CpuOptions for those types.
+#
+# x86 bare metal is NOT an alternative: those instances are legacy BIOS only
+# and Harvester dropped BIOS support. ARM server platforms are UEFI-native
+# (SBBR mandates it), which is exactly why metal works there and not on x86.
 #
 # Three templates, differing only in user-data:
 #   create  node 1, mode=create, owns the VIP and the storage class
@@ -72,13 +76,23 @@ Parameters:
     # reject the path -- and validate-template does NOT catch that, because it
     # does not check defaults against their parameter type. The failure shows up
     # only when you create the stack.
-    # Publish the id from phase 2.5:
-    #   aws ssm put-parameter --name /harvester/ami/latest \
+    # Publish the id from phase 2.5, or let `make ami` do it:
+    #   aws ssm put-parameter --name /harvester/ami/amd64/latest \
     #     --type String --overwrite --value ami-xxxxxxxx
+    #
+    # The architecture is its own path segment, so one architecture's build can
+    # never repoint the parameter the other reads. CloudFormation cannot derive
+    # one parameter's default from another, so when you switch InstanceType to
+    # a Graviton metal type you must ALSO point this at the arm64 path.
+    # A mismatch fails at RunInstances with "The architecture 'arm64' of the
+    # specified instance type does not match the architecture 'x86_64' of the
+    # specified AMI", which is clear but only surfaces at create time.
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /harvester/ami/latest
+    Default: /harvester/ami/amd64/latest
     Description: >-
-      The SSM Parameter Store value containing the AMI ID generated in phase 2.5.
+      SSM Parameter Store path holding the AMI ID from phase 2.5. Use
+      /harvester/ami/amd64/latest for x86 instance types and
+      /harvester/ami/arm64/latest for Graviton metal types.
 
   AmiIdOverride:
     Type: String
@@ -87,12 +101,17 @@ Parameters:
     Description: >-
       Optional AMI ID string. When set it overrides Parameter Store value.
 
-  # aws ec2 describe-instance-types --filters Name=processor-info.supported-features,Values=nested-virtualization
+  # x86 candidates:
+  #   aws ec2 describe-instance-types --filters Name=processor-info.supported-features,Values=nested-virtualization
+  # Graviton: any *.metal type. Virtualized Graviton has no nested
+  # virtualization, and x86 metal is BIOS-only, so metal is arm64-only here.
   InstanceType:
     Type: String
     Default: m8i.4xlarge
     Description: >-
-      Currently only deploys on nested virtualization. Instance type must support UEFI.
+      x86 types use nested virtualization; Graviton types must be bare metal.
+      Must match the architecture of the AMI selected above. All listed types
+      boot UEFI, which Harvester requires.
     AllowedValues:
       - m8i.2xlarge      # 8 vCPU / 32 GiB -- minimum, installer warns
       - m8i.4xlarge      # 16 vCPU / 64 GiB -- default
@@ -117,6 +136,15 @@ Parameters:
       - r8i.8xlarge      # 32 vCPU / 256 GiB
       - r8i.12xlarge     # 48 vCPU / 384 GiB
       - r8i.16xlarge     # 64 vCPU / 512 GiB
+      # --- Graviton (arm64) -- bare metal only, needs the arm64 AMI ---------
+      - c6g.metal        # 64 vCPU / 128 GiB -- Graviton2, the verified build host
+      - c7g.metal        # 64 vCPU / 128 GiB
+      - m6g.metal        # 64 vCPU / 256 GiB
+      - m7g.metal        # 64 vCPU / 256 GiB
+      - r6g.metal        # 64 vCPU / 512 GiB
+      - r7g.metal        # 64 vCPU / 512 GiB
+      - c8g.metal-24xl   # 96 vCPU / 192 GiB -- Graviton4
+      - m8g.metal-24xl   # 96 vCPU / 384 GiB
 
   # --- 2. Placement -------------------------------------------------------
   VpcId:
@@ -228,6 +256,24 @@ Parameters:
 
 Conditions:
   IsCluster:   !Not [!Equals [!Ref NodeCount, '1']]
+  # Bare metal has the real CPU: it needs no nested-virtualization opt-in and
+  # REJECTS the flag rather than ignoring it, so CpuOptions must be omitted
+  # entirely for these types. CloudFormation has no substring test usable in a
+  # Condition (Fn::Contains exists only in Rules), so this enumerates them.
+  #
+  # Fn::Or takes at most 10 conditions. There are 8 here; if you add metal
+  # types to AllowedValues above you must add them here too, and past 10 this
+  # has to become nested Fn::Or blocks rather than one flat list.
+  IsGravitonMetal: !Or
+    - !Equals [!Ref InstanceType, 'c6g.metal']
+    - !Equals [!Ref InstanceType, 'c7g.metal']
+    - !Equals [!Ref InstanceType, 'm6g.metal']
+    - !Equals [!Ref InstanceType, 'm7g.metal']
+    - !Equals [!Ref InstanceType, 'r6g.metal']
+    - !Equals [!Ref InstanceType, 'r7g.metal']
+    - !Equals [!Ref InstanceType, 'c8g.metal-24xl']
+    - !Equals [!Ref InstanceType, 'm8g.metal-24xl']
+
   HasWorkers:  !Equals [!Ref NodeCount, '5']
   HasPassword: !Not [!Equals [!Ref PasswordHash, '']]
   # Fn::Length (AWS::LanguageExtensions) resolves at transform time, so each
@@ -534,8 +580,10 @@ Resources:
         ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
-        CpuOptions:
-          NestedVirtualization: enabled
+        CpuOptions: !If
+          - IsGravitonMetal
+          - !Ref 'AWS::NoValue'
+          - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
           HttpPutResponseHopLimit: 2
@@ -604,8 +652,10 @@ Resources:
         ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
-        CpuOptions:
-          NestedVirtualization: enabled
+        CpuOptions: !If
+          - IsGravitonMetal
+          - !Ref 'AWS::NoValue'
+          - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
           HttpPutResponseHopLimit: 2
@@ -676,8 +726,10 @@ Resources:
         ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
-        CpuOptions:
-          NestedVirtualization: enabled
+        CpuOptions: !If
+          - IsGravitonMetal
+          - !Ref 'AWS::NoValue'
+          - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
           HttpPutResponseHopLimit: 2

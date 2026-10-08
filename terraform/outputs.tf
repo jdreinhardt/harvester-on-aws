@@ -48,9 +48,11 @@ output "watch_bootstrap" {
 # at all, and server_url on port 443 so harv-update-rke2-server-url rewrites it
 # to the supervisor's 9345.
 #
-# The instance itself still needs: the same AMI, nested virtualization enabled,
+# The instance itself still needs: the same AMI (matching architecture),
 # IMDSv2, this security group and subnet, and a root volume of at least
-# var.volume_size GiB.
+# var.volume_size GiB. On a virtualized x86 type it also needs nested
+# virtualization enabled; on a Graviton *.metal type that flag must be
+# OMITTED, because metal rejects it rather than ignoring it.
 
 output "join_user_data" {
   description = "User-data for manually adding a management node. Replace REPLACE_WITH_CLUSTER_TOKEN."

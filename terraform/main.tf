@@ -10,10 +10,21 @@
 #   * No launch templates. AWS::EC2::Instance cannot enable nested
 #     virtualization, so the template routes everything through launch
 #     templates; aws_instance takes cpu_options directly.
+#   * Metal detection is a regex. CloudFormation has no substring test usable in
+#     a Condition (Fn::Contains exists only in Rules), so the template has to
+#     enumerate every metal type in an Fn::Or capped at 10 entries. HCL just
+#     matches the suffix, so adding a metal type needs no change here.
 # =============================================================================
 
 locals {
   ami_id = var.ami_id != "" ? var.ami_id : nonsensitive(data.aws_ssm_parameter.ami[0].value)
+
+  # Bare metal has the real CPU: no nested-virtualization opt-in is needed, and
+  # the flag is REJECTED rather than ignored, so cpu_options must be omitted
+  # entirely. Keyed off the instance type rather than an architecture variable,
+  # which keeps it correct even for an x86 *.metal type and means there is no
+  # second variable that can disagree with instance_type.
+  is_metal = can(regex("\\.metal(-|$)", var.instance_type))
 
   nlb_enabled = var.management_nlb != "none"
   nlb_public  = var.management_nlb == "internet-facing"
@@ -183,10 +194,14 @@ resource "aws_instance" "node" {
   key_name               = var.key_name
   source_dest_check      = !var.disable_source_dest_check
 
-  # Opt-in per instance. Without it there is no /dev/kvm even on a supported
-  # instance type, and KubeVirt cannot run guests.
-  cpu_options {
-    nested_virtualization = "enabled"
+  # Opt-in per instance on virtualized types: without it there is no /dev/kvm
+  # even on a supported instance type, and KubeVirt cannot run guests. Omitted
+  # entirely on metal, which rejects the flag.
+  dynamic "cpu_options" {
+    for_each = local.is_metal ? [] : [1]
+    content {
+      nested_virtualization = "enabled"
+    }
   }
 
   # IMDSv2 only; /oem/aws/configure.sh does the token handshake. Hop limit 2 so

@@ -1,8 +1,9 @@
 # =============================================================================
 # Management endpoint
 #
-# 443 always; 6443 and 9345 only with control_plane_via_nlb, because they need an
-# AMI whose configure.sh writes the RKE2 tls-san drop-in on every node.
+# 443 always; 6443 only with control_plane_via_nlb, because it needs an AMI
+# whose configure.sh writes the RKE2 tls-san drop-in on every node. There is
+# deliberately no 9345 listener -- see the note further down.
 #
 # harvester-installer writes the config carrying tls-san only on the bootstrap
 # node (`if config.ServerURL == ""`). Measured on a live three-node cluster, the

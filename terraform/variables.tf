@@ -3,11 +3,23 @@
 variable "ami_ssm_parameter" {
   description = <<-EOT
     Name of an SSM parameter holding the Harvester AMI id, published at the end
-    of phase 2.5. The AMI's boot mode must be uefi; Harvester dropped legacy BIOS
-    and nothing here can check it for you.
+    of phase 2.5 (or by `make ami`). The AMI's boot mode must be uefi; Harvester
+    dropped legacy BIOS and nothing here can check it for you.
+
+    The architecture is its own path segment, so a build of one architecture can
+    never repoint the parameter the other one reads:
+
+      /harvester/ami/amd64/latest   x86 instance types
+      /harvester/ami/arm64/latest   Graviton *.metal types
+
+    This must match instance_type's architecture. Terraform cannot derive one
+    variable's default from another, so switching to a Graviton type means
+    changing both. A mismatch fails at apply with "The architecture 'arm64' of
+    the specified instance type does not match the architecture 'x86_64' of the
+    specified AMI".
   EOT
   type        = string
-  default     = "/harvester/ami/latest"
+  default     = "/harvester/ami/amd64/latest"
 }
 
 variable "ami_id" {
@@ -18,10 +30,22 @@ variable "ami_id" {
 
 variable "instance_type" {
   description = <<-EOT
-    Must support nested virtualization (Harvester needs /dev/kvm) and clear the
-    32 GiB memory floor. List candidates with:
-      aws ec2 describe-instance-types --filters \
-        Name=processor-info.supported-features,Values=nested-virtualization
+    Must give Harvester /dev/kvm and clear the 32 GiB memory floor. Two ways,
+    mutually exclusive:
+
+      x86      a virtualized type supporting nested virtualization. List them:
+                 aws ec2 describe-instance-types --filters \
+                   Name=processor-info.supported-features,Values=nested-virtualization
+      arm64    a Graviton *.metal type (c6g.metal, c7g.metal, c8g.metal-24xl,
+               m8g.metal-24xl, ...). Bare metal has the real CPU, so no opt-in
+               is needed -- and it REJECTS the nested-virtualization flag rather
+               than ignoring it, which is why cpu_options below is conditional.
+
+    Metal is arm64-only in practice: x86_64 *.metal types are legacy BIOS and
+    Harvester dropped BIOS support, while ARM server platforms are UEFI-native
+    (SBBR mandates it).
+
+    Must match ami_ssm_parameter's architecture.
   EOT
   type        = string
   default     = "m8i.4xlarge"
@@ -124,7 +148,7 @@ variable "management_nlb" {
 
 variable "control_plane_via_nlb" {
   description = <<-EOT
-    Also put 6443 (kubectl) and 9345 (RKE2 supervisor) behind the load balancer,
+    Also put 6443 (kubectl) behind the load balancer,
     for reaching the Kubernetes API from OUTSIDE the VPC on an address that
     survives losing a node.
     It does NOT change where joining nodes point. A Network Load Balancer cannot

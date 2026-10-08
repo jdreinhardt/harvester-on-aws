@@ -4,12 +4,12 @@ set -euo pipefail
 # =============================================================================
 # Phase 3: Launch a Harvester node on EC2
 #
-#   1. Sanity-check the AMI (must be UEFI) and the instance type (must support
-#      nested virtualization, or Harvester has no /dev/kvm and KubeVirt cannot
-#      run guests)
+#   1. Sanity-check the AMI (must be UEFI, and its architecture must match the
+#      instance type) and the instance type (it must give Harvester /dev/kvm,
+#      or KubeVirt cannot run guests)
 #   2. Pick a VIP from the subnet if one was not given (create mode only)
 #   3. Build the Harvester configuration and pass it as EC2 user-data
-#   4. Launch with nested virtualization enabled
+#   4. Launch, enabling nested virtualization on virtualized instance types
 #   5. Assign the VIP as a secondary private IP on the instance's ENI
 #      (create mode only)
 #
@@ -81,7 +81,9 @@ Options:
                    Auto-selected from the subnet if omitted. Create mode only.
   --token          Cluster token. Generated if omitted when creating; required
                    when joining, and must match the cluster exactly.
-  --instance-type  Default: ${INSTANCE_TYPE}. Must support nested virtualization.
+  --instance-type  Default: ${INSTANCE_TYPE}. Must provide /dev/kvm: either an
+                   x86 type supporting nested virtualization, or a Graviton
+                   (arm64) *.metal type. Must match the AMI's architecture.
   --key-name       EC2 key pair. Its public key is added to the rancher user.
   --role ROLE      Node role. Left unset by default, which is Harvester's
                    "default": eligible for automatic promotion. Promotion only
@@ -334,19 +336,56 @@ if [ "${AMI_VOLUME_SIZE:-0}" -gt 0 ] && [ "$VOLUME_SIZE" -lt "$AMI_VOLUME_SIZE" 
 fi
 
 echo "Checking the instance type..."
-NESTED="$(aws ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" \
-    --query 'InstanceTypes[0].ProcessorInfo.SupportedFeatures' --output text 2>/dev/null || true)"
-if [[ "$NESTED" != *"nested-virtualization"* ]]; then
-    echo "ERROR: $INSTANCE_TYPE does not support nested virtualization." >&2
-    echo "       Harvester requires /dev/kvm (preflight.KVMHostCheck) and" >&2
-    echo "       KubeVirt cannot run guests without it." >&2
-    echo "       List supported types with:" >&2
-    echo "         aws ec2 describe-instance-types \\" >&2
-    echo "           --filters Name=processor-info.supported-features,Values=nested-virtualization \\" >&2
-    echo "           --query 'InstanceTypes[].InstanceType' --output text" >&2
+
+# Two ways to get /dev/kvm on EC2, and they are mutually exclusive:
+#
+#   virtualized  nested virtualization, opt-in per instance via --cpu-options.
+#                x86 only in practice -- no virtualized Graviton type offers it.
+#   bare metal   the real CPU, so no opt-in is needed. A metal instance REJECTS
+#                --cpu-options NestedVirtualization rather than ignoring it, so
+#                the flag must be omitted entirely.
+#
+# Metal is only useful on arm64: x86_64 *.metal types are legacy BIOS and
+# Harvester dropped BIOS support, while ARM server platforms are UEFI-native
+# (SBBR mandates it).
+case "$INSTANCE_TYPE" in
+    *.metal|*.metal-*) IS_METAL="true" ;;
+    *)                 IS_METAL="false" ;;
+esac
+
+TYPE_ARCH="$(aws ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" \
+    --query 'InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0]' --output text 2>/dev/null || true)"
+
+if [ "$IS_METAL" = "true" ]; then
+    echo "  $INSTANCE_TYPE is bare metal -- native /dev/kvm, no nested virtualization needed"
+else
+    NESTED="$(aws ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" \
+        --query 'InstanceTypes[0].ProcessorInfo.SupportedFeatures' --output text 2>/dev/null || true)"
+    if [[ "$NESTED" != *"nested-virtualization"* ]]; then
+        echo "ERROR: $INSTANCE_TYPE is virtualized and does not support nested" >&2
+        echo "       virtualization, so it cannot give Harvester /dev/kvm" >&2
+        echo "       (preflight.KVMHostCheck). KubeVirt cannot run guests." >&2
+        echo "       Either pick a type that supports it:" >&2
+        echo "         aws ec2 describe-instance-types \\" >&2
+        echo "           --filters Name=processor-info.supported-features,Values=nested-virtualization \\" >&2
+        echo "           --query 'InstanceTypes[].InstanceType' --output text" >&2
+        echo "       or use a Graviton *.metal type with an arm64 AMI." >&2
+        exit 1
+    fi
+    echo "  $INSTANCE_TYPE supports nested virtualization"
+fi
+
+# An architecture mismatch is rejected by RunInstances with a clear message, but
+# only after everything else has been set up. Catch it here instead.
+AMI_ARCH="$(aws ec2 describe-images --image-ids "$AMI" \
+    --query 'Images[0].Architecture' --output text 2>/dev/null || true)"
+if [ -n "$AMI_ARCH" ] && [ -n "$TYPE_ARCH" ] && [ "$AMI_ARCH" != "$TYPE_ARCH" ]; then
+    echo "ERROR: AMI $AMI is ${AMI_ARCH} but $INSTANCE_TYPE is ${TYPE_ARCH}." >&2
+    echo "       Build the matching AMI (ARCH=arm64 or ARCH=amd64 in the" >&2
+    echo "       Makefile) or pick an instance type for this AMI." >&2
     exit 1
 fi
-echo "  $INSTANCE_TYPE supports nested virtualization"
+echo "  architecture: ${AMI_ARCH:-unknown} (AMI) matches ${TYPE_ARCH:-unknown} (instance type)"
 
 SUBNET_CIDR="$(aws ec2 describe-subnets --subnet-ids "$SUBNET" \
     --query 'Subnets[0].CidrBlock' --output text)"
@@ -534,9 +573,6 @@ LAUNCH_ARGS=(
     --subnet-id "$SUBNET"
     --security-group-ids "$SG"
     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${VOLUME_SIZE},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]"
-    # Nested virtualization is opt-in per instance. Without this there is no
-    # /dev/kvm even on a supported instance type.
-    --cpu-options "NestedVirtualization=enabled"
     # IMDSv2 only. /oem/aws/configure.sh does the token handshake. Hop limit 2
     # so pods can reach IMDS if they need to.
     --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled"
@@ -544,6 +580,11 @@ LAUNCH_ARGS=(
     --user-data "file://$USERDATA_FILE"
 )
 [ -n "$KEY_NAME" ] && LAUNCH_ARGS+=(--key-name "$KEY_NAME")
+
+# Only on virtualized types: metal rejects the flag rather than ignoring it.
+if [ "$IS_METAL" != "true" ]; then
+    LAUNCH_ARGS+=(--cpu-options "NestedVirtualization=enabled")
+fi
 
 if [ "$DRY_RUN" = "true" ]; then
     echo "Dry run. Would launch with:"
@@ -563,9 +604,11 @@ if ! INSTANCE_INFO="$(aws ec2 run-instances "${LAUNCH_ARGS[@]}" \
         --output text)"; then
     echo "" >&2
     echo "ERROR: run-instances failed." >&2
-    echo "       If it rejected NestedVirtualization, your aws CLI predates the" >&2
-    echo "       feature. Check with 'aws --version' and upgrade; nested" >&2
-    echo "       virtualization is what gives Harvester /dev/kvm." >&2
+    if [ "$IS_METAL" != "true" ]; then
+        echo "       If it rejected NestedVirtualization, your aws CLI predates the" >&2
+        echo "       feature. Check with 'aws --version' and upgrade; nested" >&2
+        echo "       virtualization is what gives Harvester /dev/kvm." >&2
+    fi
     exit 1
 fi
 
