@@ -1,0 +1,48 @@
+# Ordered target list for the full single-run report.
+#
+# ORDER MATTERS. pytest honours the order of explicitly-listed files, but only
+# when every target is explicit -- mixing the harvester_e2e_tests package with
+# appended files silently re-sorts them. So every module is listed here, with
+# the destructive ones LAST:
+#
+#   cpu_pinning / powercycle  mutate node state
+#   apis/test_hosts.py        maintenance_mode (known to fail on v1.8.2 and
+#                             leave a node cordoned) and delete_host, which is
+#                             IRREVERSIBLE -- the suite cannot add a node back,
+#                             so it is deliberately the very last test.
+#
+# Excluded entirely, structurally impossible on EC2 (Nitro drops frames whose
+# source address is not registered on the ENI): test_5_vm_networks,
+# test_5_vm_networks_interact, test_0_storage_network, and the
+# TestImageWithStorageNetwork class in test_1_images (deselected on the CLI).
+# Excluded as not applicable: rancher, terraform, upgrade.
+#
+# test_2_security_images (Longhorn volume encryption) is included: it has no
+# VLAN or storage-network dependency and all 10 tests pass -- BUT only against a
+# clean cluster. Run it over leftover images or secrets from a previous run and
+# TestInvalidEncryptionSecret fails ('secret ... not found') and the teardown
+# errors trying to delete a secret an old image still references. If those two
+# fail, suspect residue before suspecting Harvester.
+
+harvester_e2e_tests/apis/test_images.py
+harvester_e2e_tests/apis/test_keypairs.py
+harvester_e2e_tests/apis/test_namespaces.py
+harvester_e2e_tests/apis/test_networks.py
+harvester_e2e_tests/apis/test_volumes.py
+harvester_e2e_tests/apis/test_vm_templates.py
+harvester_e2e_tests/apis/test_vms.py
+harvester_e2e_tests/apis/test_support_bundle.py
+harvester_e2e_tests/integrations/test_1_images.py
+harvester_e2e_tests/integrations/test_1_volumes.py
+harvester_e2e_tests/integrations/test_2_security_images.py
+harvester_e2e_tests/integrations/test_3_vm.py
+harvester_e2e_tests/integrations/test_3_vm_functions.py
+harvester_e2e_tests/integrations/test_4_vm_template.py
+harvester_e2e_tests/integrations/test_4_vm_overcommit.py
+harvester_e2e_tests/integrations/test_4_vm_snapshot.py
+harvester_e2e_tests/integrations/test_4_vm_backup_restore.py
+harvester_e2e_tests/apis/test_addons.py
+harvester_e2e_tests/apis/test_settings.py
+harvester_e2e_tests/integrations/test_4_vm_host_cpu_pinning.py
+harvester_e2e_tests/integrations/test_4_vm_host_powercycle.py
+harvester_e2e_tests/apis/test_hosts.py

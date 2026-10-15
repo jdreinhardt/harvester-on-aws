@@ -9,3 +9,6 @@ artifacts/
 *.tfstate
 *.tfstate.*
 *.tfplan
+
+e2e/config.yml
+results/

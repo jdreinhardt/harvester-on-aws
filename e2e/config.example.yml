@@ -1,0 +1,128 @@
+# Example config for the upstream Harvester test suite, tuned for a cluster
+# deployed by this repository.
+#
+#   git clone https://github.com/harvester/tests.git ~/devwork/suse/harvester-tests
+#   cd ~/devwork/suse/harvester-tests
+#   rm -rf .venv && python3 -m venv .venv
+#   ./.venv/bin/pip install -r test-requirements.txt
+#   ./.venv/bin/pip install --no-deps -e ./apiclient     # NOT in the README; without
+#                                                        # it you get 28 import errors
+# Then copy this file over the suite's own config.yml, or pass values as flags
+# (every key has a --flag equivalent; flags win over the file).
+#
+# Copy to config.yml in THIS directory and fill in the blanks. config.yml is
+# gitignored here precisely because it holds credentials; this example is not.
+
+# --- Cluster ----------------------------------------------------------------
+# RUN THE SUITE FROM INSIDE THE VPC. It needs two kinds of access:
+#   * HTTPS to this endpoint, and
+#   * SSH to each node's PRIVATE address (Harvester reports host_ip as the
+#     private IP, and the suite jumphosts through it to reach guests).
+# A laptop cannot do the second even with an internet-facing NLB, so an API
+# tunnel is not enough -- use a small EC2 instance in the cluster's subnet as
+# the test runner.
+#
+# From inside the VPC the VIP works directly. With management_nlb set, `tofu
+# output management_url` gives the balanced address instead, which survives
+# losing a node. The certificate is self-signed either way; the suite does not
+# verify (tox.ini silences "Unverified HTTPS request").
+endpoint: 'https://REPLACE-WITH-VIP-OR-NLB'
+username: 'admin'
+password: 'REPLACE-WITH-DASHBOARD-PASSWORD'
+
+# Node access. Needed by more than the host-management tests: the backup and
+# restore tests reach the guest by SSHing to the NODE and using it as a
+# jumphost, so without this they cannot write test data into a VM.
+#
+# Two traps here:
+#   1. host-private-key takes the key MATERIAL, not a path -- the suite does
+#      RSAKey.from_private_key(StringIO(value)).
+#   2. It must be an RSA key. The suite hardcodes paramiko.RSAKey, so an ED25519
+#      EC2 key pair (the default for `aws-testing.pem` here) fails to load with
+#      "unpack requires a buffer of 4 bytes".
+#
+# So use the password instead, and leave the key EMPTY -- the key is only parsed
+# when non-empty. The rancher user's password is whatever phase 1 baked in
+# (default `rancher`) unless password_hash was set at deploy time.
+host-password: 'rancher'
+host-private-key: ''
+
+# --- Timeouts ---------------------------------------------------------------
+# Default is 600. Raise it for anything touching node power state: a stop/start
+# of a .metal instance is far slower than a virtualized one.
+wait-timeout: 900
+sleep-timeout: 3
+
+# --- VLAN: MUST be -1 on AWS ------------------------------------------------
+# The suite's default of 1 ENABLES the external-networking tests. Bridged and
+# VLAN VM networking can never work on EC2 -- the Nitro card drops any frame
+# whose source address is not registered on the ENI -- so these would fail for
+# a reason that is not a bug. -1 disables them.
+vlan-id: -1
+vlan-nic: 'mgmt'
+
+# The suite's default 192.168.0.0/24 means nothing in a VPC. Set these only if
+# you have created a kube-ovn overlay subnet and a VPC route for it; otherwise
+# leave as-is and expect IP-pool tests to be irrelevant.
+ip-pool-subnet: '192.168.0.0/24'
+ip-pool-start: '192.168.0.200'
+ip-pool-end: '192.168.0.210'
+
+# --- Backup target: S3 ------------------------------------------------------
+# Longhorn on the NODES performs the S3 I/O, not the test runner -- the suite
+# only passes these through to Harvester's `backup-target` setting. So the IAM
+# principal needs bucket access reachable from inside the VPC.
+#
+# `s3-endpoint` stays EMPTY for real AWS S3; set it only for MinIO or another
+# S3-compatible target. The other four are asserted non-empty, and backup tests
+# skip entirely when accessKeyId is blank.
+s3-endpoint: ''
+region: 'us-east-2'
+accessKeyId: 'REPLACE-WITH-ACCESS-KEY-ID'
+secretAccessKey: 'REPLACE-WITH-SECRET-ACCESS-KEY'
+bucketName: 'harvester-e2e-backup-500648861596'
+
+# --- Backup target: NFS (alternative to S3) ---------------------------------
+# Leave empty unless you stand up EFS or an NFS server. Must start with nfs://.
+nfs-endpoint: ''
+nfs-mount-dir: 'nfsshare'
+
+# --- Guest images -----------------------------------------------------------
+# These defaults are x86_64 ONLY. For an arm64 cluster, swap both for aarch64
+# builds, or every VM test fails on architecture rather than on anything real.
+#
+# The suite's own default points at rsync.opensuse.org, which 404s -- measured
+# 2026-10-12. download.opensuse.org serves the identical path. Harvester does
+# the fetching, so the symptom is an image stuck at
+# "RetryLimitExceeded ... got 404 status code", and every VM-based test then
+# errors in setup rather than failing for a reason of its own.
+opensuse-image-url: https://download.opensuse.org/repositories/Cloud:/Images:/Leap_15.6/images/openSUSE-Leap-15.6.x86_64-NoCloud.qcow2
+opensuse-checksum: ''
+ubuntu-image-url: https://cloud-images.ubuntu.com/releases/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+ubuntu-checksum: ''
+image-cache-url: ''
+
+# --- Host power cycle -------------------------------------------------------
+# Needs a directory holding power_on.sh / power_off.sh / reboot.sh. See
+# e2e/node-scripts/ here for EC2 implementations; the suite ships
+# scripts/vagrant as the reference.
+node-scripts-location: '../harvester-aws/e2e/node-scripts'
+
+# --- Not applicable on this deployment --------------------------------------
+# Rancher tests stay disabled while rancher-endpoint is unset. Terraform tests
+# want the `terraform` CLI specifically; we use `tofu`.
+rancher-endpoint: ''
+rancher-admin-password: ''
+k8s-version: 'v1.28'
+rancher-cluster-wait-timeout: 1800
+terraform-scripts-location: 'terraform_test_artifacts'
+terraform-provider-rancher: ''
+terraform-provider-harvester: ''
+
+# --- Upgrade tests: out of scope for now ------------------------------------
+upgrade-prepare-dependence: False
+upgrade-sc-replicas: 3
+upgrade-target-version: ""
+upgrade-iso-url: ""
+upgrade-iso-checksum: ""
+upgrade-wait-timeout: 7200

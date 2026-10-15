@@ -878,6 +878,57 @@ joining node still resolves it to node 1's ENI. Losing that node leaves the
 cluster running and the UI reachable, but no further nodes can join until the
 address is moved by hand. The measurement behind that is in the same section.
 
+#### Scoping a fix
+
+**Multicast does not help, and it is the first thing people reach for.** The
+instinct is that the election needs it — enable a Transit Gateway multicast
+domain on the VPC and the nodes can agree. But VRRP and keepalived are what
+need multicast, electing a master by advertising to `224.0.0.18`. kube-vip's
+ARP mode elects through a Kubernetes **Lease** object instead: no
+router-to-router protocol, no multicast, no virtual router ID. Election already
+works correctly here. What fails is the unicast data path *after* the election
+is decided. A TGW multicast domain carries multicast groups between subnets
+(IGMPv2 or static membership) and never affects how a unicast address is
+routed, so it cannot move the VIP no matter how it is configured.
+
+**Two shapes a real fix can take**, both of which the `aws-vpc-move-ip`
+resource agent implements:
+
+| Approach | Mechanism | Multi-AZ |
+| --- | --- | --- |
+| Secondary IP reassignment | `assign-private-ip-addresses --allow-reassignment` moves the VIP onto the new leader's ENI. The VIP stays inside the VPC CIDR, so in-VPC clients are unaffected. | **No.** A subnet cannot span AZs, so the VIP is pinned to one. |
+| Route-table `/32` | The VIP lives *outside* the VPC CIDR and a `/32` route points at the active node's ENI, rewritten on failover. The variant SUSE's agent commonly uses for SAP HA. | **Yes.** |
+
+Multi-AZ is also on the open list, so the route-table variant is worth weighing
+before taking the simpler one. Its cost is that an address outside the VPC CIDR
+is reachable only where you control the routing — packets originating outside
+the VPC never arrive — so it is in-VPC only unless a gateway layer is added.
+That may not matter, because the load balancer already serves external clients.
+
+Either way the work has the same shape: something watching the kube-vip lease
+and calling the EC2 API on leader change, plus the IAM policy for it. Nothing
+off the shelf does this for Harvester.
+
+**How urgent is it? Less than it first looks.** The e2e powercycle module stops
+and starts nodes repeatedly — `test_poweroff_node_trigger_vm_reschedule`,
+`test_delete_vm_after_host_shutdown` and `test_vm_restarted_after_host_reboot`
+all pass — and the suite keeps working throughout. RKE2 agents maintain their
+own load balancer across every known server endpoint once registered, rather
+than depending on `server_url`. So the VIP's remaining jobs are narrow: initial
+node registration, and whatever addresses the cluster by VIP directly.
+
+**Open before building anything:**
+
+* What actually breaks during a VIP outage, measured rather than assumed. In
+  particular whether a *new* node can join while the VIP is down — that is the
+  one case the agent-side load balancer cannot cover, and it is the case the
+  paragraph above already suspects.
+* Whether the route-table variant's in-VPC-only reachability is acceptable
+  given the load balancer serves external clients anyway.
+* Whether the desync problem above — kube-vip re-electing while node 1 is still
+  healthy, leaving the VIP bound on one node and routed to another — is better
+  solved by the same controller, or separately.
+
 ---
 
 ## CloudFormation
