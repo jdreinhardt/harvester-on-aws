@@ -369,7 +369,15 @@ harvester-v<version>-initrd-<arch>
 
 `<arch>` is `amd64` or `arm64`, exactly as the release names them —
 `01-build-instance.sh` derives these filenames from `ARCH`, which it takes from
-the host because KVM cannot cross-emulate. `make ami` downloads them for you.
+the host because KVM cannot cross-emulate.
+
+`./scripts/00-fetch-artifacts.sh` does the download and checks every file
+against the release's `harvester-<version>-<arch>.sha512` manifest. It fetches
+to `<name>.part` and renames only once the checksum matches, so an interrupted
+download is never mistaken for a finished one, and it re-verifies files that
+are already present rather than trusting them. `make ami` runs it on the helper
+for you. Set `SHA512_FILE` to a manifest obtained out of band if you do not want
+to trust the one served beside the files.
 
 Mixing architectures here is an easy mistake with a confusing failure: an
 x86 initrd beside an arm64 kernel gets you a QEMU error about a missing file
@@ -407,11 +415,17 @@ Override with env vars: `HARVESTER_VERSION`, `DISK_SIZE_GIB`,
 `PERSISTENT_SIZE`, `MEMORY_MIB`, `SMP`, `QEMU_TIMEOUT`, `OS_PASSWORD`,
 `OS_PASSWORD_HASH`, `OVMF_CODE`.
 
+There is no default OS password. Unless `OS_PASSWORD` or `OS_PASSWORD_HASH` is
+set, phase 1 generates a random one and writes it only to
+`artifacts/build-os-password` (mode 0600) for the case below. It never reaches
+a running node — see [Access to the nodes](#access-to-the-nodes).
+
 ### If phase 1 fails
 
 The installer prints `** Installation Failed **` and then, deliberately, leaves
 the VM running instead of powering off. Log in on that same console as
-`rancher` / `rancher` and read `/var/log/console.log` for the real error. The
+`rancher`, with the password from `artifacts/build-os-password` (or your
+`OS_PASSWORD`), and read `/var/log/console.log` for the real error. The
 script also tails the captured console log for you and exits non-zero.
 
 Failures during `Load images from .../rke2-images...tar.zst` are almost always
@@ -603,6 +617,30 @@ because it goes into user-data.
 Nothing needs to pin kube-vip to an interface: the chart ships
 `vip_interface: ""` and kube-vip picks the default-route interface, which on a
 configured Harvester node is `mgmt-br`.
+
+### Access to the nodes
+
+**SSH is key-only.** On every boot, `/oem/aws/stage-initramfs.sh` sets
+`PasswordAuthentication no` and `KbdInteractiveAuthentication no` for sshd, and
+`configure.sh` logs the values `sshd -T` actually reports. Keys come from the
+launch key pair (`--key-name` / `KeyName` / `key_name`) or from
+`os.ssh_authorized_keys` in user-data.
+
+**The `rancher` password is for the serial console only.** The random build
+password never survives first boot: `configure.sh` replaces it with the
+user-data `os.password` hash if there is one (`--password-hash` /
+`PasswordHash` / `password_hash`), and otherwise with `*`, which matches no
+password. Set a hash if you want to be able to log in on the EC2 serial
+console, which is the way in when the network is broken.
+
+A node with neither a key nor a password hash could never be logged in to, so
+`configure.sh` refuses it and the installer comes up interactively on the serial
+console instead; `03-launch-instance.sh` catches the same case before launching.
+
+Why this matters on Harvester in particular: guest VMs' traffic leaves as the
+node's own address, so it is admitted by the security group's node-to-node rule.
+A password that every node shares would be one guess away from root on the
+hypervisor for any VM.
 
 ### Security group
 
@@ -1039,10 +1077,11 @@ disappear; nothing logs anything.
 
 The `DisableSourceDestCheck` parameter reads as **"disable the check"**, not as the
 EC2 property of the same name — `true` disables it, `false` leaves EC2's normal
-behaviour in place. It defaults to `true`, because that is what a cluster
-running an overlay needs, and applies to node 1's ENI and to every other node's
-instance. Set it to `false` if you are not routing an overlay CIDR to these
-nodes.
+behaviour in place. It defaults to `false`: disabling the check also lets a
+node emit traffic from addresses that are not its own, so it should only be off
+where it is needed. Set it to `true`, together with `OverlayClientCidr` and the
+VPC route, when you route an overlay CIDR to these nodes. It applies to node 1's
+ENI and to every other node's instance.
 
 This replaces the manual `modify-instance-attribute --no-source-dest-check` step
 the script-based path needs.
@@ -1241,10 +1280,11 @@ zones — a separate decision.
 | `VipAddress` | The only address you pick. Node 1's own private address is assigned by EC2 as normal — the ENI declares just the VIP as a secondary. `PrivateIpAddressSpecification` requires both `PrivateIpAddress` and `Primary` on each *entry*, but does not require a `Primary: true` entry to be present. |
 | `AdminCidrs` | Comma-separated, **maximum 5**. Anything past the fifth is silently ignored. |
 | `OverlayClientCidr` | Optional. Opens the nodes to this source on **all** protocols, which is what routing traffic into overlay VMs requires. Empty unless you have added the VPC route. |
-| `AmiIdOverride` | Optional literal `ami-…`, bypassing the SSM lookup for a one-off image. |
+| `AmiIdOverride` | Optional literal `ami-…`, bypassing the SSM lookup. **Set it for any stack you mean to keep.** `AmiSsmParameter` is re-resolved on every stack update, the AMI reaches the instances through launch templates (a replacement-only property), and `make ami` repoints `…/latest` by default — so without a pinned id, the first update after a build replaces every node and its root volume, VM disks included. |
+| `EbsKmsKeyId` | Optional KMS key ARN. Root volumes are always encrypted; empty uses the account's default `aws/ebs` key. |
 | `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
 | `ControlPlaneViaNlb` | Adds **6443 only** to the load balancer, for reaching the Kubernetes API from outside the VPC. It does **not** change where joining nodes point — a load balancer cannot be reached by its own registered targets, so `server_url` stays on the VIP. There is deliberately no 9345 listener. Default `false`; needs an AMI whose `configure.sh` writes the tls-san drop-in. |
-| `DisableSourceDestCheck` | Reads as *disable the check*: `true` (the default) disables it, `false` leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
+| `DisableSourceDestCheck` | Reads as *disable the check*: `true` disables it, `false` (the default) leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
 
 ---
 
@@ -1568,7 +1608,8 @@ reachability inside the VPC, not the public management endpoint. See
 
 1. The **route**, above — gets packets to a node.
 2. **Source/destination check disabled** — lets that node forward for addresses
-   that are not its own. The template does this by default.
+   that are not its own. Set `DisableSourceDestCheck=true` (Terraform:
+   `disable_source_dest_check = true`); both default to leaving the check on.
 3. A **security group rule** permitting the traffic inbound. This is the one that
    is easy to miss: the nodes' group only admits the admin CIDRs and itself, so
    traffic from elsewhere in the VPC is dropped before it can be forwarded, even
@@ -1811,6 +1852,12 @@ installer's fuzzy-name schema mapper.
 
 **`/oem/userdata.yaml` contains the cluster token** and possibly a password
 hash. It is written `0600` and left in place, matching what `stream-disk` does.
+The same values stay in the instance's EC2 user-data for its whole life, so
+`ec2:DescribeInstanceAttribute` (and, for the CloudFormation stack,
+`ec2:DescribeLaunchTemplateVersions`) amounts to read access to the token —
+CloudFormation's `NoEcho` and Terraform's `sensitive` do not change that, and
+Terraform state holds it in plain text. Every launch path sets the IMDS hop
+limit to 1 so pods on the node cannot fetch it.
 
 **An OS upgrade replaces `active.img`**, reverting the `bootargs.cfg` console
 and `net.ifnames` patches. The `grubcustom` copy is the fallback; after an
@@ -1855,9 +1902,11 @@ The bridge inherits `eth0`'s MAC, so DHCP returns the same primary private IP.
 **Source/destination checking.** Traffic from the node uses `eth0`'s MAC and
 either the primary IP or the VIP, both registered on the ENI, so the default
 src/dst check is fine for the cluster itself. It is *not* fine once guest VMs
-get addresses the ENI doesn't know about — if you go on to use Harvester VLAN
-networking you will need `modify-instance-attribute --no-source-dest-check`
-plus routes, which this repo does not set up.
+get addresses the ENI doesn't know about — routing an overlay CIDR into the
+cluster needs the check disabled, plus a route and a security group rule. The
+CloudFormation template and Terraform module can disable it
+(`DisableSourceDestCheck` / `disable_source_dest_check`) but leave it on by
+default; see [Source/destination check](#sourcedestination-check).
 
 **Jumbo frames.** ENA defaults to MTU 9001, but `checkMTU()` caps
 `install.management_interface.mtu` at 9000, so you cannot match it exactly.

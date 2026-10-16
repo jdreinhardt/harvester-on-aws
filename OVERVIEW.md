@@ -61,8 +61,12 @@ manual step. Fully automatable.
   environment deployments. The role and clustering information is fed in at
   initialization.
 
-The script uses IMDSv2, so the cluster token isn't sitting behind a request
-anyone can forge.
+The script uses IMDSv2 with a hop limit of 1, so the user-data — which carries
+the cluster token — can't be fetched through a forged request (SSRF) or from
+inside a pod. It is still readable by root on the node, and through the EC2 API
+by anyone allowed `ec2:DescribeInstanceAttribute` or
+`ec2:DescribeLaunchTemplateVersions`, so treat those permissions as access to
+the token.
 
 ---
 
