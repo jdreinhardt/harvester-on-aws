@@ -34,17 +34,20 @@ password: 'REPLACE-WITH-DASHBOARD-PASSWORD'
 # restore tests reach the guest by SSHing to the NODE and using it as a
 # jumphost, so without this they cannot write test data into a VM.
 #
-# Two traps here:
-#   1. host-private-key takes the key MATERIAL, not a path -- the suite does
-#      RSAKey.from_private_key(StringIO(value)).
-#   2. It must be an RSA key. The suite hardcodes paramiko.RSAKey, so an ED25519
-#      EC2 key pair (the default for `aws-testing.pem` here) fails to load with
-#      "unpack requires a buffer of 4 bytes".
+# Leave both EMPTY here. Node SSH is key-only -- a password cannot work -- so
+# run-tests.sh fills in host-private-key on the runner's copy of this file from
+# --host-key-file (default: --key-file), and clears host-password. The private
+# key never has to be written into this file.
 #
-# So use the password instead, and leave the key EMPTY -- the key is only parsed
-# when non-empty. The rancher user's password is whatever phase 1 baked in
-# (default `rancher`) unless password_hash was set at deploy time.
-host-password: 'rancher'
+# That key must be the cluster's EC2 key pair, and it must be RSA: the suite
+# hardcodes paramiko.RSAKey, so an ED25519 key fails with "unpack requires a
+# buffer of 4 bytes". Deploy test clusters with an RSA key pair:
+#
+#   aws ec2 create-key-pair --key-name harvester-e2e-rsa --key-type rsa \
+#     --key-format pem --query KeyMaterial --output text > ~/.ssh/harvester-e2e-rsa.pem
+#
+# run-tests.sh checks the key type before launching anything.
+host-password: ''
 host-private-key: ''
 
 # --- Timeouts ---------------------------------------------------------------

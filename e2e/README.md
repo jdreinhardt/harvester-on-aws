@@ -20,8 +20,38 @@ at all, because RKE2 runs without the AWS cloud controller. So the suite has to
 run from inside the VPC.
 
 ```bash
-./e2e/run-tests.sh --targets-file e2e/targets-full.txt --markers "p0" --keep
+./e2e/run-tests.sh --targets-file e2e/targets-full.txt --markers "p0" --keep \
+  --host-key-file ~/.ssh/harvester-e2e-rsa.pem
 ```
+
+## Node SSH: an RSA key pair for test clusters
+
+Node SSH is key-only — password authentication is off and the `rancher` user's
+password is unusable unless a hash was set at deploy time — so the suite has to
+reach the nodes with the cluster's key. It can only load **RSA** keys: both
+`host_shell` and the VM jumphost path call `paramiko.RSAKey.from_private_key`,
+which fails on ED25519 with "unpack requires a buffer of 4 bytes".
+
+So deploy test clusters with a dedicated RSA EC2 key pair, and keep ED25519 for
+everything else:
+
+```bash
+aws ec2 create-key-pair --key-name harvester-e2e-rsa --key-type rsa \
+  --key-format pem --query KeyMaterial --output text > ~/.ssh/harvester-e2e-rsa.pem
+chmod 0600 ~/.ssh/harvester-e2e-rsa.pem
+```
+
+Use it as the cluster's `KeyName` / `key_name`, then pass it to
+`--host-key-file` (or use it for the runner too, via `--key-name`, and let
+`--host-key-file` default to `--key-file`). `run-tests.sh`:
+
+* checks the key is RSA and unencrypted before launching anything;
+* copies it into the **runner's** copy of `config.yml` as `host-private-key`
+  and clears `host-password`. Your local `config.yml` keeps both empty, so the
+  private key is never written into it.
+
+`--host-key-file none` skips this and uses `config.yml`'s host credentials as
+they are — only useful against a cluster built before node SSH became key-only.
 
 ## IAM: only the host-power tests need it
 
@@ -51,11 +81,19 @@ venv and clone survive.
 
 `ec2:DescribeInstances` is granted on `*` because EC2's describe calls do not
 support resource-level permissions. The calls that actually change state are
-restricted to instances carrying a `HarvesterRole` tag, which both the
-Terraform and the CloudFormation node definitions set (`create`, `join`,
-`worker`) and nothing else in the account carries — notably not the runner
-itself, which is tagged only with `Name`. So the runner can power-cycle cluster
-nodes and nothing else.
+restricted to this account and region, and to instances carrying both a
+`HarvesterRole` tag (which the Terraform and CloudFormation node definitions
+set) **and** a `Name` of `<name-prefix>-node-*` — the same pattern the script
+uses to discover the cluster, and the one both deployments use
+(`<name_prefix>-node-N`, `<StackName>-node-N`). `HarvesterRole` alone is not
+enough: every cluster deployed from this repo carries it, so a test run could
+otherwise stop another, real cluster's nodes. The runner itself is tagged only
+with `Name=harvester-e2e-runner`, so it cannot stop itself.
+
+The role is shared between runs and the policy is re-put on every
+`--host-power` run, so it always names the most recently tested cluster. The
+node scripts apply the same scope when resolving an IP to an instance, from a
+`cluster.env` file `run-tests.sh` places beside them.
 
 ```json
 {
@@ -78,9 +116,12 @@ nodes and nothing else.
         "ec2:StopInstances",
         "ec2:RebootInstances"
       ],
-      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Resource": "arn:aws:ec2:<region>:<account>:instance/*",
       "Condition": {
-        "StringLike": {"aws:ResourceTag/HarvesterRole": "*"}
+        "StringLike": {
+          "aws:ResourceTag/HarvesterRole": "*",
+          "aws:ResourceTag/Name": "<name-prefix>-node-*"
+        }
       }
     }
   ]
@@ -91,10 +132,6 @@ The trust policy allows `ec2.amazonaws.com` to assume the role, and nothing
 else. Both documents are defined in `run-tests.sh` (`iam_policy_document` and
 `iam_trust_document`) so the script is the source of truth; this section is a
 copy for review.
-
-If you scope your nodes differently, change the tag condition rather than
-widening the resource — a `Name`-based `StringLike` is fragile because the
-Terraform and CloudFormation deployments name nodes differently.
 
 ### What *your* credentials need
 

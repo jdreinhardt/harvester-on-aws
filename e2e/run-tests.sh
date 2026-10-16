@@ -28,6 +28,8 @@ set -euo pipefail
 NAME_PREFIX="terraform-cluster"
 KEY_NAME="aws-testing"
 KEY_FILE=""
+# Key the SUITE uses to SSH to the nodes as rancher. See --host-key-file.
+HOST_KEY_FILE=""
 RUNNER_TYPE="t3.medium"
 RUNNER_TAG="harvester-e2e-runner"
 # IAM role and instance profile used only by the host-power tests. Opt-in via
@@ -60,6 +62,13 @@ Usage: $0 [options]
   --name-prefix P   Cluster Name-tag prefix to discover. Default: ${NAME_PREFIX}
   --key-name N      EC2 key pair for the runner. Default: ${KEY_NAME}
   --key-file F      Private key. Default: \$HOME/.ssh/<key-name>.pem
+  --host-key-file F Private key for the CLUSTER's key pair, which the suite
+                    uses to SSH to the nodes as rancher (node SSH is key-only).
+                    Must be RSA and unencrypted: the suite loads it with
+                    paramiko.RSAKey, so ED25519 cannot work. It is copied into
+                    the runner's config.yml as host-private-key, so it never
+                    has to sit in your local one. Default: --key-file. Pass
+                    'none' to use config.yml's host credentials unchanged.
   --runner-type T   Runner instance type. Default: ${RUNNER_TYPE}
   --markers M       pytest -m expression. Default: "${MARKERS}"
   --target PATHS    Space-separated list of paths to collect from, in the
@@ -90,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         --name-prefix) NAME_PREFIX="$2"; shift 2 ;;
         --key-name)    KEY_NAME="$2"; shift 2 ;;
         --key-file)    KEY_FILE="$2"; shift 2 ;;
+        --host-key-file) HOST_KEY_FILE="$2"; shift 2 ;;
         --runner-type) RUNNER_TYPE="$2"; shift 2 ;;
         --markers)     MARKERS="$2"; shift 2 ;;
         --target)      TARGET="$2"; shift 2 ;;
@@ -106,6 +116,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 : "${KEY_FILE:=$HOME/.ssh/${KEY_NAME}.pem}"
+: "${HOST_KEY_FILE:=$KEY_FILE}"
+
+# Used in EC2 filters, an IAM policy document and a file the node scripts
+# source, so keep it to characters that are inert in all three.
+if ! [[ "$NAME_PREFIX" =~ ^[A-Za-z0-9-]+$ ]]; then
+    echo "ERROR: --name-prefix may contain only letters, digits and '-'." >&2
+    exit 1
+fi
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$REPO/.make/e2e_known_hosts" -o ConnectTimeout=10)
 
 find_runner() {
@@ -126,12 +144,32 @@ find_runner() {
 #
 # Scoping. ec2:DescribeInstances cannot be restricted by resource -- EC2's
 # describe calls do not support resource-level permissions -- so it is granted
-# on "*". The calls that actually change state are restricted to instances
-# carrying a HarvesterRole tag, which both the Terraform node definitions and
-# the CloudFormation node definitions set (create/join/worker) and nothing else
-# in the account carries. The runner itself is tagged only with Name, so this
-# policy does not let it stop itself, the NLB's targets aside from nodes, or
-# any unrelated instance.
+# on "*". The calls that actually change state are restricted to:
+#
+#   - this account and this region (the instance ARN), and
+#   - instances carrying a HarvesterRole tag (which both the Terraform and the
+#     CloudFormation node definitions set) AND a Name tag of
+#     <name-prefix>-node-*, i.e. THIS cluster's nodes.
+#
+# HarvesterRole alone is not enough: every cluster deployed from this repo
+# carries it, so a test run could otherwise stop the nodes of a different,
+# real cluster in the same account. The runner itself is tagged only with
+# Name=harvester-e2e-runner, so the policy does not let it stop itself.
+#
+# The role is shared between runs and the policy is re-put every time, so it
+# always matches the cluster of the most recent --host-power run.
+iam_scope() {
+    local caller
+    caller="$(aws sts get-caller-identity --query Arn --output text)"
+    IAM_PARTITION="$(printf '%s' "$caller" | cut -d: -f2)"
+    IAM_ACCOUNT="$(printf '%s' "$caller" | cut -d: -f5)"
+    IAM_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}"
+    [ -n "$IAM_REGION" ] || {
+        echo "ERROR: cannot determine the AWS region; set AWS_REGION." >&2
+        exit 1
+    }
+}
+
 iam_trust_document() {
     cat <<'JSON'
 {
@@ -146,7 +184,7 @@ JSON
 }
 
 iam_policy_document() {
-    cat <<'JSON'
+    cat <<JSON
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -167,9 +205,12 @@ iam_policy_document() {
         "ec2:StopInstances",
         "ec2:RebootInstances"
       ],
-      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Resource": "arn:${IAM_PARTITION}:ec2:${IAM_REGION}:${IAM_ACCOUNT}:instance/*",
       "Condition": {
-        "StringLike": {"aws:ResourceTag/HarvesterRole": "*"}
+        "StringLike": {
+          "aws:ResourceTag/HarvesterRole": "*",
+          "aws:ResourceTag/Name": "${NAME_PREFIX}-node-*"
+        }
       }
     }
   ]
@@ -182,6 +223,7 @@ JSON
 # earlier run can leave the role without its profile, or the profile without
 # its role.
 ensure_instance_profile() {
+    iam_scope
     aws iam get-role --role-name "$IAM_ROLE" >/dev/null 2>&1 || {
         echo "    creating IAM role ${IAM_ROLE}"
         aws iam create-role --role-name "$IAM_ROLE" \
@@ -230,6 +272,31 @@ command -v aws >/dev/null || { echo "ERROR: aws CLI not found" >&2; exit 1; }
 }
 [ -f "$KEY_FILE" ] || { echo "ERROR: key file $KEY_FILE not found (--key-file)" >&2; exit 1; }
 
+# The suite hardcodes paramiko.RSAKey for node SSH, and node SSH is key-only, so
+# a non-RSA key would fail every node-access test -- hours in, with "unpack
+# requires a buffer of 4 bytes". Check now.
+if [ "$HOST_KEY_FILE" != "none" ]; then
+    [ -f "$HOST_KEY_FILE" ] || { echo "ERROR: host key file $HOST_KEY_FILE not found (--host-key-file)" >&2; exit 1; }
+    HOST_PUB="$(ssh-keygen -y -P '' -f "$HOST_KEY_FILE" 2>/dev/null)" || {
+        echo "ERROR: cannot read $HOST_KEY_FILE without a passphrase." >&2
+        echo "       The suite cannot unlock an encrypted key; use an unencrypted one." >&2
+        exit 1
+    }
+    case "$HOST_PUB" in
+        ssh-rsa\ *) : ;;
+        *)
+            echo "ERROR: $HOST_KEY_FILE is a ${HOST_PUB%% *} key, not RSA." >&2
+            echo "       The suite loads the node key with paramiko.RSAKey only. Deploy" >&2
+            echo "       test clusters with an RSA EC2 key pair, e.g." >&2
+            echo "         aws ec2 create-key-pair --key-name harvester-e2e-rsa \\" >&2
+            echo "           --key-type rsa --key-format pem \\" >&2
+            echo "           --query KeyMaterial --output text > ~/.ssh/harvester-e2e-rsa.pem" >&2
+            echo "       and pass --host-key-file ~/.ssh/harvester-e2e-rsa.pem." >&2
+            exit 1
+            ;;
+    esac
+fi
+
 if grep -q 'REPLACE-WITH' "$REPO/e2e/config.yml"; then
     echo "ERROR: e2e/config.yml still has REPLACE-WITH placeholders:" >&2
     grep -n 'REPLACE-WITH' "$REPO/e2e/config.yml" | sed 's/^/       /' >&2
@@ -264,6 +331,35 @@ VIP="$(aws ec2 describe-instances \
     exit 1
 }
 echo "    nodes: ${NODE_COUNT}   subnet: ${SUBNET}   sg: ${SG}   vip: ${VIP}"
+
+# Guest images must match the nodes' architecture. A mismatched image is the
+# worst kind of wrong: QEMU starts, the virt-launcher pod goes Ready and the
+# VMI reports Running WITH an IP, so everything looks healthy -- but the guest
+# never boots, the agent never connects, and every VM test sits out its full
+# wait-timeout instead of failing. Two runs were lost to exactly that before
+# this check existed.
+NODE_ARCH="$(aws ec2 describe-instances --instance-ids "$NODE_ID" \
+    --query 'Reservations[0].Instances[0].Architecture' --output text 2>/dev/null)"
+case "$NODE_ARCH" in
+    arm64)  WRONG_ARCH='x86_64|amd64' ;;
+    x86_64) WRONG_ARCH='aarch64|arm64' ;;
+    *)      WRONG_ARCH='' ;;
+esac
+if [ -n "$WRONG_ARCH" ]; then
+    MISMATCHED="$(grep -nE '^[a-z]+-image-url:' "$REPO/e2e/config.yml" \
+        | grep -E "$WRONG_ARCH" || true)"
+    if [ -n "$MISMATCHED" ]; then
+        echo "ERROR: cluster nodes are ${NODE_ARCH}, but config.yml points at guest" >&2
+        echo "       images for the other architecture:" >&2
+        echo "$MISMATCHED" | sed 's/^/         /' >&2
+        echo "       Such a guest never boots, so VM tests hang for the whole" >&2
+        echo "       wait-timeout rather than failing. Fix the *-image-url lines." >&2
+        exit 1
+    fi
+    echo "    node arch: ${NODE_ARCH} (guest images match)"
+else
+    echo "    node arch: ${NODE_ARCH:-unknown} (not checked against guest images)"
+fi
 
 # A powercycle run without --host-power fails at the first assertion, three
 # hours in if it is at the end of an ordered target list. Say so up front.
@@ -396,6 +492,17 @@ echo "==> provisioning"
 scp "${SSH_OPTS[@]}" -i "$KEY_FILE" -q "$HERE/runner-provision.sh" "ec2-user@$IP:/tmp/"
 ssh "${SSH_OPTS[@]}" -i "$KEY_FILE" "ec2-user@$IP" 'mkdir -p ~/node-scripts'
 scp "${SSH_OPTS[@]}" -i "$KEY_FILE" -q "$HERE"/node-scripts/*.sh "ec2-user@$IP:~/node-scripts/"
+# Tells _common.sh which cluster it may act on, so an instance is resolved by
+# private IP AND by this cluster's Name tag -- private IPs are only unique
+# within a VPC, and the account may hold other clusters.
+CLUSTER_ENV="$(mktemp "${TMPDIR:-/tmp}/harv-cluster-env.XXXXXX")"
+{
+    printf 'NAME_PREFIX=%s\n' "$NAME_PREFIX"
+    REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}"
+    if [ -n "$REGION" ]; then printf 'AWS_DEFAULT_REGION=%s\n' "$REGION"; fi
+} > "$CLUSTER_ENV"
+scp "${SSH_OPTS[@]}" -i "$KEY_FILE" -q "$CLUSTER_ENV" "ec2-user@$IP:~/node-scripts/cluster.env"
+rm -f "$CLUSTER_ENV"
 
 ssh "${SSH_OPTS[@]}" -i "$KEY_FILE" "ec2-user@$IP" 'chmod +x ~/node-scripts/*.sh /tmp/runner-provision.sh'
 
@@ -406,6 +513,25 @@ ssh "${SSH_OPTS[@]}" -i "$KEY_FILE" "ec2-user@$IP" 'bash /tmp/runner-provision.s
 
 echo "==> config"
 scp "${SSH_OPTS[@]}" -i "$KEY_FILE" -q "$REPO/e2e/config.yml" "ec2-user@$IP:~/harvester-tests/config.yml"
+ssh "${SSH_OPTS[@]}" -i "$KEY_FILE" "ec2-user@$IP" 'chmod 0600 ~/harvester-tests/config.yml'
+# Node credentials go into the RUNNER's copy only. The key travels as a file and
+# is merged in by the suite's own Python rather than passed as a pytest flag,
+# which would put it on a command line visible in ps.
+if [ "$HOST_KEY_FILE" != "none" ]; then
+    echo "    node SSH key: ${HOST_KEY_FILE} (host-password cleared; nodes are key-only)"
+    ssh "${SSH_OPTS[@]}" -i "$KEY_FILE" "ec2-user@$IP" 'umask 077; : > ~/harvester-tests/.host-key'
+    scp "${SSH_OPTS[@]}" -i "$KEY_FILE" -q "$HOST_KEY_FILE" "ec2-user@$IP:~/harvester-tests/.host-key"
+    ssh "${SSH_OPTS[@]}" -i "$KEY_FILE" "ec2-user@$IP" 'cd ~/harvester-tests && ./.venv/bin/python -I - <<"PY" && rm -f .host-key
+import yaml
+with open("config.yml") as fh:
+    cfg = yaml.safe_load(fh)
+with open(".host-key") as fh:
+    cfg["host-private-key"] = fh.read()
+cfg["host-password"] = ""
+with open("config.yml", "w") as fh:
+    yaml.safe_dump(cfg, fh, sort_keys=False, default_flow_style=False)
+PY'
+fi
 # Only now can pytest be invoked at all: conftest.py does a bare
 # open('config.yml'), relative to the CWD, while parsing options.
 ssh "${SSH_OPTS[@]}" -i "$KEY_FILE" "ec2-user@$IP" \
