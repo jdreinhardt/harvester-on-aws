@@ -204,17 +204,22 @@ resource "aws_instance" "node" {
     }
   }
 
-  # IMDSv2 only; /oem/aws/configure.sh does the token handshake. Hop limit 2 so
-  # pods can reach IMDS.
+  # IMDSv2 only; /oem/aws/configure.sh does the token handshake from the host,
+  # so a hop limit of 1 is all it needs. Nothing else here uses IMDS -- no
+  # instance role, no cloud controller -- and a higher limit would let any pod
+  # read user-data, which holds the cluster token and any password hash.
   metadata_options {
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_put_response_hop_limit = 1
     http_endpoint               = "enabled"
   }
 
+  # Longhorn's data partition -- every VM disk -- lives on this volume.
   root_block_device {
     volume_size = var.volume_size
     volume_type = "gp3"
+    encrypted   = true
+    kms_key_id  = var.ebs_kms_key_id != "" ? var.ebs_kms_key_id : null
   }
 
   # Only node 1 carries the VIP, as a secondary private address.
@@ -234,6 +239,15 @@ resource "aws_instance" "node" {
 
   # User-data is only read once, at first boot, so a change means a new node.
   user_data_replace_on_change = true
+
+  # The AMI usually comes from an SSM parameter that every plan re-reads, and
+  # `make ami` repoints /harvester/ami/<arch>/latest by default. Without this,
+  # the next apply after a build would replace every node -- and with it the
+  # root volumes that hold all VM data. Rolling nodes onto a new image is a
+  # deliberate act: `apply -replace='module.harvester.aws_instance.node[N]'`.
+  lifecycle {
+    ignore_changes = [ami]
+  }
 
   tags = {
     Name          = "${var.name_prefix}-node-${count.index + 1}"

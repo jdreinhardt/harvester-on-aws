@@ -44,7 +44,7 @@ Metadata:
       - Label: {default: "4. Addresses"}
         Parameters: [VipAddress, AdminCidrs, OverlayClientCidr, ManagementNlb]
       - Label: {default: "5. Storage"}
-        Parameters: [VolumeSize, ReplicaCount]
+        Parameters: [VolumeSize, ReplicaCount, EbsKmsKeyId]
       - Label: {default: "6. Advanced"}
         Parameters: [ControlPlaneViaNlb, DisableSourceDestCheck, Mtu, PasswordHash]
     ParameterLabels:
@@ -62,6 +62,7 @@ Metadata:
       ManagementNlb:  {default: "Management endpoint NLB"}
       VolumeSize:     {default: "Root volume size (GiB)"}
       ReplicaCount:   {default: "Storage replica count"}
+      EbsKmsKeyId:    {default: "KMS key for root volumes (optional)"}
       Mtu:            {default: "Management interface MTU"}
       ControlPlaneViaNlb: {default: "Enable Kubernetes APIs in NLB"}
       DisableSourceDestCheck: {default: "Disable EC2 source/destination check"}
@@ -89,10 +90,19 @@ Parameters:
     # specified AMI", which is clear but only surfaces at create time.
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /harvester/ami/amd64/latest
+    #
+    # CloudFormation re-resolves this on EVERY stack update, and the instances
+    # take their AMI through the launch templates, a replacement-only property.
+    # So once `make ami` has repointed .../latest, any later update -- even an
+    # unrelated one like editing AdminCidrs -- replaces every node and destroys
+    # its root volume, which is where every VM disk lives. For a stack you mean
+    # to keep, set AmiIdOverride to the literal id instead.
     Description: >-
       SSM Parameter Store path holding the AMI ID from phase 2.5. Use
       /harvester/ami/amd64/latest for x86 instance types and
-      /harvester/ami/arm64/latest for Graviton metal types.
+      /harvester/ami/arm64/latest for Graviton metal types. Re-read on every
+      stack update; for long-lived stacks pin AmiIdOverride instead, or a
+      later update will replace all nodes.
 
   AmiIdOverride:
     Type: String
@@ -100,6 +110,8 @@ Parameters:
     AllowedPattern: '^$|^ami-[0-9a-f]{8,17}$'
     Description: >-
       Optional AMI ID string. When set it overrides Parameter Store value.
+      Recommended for any stack you intend to keep: it does not change unless
+      you change it, so stack updates cannot silently replace the nodes.
 
   # x86 candidates:
   #   aws ec2 describe-instance-types --filters Name=processor-info.supported-features,Values=nested-virtualization
@@ -167,11 +179,19 @@ Parameters:
     Description: >-
       How large of a cluster to deploy.
 
+  # NoEcho only hides the value in the console and in DescribeStacks. It is
+  # still written in plain text into the launch templates' user-data, readable
+  # by anyone allowed ec2:DescribeLaunchTemplateVersions or
+  # ec2:DescribeInstanceAttribute -- restrict those accordingly.
   ClusterToken:
     Type: String
     NoEcho: true
-    MinLength: 8
-    Description: Shared secret used for registering nodes with the cluster.
+    MinLength: 16
+    AllowedPattern: '^[A-Za-z0-9._+/=-]{16,}$'
+    ConstraintDescription: at least 16 characters of A-Z a-z 0-9 . _ + / = -
+    Description: >-
+      Shared secret used for registering nodes with the cluster. Generate one
+      with: openssl rand -hex 24
 
   # --- 4. Addresses -------------------------------------------------------
   VipAddress:
@@ -222,6 +242,14 @@ Parameters:
     Description: >-
       Storage replicas. For single node clusters set to 1, otherwise leave at 3.
 
+  EbsKmsKeyId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key/[0-9a-f-]+$'
+    Description: >-
+      Optional KMS key ARN for the root volumes. They are always encrypted;
+      empty uses the account's default EBS key (aws/ebs).
+
   # --- 6. Advanced --------------------------------------------------------
   ControlPlaneViaNlb:
     Type: String
@@ -232,11 +260,13 @@ Parameters:
 
   DisableSourceDestCheck:
     Type: String
-    Default: 'true'
+    Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      Will disable Source/Destination checking of packets on all nodes.
-      This is required to make the overlay network addressable on the VPC.
+      Disables Source/Destination checking on all nodes, letting them forward
+      (and emit) traffic for addresses that are not their own. Only needed to
+      make overlay VMs addressable from the VPC -- set it together with
+      OverlayClientCidr and a VPC route. Leave false otherwise.
 
   Mtu:
     Type: Number
@@ -250,9 +280,12 @@ Parameters:
     Type: String
     Default: ''
     NoEcho: true
+    AllowedPattern: '^$|^\$[^"\\]+$'
+    ConstraintDescription: must be a crypt hash (mkpasswd -m sha-512), not a plaintext password
     Description: >-
-      Sets an OS password for rancher user (mkpasswd -m sha-512) different from the default set in phase 1.
-      Leave empty to use existing password. A plaintext value (not a hash) will effectively disable password login.
+      Optional crypt hash (mkpasswd -m sha-512) for the rancher user, for
+      logging in on the EC2 serial console. SSH is key-only regardless. Empty
+      leaves the rancher user with no usable password.
 
 Conditions:
   IsCluster:   !Not [!Equals [!Ref NodeCount, '1']]
@@ -301,6 +334,7 @@ Conditions:
           - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 3]
           - Fn::Equals: [{Fn::Length: !Ref AdminCidrs}, 4]
   HasAmiOverride: !Not [!Equals [!Ref AmiIdOverride, '']]
+  HasKmsKey:      !Not [!Equals [!Ref EbsKmsKeyId, '']]
   # true on the parameter means DISABLE the check, so the EC2 property
   # (which is the check itself) gets the opposite value.
   DisableSdc:     !Equals [!Ref DisableSourceDestCheck, 'true']
@@ -586,7 +620,9 @@ Resources:
           - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
-          HttpPutResponseHopLimit: 2
+          # 1: configure.sh fetches user-data from the host itself. Anything
+          # higher lets pods read user-data, which holds the cluster token.
+          HttpPutResponseHopLimit: 1
           HttpEndpoint: enabled
         BlockDeviceMappings:
           - DeviceName: /dev/sda1
@@ -594,6 +630,9 @@ Resources:
               VolumeSize: !Ref VolumeSize
               VolumeType: gp3
               DeleteOnTermination: true
+              # Longhorn's data partition, i.e. every VM disk, lives here.
+              Encrypted: true
+              KmsKeyId: !If [HasKmsKey, !Ref EbsKmsKeyId, !Ref 'AWS::NoValue']
         UserData:
           Fn::Base64:
             Fn::Sub:
@@ -658,7 +697,9 @@ Resources:
           - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
-          HttpPutResponseHopLimit: 2
+          # 1: configure.sh fetches user-data from the host itself. Anything
+          # higher lets pods read user-data, which holds the cluster token.
+          HttpPutResponseHopLimit: 1
           HttpEndpoint: enabled
         BlockDeviceMappings:
           - DeviceName: /dev/sda1
@@ -666,6 +707,9 @@ Resources:
               VolumeSize: !Ref VolumeSize
               VolumeType: gp3
               DeleteOnTermination: true
+              # Longhorn's data partition, i.e. every VM disk, lives here.
+              Encrypted: true
+              KmsKeyId: !If [HasKmsKey, !Ref EbsKmsKeyId, !Ref 'AWS::NoValue']
         UserData:
           Fn::Base64:
             Fn::Sub:
@@ -732,7 +776,9 @@ Resources:
           - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
-          HttpPutResponseHopLimit: 2
+          # 1: configure.sh fetches user-data from the host itself. Anything
+          # higher lets pods read user-data, which holds the cluster token.
+          HttpPutResponseHopLimit: 1
           HttpEndpoint: enabled
         BlockDeviceMappings:
           - DeviceName: /dev/sda1
@@ -740,6 +786,9 @@ Resources:
               VolumeSize: !Ref VolumeSize
               VolumeType: gp3
               DeleteOnTermination: true
+              # Longhorn's data partition, i.e. every VM disk, lives here.
+              Encrypted: true
+              KmsKeyId: !If [HasKmsKey, !Ref EbsKmsKeyId, !Ref 'AWS::NoValue']
         UserData:
           Fn::Base64:
             Fn::Sub:

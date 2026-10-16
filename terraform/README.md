@@ -74,6 +74,8 @@ instance type does not match the architecture 'x86_64' of the specified AMI"*.
 | `mtu` | Defaults to 1500. What matters is that it is set at all. |
 | `overlay_client_cidr` | Opens the nodes to this source on **all** protocols. Only with a VPC route for the overlay CIDR. |
 | `replica_count` | Fixed at bootstrap and immutable afterwards. |
+| `disable_source_dest_check` | Default `false`. Set `true` only alongside `overlay_client_cidr` and a VPC route for the overlay. |
+| `cluster_token` | At least 16 characters of `A-Za-z0-9._+/=-`; `openssl rand -hex 24`. Stored in plain text in state and in instance user-data — protect both. |
 
 ## Changing user-data replaces nodes
 
@@ -83,5 +85,25 @@ Terraform report success while the running cluster kept the old configuration.
 
 The practical consequence matches CloudFormation, where `LaunchTemplate` is a
 create-only property: anything feeding user-data — `mtu`, `cluster_token`,
-`replica_count`, `control_plane_via_nlb`, the AMI — is a **deploy-time**
-decision. Changing it rebuilds the cluster.
+`replica_count`, `control_plane_via_nlb` — is a **deploy-time** decision.
+Changing it rebuilds the cluster.
+
+## The AMI is not followed automatically
+
+The AMI is the exception: `ignore_changes = [ami]`. `ami_ssm_parameter` is
+re-read on every plan, and `make ami` repoints `/harvester/ami/<arch>/latest`
+by default, so without this the first apply after any build would replace every
+node — root volumes, and with them every VM disk, included. New nodes still
+launch from whatever the parameter says at the time. To move an existing node
+onto a new image, replace it deliberately:
+
+```bash
+tofu apply -replace='module.harvester.aws_instance.node[2]'
+```
+
+## Root volumes are encrypted
+
+Always, with the account's default EBS key unless `ebs_kms_key_id` names
+another. Turning encryption on forces replacement, so a cluster created before
+this change will be rebuilt by its next apply — destroy and recreate it
+deliberately rather than letting an unrelated apply do it.

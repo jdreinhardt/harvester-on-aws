@@ -86,9 +86,21 @@ variable "node_count" {
 }
 
 variable "cluster_token" {
-  description = "Shared by every node. Treat as a secret: it authorises joining the cluster."
+  description = <<-EOT
+    Shared by every node. Treat as a secret: it authorises joining the cluster.
+    Generate with `openssl rand -hex 24`. `sensitive` only hides it from plan
+    output -- it is stored in plain text in Terraform state and in the
+    instances' user-data, so protect the state backend and restrict
+    ec2:DescribeInstanceAttribute.
+  EOT
   type        = string
   sensitive   = true
+
+  validation {
+    # Interpolated into YAML user-data, so restrict the alphabet as well.
+    condition     = can(regex("^[A-Za-z0-9._+/=-]{16,}$", var.cluster_token))
+    error_message = "cluster_token must be at least 16 characters of A-Z a-z 0-9 . _ + / = -."
+  }
 }
 
 # --- Addresses ---------------------------------------------------------------
@@ -188,6 +200,17 @@ variable "replica_count" {
   EOT
   type        = number
   default     = 3
+
+  validation {
+    condition     = contains([1, 3], var.replica_count)
+    error_message = "replica_count must be 1 (single node) or 3."
+  }
+}
+
+variable "ebs_kms_key_id" {
+  description = "Optional KMS key ARN for the root volumes. They are always encrypted; empty uses the account's default EBS key (aws/ebs)."
+  type        = string
+  default     = ""
 }
 
 # --- Advanced ----------------------------------------------------------------
@@ -202,28 +225,43 @@ variable "mtu" {
   EOT
   type        = number
   default     = 1500
+
+  validation {
+    # checkMTU() in harvester-installer accepts 576..9000 (not ENA's 9001).
+    condition     = var.mtu >= 576 && var.mtu <= 9000
+    error_message = "mtu must be between 576 and 9000."
+  }
 }
 
 variable "disable_source_dest_check" {
   description = <<-EOT
-    Disable EC2's source/destination check. Required to reach VM addresses from
-    the VPC over a kube-ovn overlay: outbound is SNATed by natOutgoing and works
-    either way, but inbound needs the node to forward for addresses that are not
-    its own, which the check blocks silently.
+    Disable EC2's source/destination check. Required only to reach VM addresses
+    from the VPC over a kube-ovn overlay: outbound is SNATed by natOutgoing and
+    works either way, but inbound needs the node to forward for addresses that
+    are not its own, which the check blocks silently. Disabling it also lets
+    the node emit traffic from addresses that are not its own, so leave it off
+    unless you set overlay_client_cidr and add the VPC route.
   EOT
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "password_hash" {
   description = <<-EOT
-    SHA-512 crypt hash for the rancher user (mkpasswd -m sha-512). Empty keeps
-    the password baked in during phase 1. A plaintext value here does not set a
-    password, it disables password login.
+    Optional SHA-512 crypt hash for the rancher user (mkpasswd -m sha-512), for
+    logging in on the EC2 serial console. SSH is key-only regardless. Empty
+    leaves the rancher user with no usable password.
   EOT
   type        = string
   default     = ""
   sensitive   = true
+
+  validation {
+    # Written verbatim to /etc/shadow, so a plaintext value would not set a
+    # password at all. Also interpolated into YAML user-data.
+    condition     = var.password_hash == "" || can(regex("^\\$[^\"\\\\]+$", var.password_hash))
+    error_message = "password_hash must be a crypt hash (mkpasswd -m sha-512), not a plaintext password."
+  }
 }
 
 variable "name_prefix" {
