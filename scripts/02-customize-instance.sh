@@ -400,6 +400,50 @@ SYSTEMD_DIR=/etc/systemd/system
 # Both /etc/NetworkManager and /etc/systemd are PERSISTENT_STATE_BIND paths
 # (os2 files/system/oem/00_rootfs.yaml), so writes here survive reboots.
 
+# --- Key-only SSH ---------------------------------------------------------
+# Every boot, configured or not, so nothing that regenerates sshd's config can
+# quietly turn passwords back on. Password login stays available on the serial
+# console (it goes through login, not sshd), which is what a user-data
+# os.password hash is for.
+#
+# KbdInteractiveAuthentication too: with UsePAM, keyboard-interactive is just
+# password authentication by another name.
+#
+# sshd keeps the FIRST value it reads for each keyword, so the directives have
+# to come before anything else that sets them: a 00- drop-in when the config
+# includes sshd_config.d, otherwise a block at the very top of sshd_config.
+SSHD_MARK="# --- harvester-aws: key-only SSH ---"
+SSHD_BLOCK="$SSHD_MARK
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+$SSHD_MARK"
+SSHD_DROPIN=/etc/ssh/sshd_config.d/00-harvester-aws.conf
+configure_sshd() {
+    if grep -qsE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' \
+            /etc/ssh/sshd_config /usr/etc/ssh/sshd_config; then
+        mkdir -p /etc/ssh/sshd_config.d
+        printf '%s\n' "$SSHD_BLOCK" > "$SSHD_DROPIN"
+        chmod 0644 "$SSHD_DROPIN"
+        log "SSH: key-only via $SSHD_DROPIN"
+        return 0
+    fi
+    # No drop-in directory. On SUSE an /etc/ssh/sshd_config replaces the vendor
+    # /usr/etc one outright, so start from a copy of it rather than a stub that
+    # would lose Subsystem sftp and everything else.
+    if [ ! -f /etc/ssh/sshd_config ]; then
+        [ -f /usr/etc/ssh/sshd_config ] || { log "WARNING: no sshd_config found; SSH NOT hardened"; return 1; }
+        cp /usr/etc/ssh/sshd_config /etc/ssh/sshd_config
+    fi
+    if ! grep -qF "$SSHD_MARK" /etc/ssh/sshd_config; then
+        { printf '%s\n\n' "$SSHD_BLOCK"; cat /etc/ssh/sshd_config; } > /etc/ssh/sshd_config.aws-new
+        chmod 0600 /etc/ssh/sshd_config.aws-new
+        mv /etc/ssh/sshd_config.aws-new /etc/ssh/sshd_config
+    fi
+    log "SSH: key-only via the top of /etc/ssh/sshd_config"
+}
+configure_sshd || true
+
 # Once the node has been configured by the installer it owns the network:
 # bond-mgmt + bridge-mgmt + bond-slave-eth0. Never re-add the bootstrap profile
 # on top of that.
@@ -671,9 +715,12 @@ else
 fi
 DEFAULT_HOSTNAME="$(printf '%s' "$DEFAULT_HOSTNAME" | tr '[:upper:]' '[:lower:]')"
 
-# A token is mandatory in create/join mode (checkToken). Derive a stable one
-# from machine-id if user-data does not supply it.
-DEFAULT_TOKEN="harvester-$(cat /etc/machine-id 2>/dev/null | head -c 16)"
+# A token is mandatory in create/join mode (checkToken). If user-data does not
+# supply one, generate a random one -- NOT something derived from machine-id,
+# which is world-readable and not meant to be secret. It only matters for a
+# create-mode node launched with hand-written user-data; to add nodes later,
+# read it back from /oem/userdata.yaml on this node.
+DEFAULT_TOKEN="harvester-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -804,16 +851,32 @@ fi
 if [ "$MODE" = "join" ] && [ -z "$(yq -r '.server_url // ""' "$WORK/merged.yaml")" ]; then
     die "install.mode is 'join' but server_url is not set"
 fi
-if [ -z "$PASSWD" ] && [ "$NKEYS" = "0" ]; then
-    # commonCheck() rejects a config with neither. mergo fills os.password from
-    # the hash baked into /oem/harvester.config at build time, so only complain
-    # if that is empty too.
-    BAKED_PASSWD="$(yq -r '.os.password // ""' /oem/harvester.config 2>/dev/null || echo "")"
-    [ -n "$BAKED_PASSWD" ] || die "neither os.password nor os.ssh_authorized_keys is set,
-       and no password was baked in at build time. The installer refuses a
-       configuration with no credentials. Launch with --key-name, or set
-       os.password to a crypt hash in user-data."
-    say "no credentials in user-data; falling back to the password baked in at build time"
+# Credentials. SSH is key-only (stage-initramfs.sh), and the password baked in
+# at build time is random and unknown, so it must not survive into the cluster:
+#
+#   - user-data os.password set  -> that hash; usable on the serial console only
+#   - not set                    -> "*", which matches no password at all
+#
+# mergeCloudInit() assigns os.password from userdata.yaml explicitly rather
+# than through mergo, so this does replace the build-time hash. "*" rather than
+# "!": sshd treats a "!"-prefixed hash as a locked account and can refuse key
+# logins for it too.
+#
+# With no SSH key either, nobody could ever log in, so refuse -- the failure
+# leaves the interactive installer on the serial console instead.
+if [ "$NKEYS" = "0" ] && [ -z "$PASSWD" ]; then
+    die "no SSH key and no password hash. SSH on these nodes is key-only and the
+       build-time password is random, so this node would be unreachable.
+       Launch with a key pair (--key-name / KeyName / key_name), or put keys in
+       os.ssh_authorized_keys, and optionally an os.password crypt hash for the
+       serial console."
+fi
+if [ "$NKEYS" = "0" ]; then
+    say "WARNING: no SSH key; this node is reachable only through the EC2 serial console"
+fi
+if [ -z "$PASSWD" ]; then
+    yq -i '.os.password = "*"' "$WORK/merged.yaml"
+    say "no os.password in user-data; the rancher user has no usable password"
 fi
 case "$PASSWD" in
     ''|'$'*) : ;;
@@ -823,6 +886,17 @@ case "$PASSWD" in
         say "         password login rather than setting it."
         ;;
 esac
+
+# Report what sshd will actually do. stage-initramfs.sh wrote the settings
+# before sshd started; this only checks that nothing earlier in its config
+# overrides them.
+if command -v sshd >/dev/null; then
+    SSHD_EFFECTIVE="$(sshd -T 2>/dev/null | grep -iE '^(passwordauthentication|kbdinteractiveauthentication) ' | tr '\n' ' ')"
+    case "$SSHD_EFFECTIVE" in
+        *" yes"*|"") say "WARNING: sshd password login NOT confirmed off: '${SSHD_EFFECTIVE:-sshd -T failed}'" ;;
+        *)           say "sshd: ${SSHD_EFFECTIVE}" ;;
+    esac
+fi
 
 # --- 6. Extra TLS SANs for every node --------------------------------------
 # harvester-installer writes the RKE2 server config carrying tls-san ONLY on the
@@ -847,13 +921,13 @@ esac
 TLS_SANS="$(yq -r '.aws.tls_sans // [] | .[]' "$WORK/user-data.yaml" 2>/dev/null || true)"
 if [ -n "$TLS_SANS" ]; then
     mkdir -p /etc/rancher/rke2/config.yaml.d
-    {
-        echo "tls-san:"
-        printf '%s\n' "$TLS_SANS" | while IFS= read -r san; do
-            [ -n "$san" ] && echo "  - ${san}"
-        done
-    } > /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml
-    chmod 0600 /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml
+    # Emitted by yq rather than echoed, so each name is quoted as YAML needs.
+    # Echoed bare, a wildcard such as *.example.com parses as an alias and RKE2
+    # refuses the whole config.
+    yq '{"tls-san": [.aws.tls_sans[] | select(. != null and . != "")]}' "$WORK/user-data.yaml" \
+        > "$WORK/95-aws-tls-san.yaml" || die "could not render the tls-san drop-in"
+    install -o root -g root -m 0600 "$WORK/95-aws-tls-san.yaml" \
+        /etc/rancher/rke2/config.yaml.d/95-aws-tls-san.yaml
     say "wrote 95-aws-tls-san.yaml ($(printf '%s' "$TLS_SANS" | tr '\n' ' '))"
 fi
 

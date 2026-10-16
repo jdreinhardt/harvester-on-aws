@@ -178,8 +178,20 @@ QEMU_TIMEOUT="${QEMU_TIMEOUT:-3600}"
 # util.GetEncryptedPasswd() from the interactive TUI, and yip's user plugin
 # assigns schema.User.PasswordHash straight through. Passing a plaintext
 # password here silently produces an unusable shadow entry. So hash it.
-OS_PASSWORD="${OS_PASSWORD:-rancher}"
+#
+# There is deliberately no fixed default. A known password baked into the AMI
+# is a known password on every node launched from it, reachable by anything
+# that can open port 22 -- including guest VMs, whose traffic leaves as the
+# node's own address. Unless OS_PASSWORD or OS_PASSWORD_HASH is given, a
+# random one is generated and recorded only in BUILD_PASSWORD_FILE, for logging
+# in to the build VM's console if the install fails.
+#
+# It does not carry over to the cluster: /oem/aws/configure.sh replaces it on
+# first boot with the user-data password hash or with no usable password at
+# all, and SSH on the nodes is key-only either way.
+OS_PASSWORD="${OS_PASSWORD:-}"
 OS_PASSWORD_HASH="${OS_PASSWORD_HASH:-}"
+BUILD_PASSWORD_FILE="${ARTIFACTS_DIR}/build-os-password"
 
 FORCE="false"
 DEVICE=""
@@ -208,7 +220,8 @@ Environment overrides:
   MEMORY_MIB          default ${MEMORY_MIB}
   SMP                 default ${SMP}
   QEMU_TIMEOUT        default ${QEMU_TIMEOUT} seconds (0 disables)
-  OS_PASSWORD         default ${OS_PASSWORD}
+  OS_PASSWORD         build-time console password; default: random, written
+                      to ${BUILD_PASSWORD_FILE}
   OS_PASSWORD_HASH    a SHA-512 crypt hash, used instead of hashing OS_PASSWORD
   OVMF_CODE           default ${OVMF_CODE}
   OVMF_VARS_TEMPLATE  default ${OVMF_VARS_TEMPLATE}
@@ -311,8 +324,14 @@ if [ -z "$OS_PASSWORD_HASH" ]; then
         echo "         OS_PASSWORD_HASH=\$(mkpasswd -m sha-512 'yourpassword')" >&2
         exit 1
     fi
-    OS_PASSWORD_HASH="$(openssl passwd -6 "$OS_PASSWORD")"
-    echo "Generated SHA-512 crypt hash for the '${OS_PASSWORD}' console password."
+    mkdir -p "${ARTIFACTS_DIR}"
+    if [ -z "$OS_PASSWORD" ]; then
+        OS_PASSWORD="$(openssl rand -base64 24 | tr -d '/+=\n')"
+        ( umask 077; printf '%s\n' "$OS_PASSWORD" > "$BUILD_PASSWORD_FILE" )
+        echo "Generated a random build console password (in ${BUILD_PASSWORD_FILE})."
+    fi
+    # Over stdin rather than as an argument, so it never shows in ps.
+    OS_PASSWORD_HASH="$(printf '%s\n' "$OS_PASSWORD" | openssl passwd -6 -stdin)"
 fi
 
 case "$OS_PASSWORD_HASH" in
@@ -401,8 +420,9 @@ Starting Harvester install (UEFI, install-mode-only).
   abort:   Ctrl-A then X   (plain Ctrl-C goes to the guest)
 
 The VM powers itself off when the install succeeds. If it fails, the installer
-leaves the VM running so you can log in on this console as rancher/rancher and
-read /var/log/console.log.
+leaves the VM running so you can log in on this console as rancher and read
+/var/log/console.log. The password is OS_PASSWORD if you set one, otherwise
+the random one in ${BUILD_PASSWORD_FILE}.
 ---
 BANNER
 

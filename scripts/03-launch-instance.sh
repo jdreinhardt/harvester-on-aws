@@ -85,6 +85,8 @@ Options:
                    x86 type supporting nested virtualization, or a Graviton
                    (arm64) *.metal type. Must match the AMI's architecture.
   --key-name       EC2 key pair. Its public key is added to the rancher user.
+                   SSH on the nodes is key-only, so without this (or keys in
+                   --user-data-file) the node has no SSH access at all.
   --role ROLE      Node role. Left unset by default, which is Harvester's
                    "default": eligible for automatic promotion. Promotion only
                    happens once the cluster has 3 nodes -- OnNodeChanged in
@@ -122,8 +124,9 @@ Options:
                    9000) and helps Longhorn replication between nodes, but it
                    leaves VM egress depending on PMTUD through GENEVE and NAT.
                    Pass 0 to leave it unset entirely -- that is the broken case.
-  --password-hash  SHA-512 crypt hash for the rancher user. If omitted, the
-                   password baked in during phase 1 is kept.
+  --password-hash  SHA-512 crypt hash for the rancher user, for logging in on
+                   the EC2 serial console. SSH ignores it -- it is key-only.
+                   If omitted the rancher user has no usable password.
                    Generate one with:  mkpasswd -m sha-512
   --hostname       Node hostname. Default: harvester-<instance-id>
   --user-data-file Use this file as the Harvester configuration verbatim
@@ -437,14 +440,24 @@ PY
     echo "Using VIP: $VIP"
 fi
 
-# Join mode already required a token above.
+# Join mode already required a token above. The token is the cluster's join
+# secret: whoever has it can register a node and with it obtain cluster
+# credentials. So it is generated from a CSPRNG or not at all -- there is no
+# weaker fallback.
 if [ -z "$TOKEN" ]; then
-    if command -v openssl >/dev/null; then
-        TOKEN="harvester-aws-$(openssl rand -hex 8)"
-    else
-        TOKEN="harvester-aws-$(date +%s)-$RANDOM"
-    fi
+    command -v openssl >/dev/null || {
+        echo "ERROR: openssl not found, so a token cannot be generated safely." >&2
+        echo "       Install openssl or pass --token with at least 16 random characters." >&2
+        exit 1
+    }
+    TOKEN="harvester-aws-$(openssl rand -hex 24)"
     echo "Generated cluster token: $TOKEN"
+fi
+# It is interpolated into YAML below, so restrict the alphabet as well as
+# requiring some length.
+if ! [[ "$TOKEN" =~ ^[A-Za-z0-9._+/=-]{16,}$ ]]; then
+    echo "ERROR: --token must be at least 16 characters of [A-Za-z0-9._+/=-]." >&2
+    exit 1
 fi
 
 if [ "$MTU" = "0" ]; then
@@ -460,6 +473,22 @@ elif [ -n "$MTU" ]; then
         echo "       ENA's 9001 is rejected; use 9000." >&2
         exit 1
     fi
+fi
+
+# configure.sh refuses a node with neither, since it could never be logged in
+# to. Catch it here rather than after a 15-minute boot. A --user-data-file is
+# checked on the node instead.
+if [ -z "$USER_DATA_FILE" ] && [ -z "$KEY_NAME" ]; then
+    if [ -z "$PASSWORD_HASH" ]; then
+        echo "ERROR: pass --key-name (and optionally --password-hash)." >&2
+        echo "       SSH on the nodes is key-only and the build-time password is" >&2
+        echo "       random, so without either the node is unreachable and" >&2
+        echo "       configure.sh refuses to proceed." >&2
+        exit 1
+    fi
+    echo "WARNING: no --key-name. The node will have no SSH access; only the EC2" >&2
+    echo "         serial console, with the --password-hash password." >&2
+    echo "" >&2
 fi
 
 if [ -n "$PASSWORD_HASH" ]; then
@@ -572,10 +601,14 @@ LAUNCH_ARGS=(
     --instance-type "$INSTANCE_TYPE"
     --subnet-id "$SUBNET"
     --security-group-ids "$SG"
-    --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${VOLUME_SIZE},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]"
-    # IMDSv2 only. /oem/aws/configure.sh does the token handshake. Hop limit 2
-    # so pods can reach IMDS if they need to.
-    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled"
+    # Encrypted: Longhorn's data partition -- every VM disk -- is on this volume.
+    --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${VOLUME_SIZE},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true,\"Encrypted\":true}}]"
+    # IMDSv2 only. /oem/aws/configure.sh does the token handshake from the host
+    # network namespace, so a hop limit of 1 is all it needs. Nothing else here
+    # uses IMDS -- there is no instance role and no cloud controller -- and a
+    # higher limit would let any pod read user-data, which holds the cluster
+    # token and any password hash.
+    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME_TAG}}]"
     --user-data "file://$USERDATA_FILE"
 )

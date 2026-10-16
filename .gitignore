@@ -12,3 +12,12 @@ artifacts/
 
 e2e/config.yml
 results/
+
+# Local deployment roots. tf-deploy.tf carries a live cluster token, admin
+# CIDRs and account-specific ids; keep it, and any tfvars, out of git.
+/tf-deploy.tf
+/.terraform.lock.hcl
+*.tfvars
+*.tfvars.json
+
+__pycache__/

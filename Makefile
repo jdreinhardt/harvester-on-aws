@@ -190,7 +190,12 @@ migrate:
 	fi
 
 # --- helper instance, volume, security group --------------------------------
-$(STATE)/sg-id: check | $(STATE)
+# `check` is order-only (after the |) on purpose. It is phony, and a phony
+# NORMAL prerequisite makes its target permanently out of date -- every
+# `make ami` would then create a fresh security group, volume and instance and
+# overwrite the stamp holding the previous one's id. Order-only still runs it
+# first, without forcing the rebuild.
+$(STATE)/sg-id: | check $(STATE)
 	@echo "==> security group (SSH from $(SSH_CIDR))"
 	@VPC=$$($(AWS) ec2 describe-subnets --subnet-ids $(SUBNET_ID) --query 'Subnets[0].VpcId' --output text); \
 	SG=$$($(AWS) ec2 create-security-group --group-name harvester-build-$$$$ \
@@ -199,7 +204,7 @@ $(STATE)/sg-id: check | $(STATE)
 		--protocol tcp --port 22 --cidr $(SSH_CIDR) >/dev/null; \
 	echo $$SG > $@; echo "    $$SG"
 
-$(STATE)/volume-id: check | $(STATE)
+$(STATE)/volume-id: | check $(STATE)
 	@echo "==> $(VOLUME_SIZE) GiB volume"
 	@AZ=$$($(AWS) ec2 describe-subnets --subnet-ids $(SUBNET_ID) --query 'Subnets[0].AvailabilityZone' --output text); \
 	$(AWS) ec2 create-volume --size $(VOLUME_SIZE) --volume-type gp3 --availability-zone $$AZ \
@@ -207,7 +212,7 @@ $(STATE)/volume-id: check | $(STATE)
 		--query VolumeId --output text > $@; \
 	echo "    $$(cat $@)"
 
-$(STATE)/instance-id: check $(STATE)/sg-id
+$(STATE)/instance-id: $(STATE)/sg-id | check
 	@echo "==> helper instance ($(HELPER_TYPE), $(ARCH))"
 	@OS_AMI=$$($(AWS) ssm get-parameter --name $(HELPER_OS_SSM) --query 'Parameter.Value' --output text); \
 	ROOT_DEV=$$($(AWS) ec2 describe-images --image-ids $$OS_AMI --query 'Images[0].RootDeviceName' --output text); \
@@ -239,8 +244,8 @@ $(STATE)/provisioned: $(STATE)/attached
 		ssh $(SSH_OPTS) -i $(KEY_FILE) $(REMOTE)@$$IP true 2>/dev/null && break || sleep 15; \
 	done; \
 	ssh $(SSH_OPTS) -i $(KEY_FILE) $(REMOTE)@$$IP 'mkdir -p ~/scripts'; \
-	scp $(SSH_OPTS) -i $(KEY_FILE) scripts/01-build-instance.sh scripts/02-customize-instance.sh \
-		$(REMOTE)@$$IP:~/scripts/ ; \
+	scp $(SSH_OPTS) -i $(KEY_FILE) scripts/00-fetch-artifacts.sh scripts/01-build-instance.sh \
+		scripts/02-customize-instance.sh $(REMOTE)@$$IP:~/scripts/ ; \
 	ssh $(SSH_OPTS) -i $(KEY_FILE) $(REMOTE)@$$IP 'set -eu; \
 		$(PKG_INSTALL) >/dev/null; \
 		test -w /dev/kvm || { echo "ERROR: /dev/kvm missing or not writable."; \
@@ -248,10 +253,8 @@ $(STATE)/provisioned: $(STATE)/attached
 			echo "       which is launch-time only. A .metal helper should have KVM natively;"; \
 			echo "       if it does not, the instance type is wrong for $(ARCH)."; \
 			echo "       Either way: 'make teardown ARCH=$(ARCH)' and retry."; exit 1; }; \
-		mkdir -p artifacts; cd artifacts; \
-		for f in harvester-$(HARVESTER_VERSION)-$(ARCH).iso harvester-$(HARVESTER_VERSION)-vmlinuz-$(ARCH) harvester-$(HARVESTER_VERSION)-initrd-$(ARCH); do \
-			[ -s "$$f" ] || curl -fsSL -O "$(RELEASE_BASE)/$$f"; \
-		done'
+		HARVESTER_VERSION=$(HARVESTER_VERSION) ARCH=$(ARCH) RELEASE_BASE=$(RELEASE_BASE) \
+			./scripts/00-fetch-artifacts.sh'
 	@touch $@
 
 $(STATE)/built: $(STATE)/provisioned
