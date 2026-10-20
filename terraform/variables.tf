@@ -175,6 +175,20 @@ variable "control_plane_via_nlb" {
   default     = false
 }
 
+variable "etcd_expose_metrics" {
+  description = <<-EOT
+    TEST CLUSTERS ONLY. Sets RKE2's etcd-expose-metrics on every node, so etcd
+    serves unauthenticated plain-HTTP /metrics on the node address (2381) to
+    every pod, every guest VM and everything in the security group, instead of
+    only on 127.0.0.1. Exists for harvester-perf's etcd-benchmark; see
+    perf/README.md. Deliberately undocumented elsewhere and absent from the
+    CloudFormation template. Every plan warns while it is true. Changing it
+    replaces every node (it is user-data). Older AMIs ignore it.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # --- Storage -----------------------------------------------------------------
 
 variable "volume_size" {

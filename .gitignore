@@ -4,7 +4,7 @@ artifacts/
 *.raw.zst
 .make/
 
-# terraform / opentofu -- these appear wherever you run it, not just in terraform/
+# terraform / opentofu
 .terraform/
 *.tfstate
 *.tfstate.*
@@ -13,8 +13,7 @@ artifacts/
 e2e/config.yml
 results/
 
-# Local deployment roots. tf-deploy.tf carries a live cluster token, admin
-# CIDRs and account-specific ids; keep it, and any tfvars, out of git.
+# Local deployment roots
 /tf-deploy.tf
 /.terraform.lock.hcl
 *.tfvars

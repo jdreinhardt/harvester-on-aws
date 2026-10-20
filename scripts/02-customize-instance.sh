@@ -931,6 +931,27 @@ if [ -n "$TLS_SANS" ]; then
     say "wrote 95-aws-tls-san.yaml ($(printf '%s' "$TLS_SANS" | tr '\n' ' '))"
 fi
 
+# --- 6a. Expose etcd metrics (opt-in) ---------------------------------------
+# RKE2's etcd static pod declares a container port named `metrics` on 2381, but
+# etcd only listens there on 127.0.0.1 unless etcd-expose-metrics is set. A
+# PodMonitor scrapes the pod IP -- the node IP, since etcd is host-network -- so
+# without this Prometheus gets connection refused. harvester-installer never
+# sets it. harvester-perf's etcd-benchmark needs it for its metrics case.
+#
+# Off by default: it serves unauthenticated plain HTTP on the node address, to
+# anything the security group lets in and to every pod on the cluster network.
+#
+# Written on every node, not just the bootstrap one, because joined nodes start
+# as agents and are PROMOTED later; the drop-in has to be there before RKE2
+# first runs as a server. Agents ignore server-only config keys.
+if [ "$(yq -r '.aws.etcd_expose_metrics // false' "$WORK/user-data.yaml" 2>/dev/null)" = "true" ]; then
+    mkdir -p /etc/rancher/rke2/config.yaml.d
+    printf 'etcd-expose-metrics: true\n' > "$WORK/95-aws-etcd-metrics.yaml"
+    install -o root -g root -m 0600 "$WORK/95-aws-etcd-metrics.yaml" \
+        /etc/rancher/rke2/config.yaml.d/95-aws-etcd-metrics.yaml
+    say "wrote 95-aws-etcd-metrics.yaml"
+fi
+
 # --- 7. Stage it -----------------------------------------------------------
 # `aws.*` is ours, not Harvester's. Remove it so the installer only ever sees a
 # clean Harvester configuration file.

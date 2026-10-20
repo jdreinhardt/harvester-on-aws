@@ -66,6 +66,8 @@ output "join_user_data" {
     mtu           = var.mtu
     password_hash = ""
     tls_sans      = local.tls_sans
+
+    etcd_expose_metrics = var.etcd_expose_metrics
   })
 }
 
@@ -81,5 +83,7 @@ output "worker_user_data" {
     mtu           = var.mtu
     password_hash = ""
     tls_sans      = local.tls_sans
+
+    etcd_expose_metrics = var.etcd_expose_metrics
   })
 }

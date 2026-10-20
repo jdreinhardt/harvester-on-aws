@@ -235,6 +235,8 @@ resource "aws_instance" "node" {
     mtu           = var.mtu
     password_hash = var.password_hash
     tls_sans      = local.tls_sans
+
+    etcd_expose_metrics = var.etcd_expose_metrics
   })
 
   # User-data is only read once, at first boot, so a change means a new node.
@@ -252,5 +254,15 @@ resource "aws_instance" "node" {
   tags = {
     Name          = "${var.name_prefix}-node-${count.index + 1}"
     HarvesterRole = count.index == 0 ? "create" : (count.index >= 3 ? "worker" : "join")
+  }
+}
+
+# A warning, not an error, on every plan and apply while etcd metrics are
+# exposed: the setting is legitimate on a perf test cluster, but should never
+# reach a real one unnoticed.
+check "etcd_metrics_not_exposed" {
+  assert {
+    condition     = !var.etcd_expose_metrics
+    error_message = "etcd_expose_metrics = true: every node serves unauthenticated etcd metrics on :2381 to all pods, guest VMs and the security group. Intended for perf/ test clusters only."
   }
 }

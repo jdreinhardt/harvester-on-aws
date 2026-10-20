@@ -1,13 +1,13 @@
-%{ if length(tls_sans) > 0 ~}
 aws:
   data_disk_size: "max"
+%{ if length(tls_sans) > 0 ~}
   tls_sans:
 %{ for san in tls_sans ~}
     - ${san}
 %{ endfor ~}
-%{ else ~}
-aws:
-  data_disk_size: "max"
+%{ endif ~}
+%{ if etcd_expose_metrics ~}
+  etcd_expose_metrics: true
 %{ endif ~}
 scheme_version: 1
 token: "${cluster_token}"

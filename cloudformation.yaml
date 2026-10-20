@@ -251,6 +251,10 @@ Parameters:
       empty uses the account's default EBS key (aws/ebs).
 
   # --- 6. Advanced --------------------------------------------------------
+  # etcd-expose-metrics (user-data aws.etcd_expose_metrics) is deliberately NOT
+  # a parameter. The console cannot hide one, and this is the click-to-deploy
+  # path, where enabling it by accident is easiest. It is Terraform-only, for
+  # test clusters; see perf/README.md. Do not add it here for parity.
   ControlPlaneViaNlb:
     Type: String
     Default: 'false'
