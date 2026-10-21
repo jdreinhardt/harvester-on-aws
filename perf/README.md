@@ -357,6 +357,10 @@ one architecture.
 ./perf/run-perf.sh --suites guest --guest-label "m8i run 2"      # only the VM-overhead measurement
 ./perf/run-perf.sh --suites guest --guest-mode vm                # VM figures only, no pod baseline
 ./perf/run-perf.sh --suites guest --guest-multiqueue             # VMs get one virtio-net queue per vCPU
+./perf/run-perf.sh --suites guest --guest-sustained 900          # adds a 15-minute 4-stream network test
+./perf/run-perf.sh --suites guest --guest-storage-class SC       # fio (and pgbench) data disk on another class
+./perf/run-perf.sh --suites guest --guest-pgbench                # adds pgbench in the VM and the pod
+./perf/run-perf.sh --suites guest --guest-contention 6           # 6 VMs writing at once instead of VM vs pod
 ./perf/run-perf.sh --perf-ref 6858e2c --keep                     # pin hvperf, keep the runner
 ./perf/run-perf.sh --down
 ```
@@ -379,7 +383,7 @@ anything into them:
 
 | Limit | Value | Where it shows up |
 | --- | --- | --- |
-| gp3 volume, as deployed | 3,000 IOPS, 125 MiB/s (the gp3 baseline; the module sets neither) | Seq write is 126 MiB/s and 4K random write is 2,941 IOPS, in **both** the VM and the pod, so both sit at the volume cap. 4K random read is 8,840 IOPS, about 3 × 3,000, because Longhorn serves reads from any of its three replicas, each on a different node's volume. |
+| gp3 volume, as deployed | 3,000 IOPS, 125 MiB/s, gp3's baseline, unless the Terraform module's `volume_iops` / `volume_throughput` raise it | Seq write is 126 MiB/s and 4K random write is 2,941 IOPS, in **both** the VM and the pod, so both sit at the volume cap. 4K random read is 8,840 IOPS, about 3 × 3,000, because Longhorn serves reads from any of its three replicas, each on a different node's volume. |
 | `m8i.4xlarge` EBS bandwidth | 5,000 Mbps / 20,000 IOPS baseline, 10,000 / 40,000 burst | Not reached: the volume caps first, at under a fifth of it. |
 | `m8i.4xlarge` network | 7.5 Gbit/s baseline, 15 burst | Pod-to-pod with 4 streams held 13.9 Gbit/s for a full 15-minute `--guest-sustained 900` run, with no drop toward the baseline (2026-10-16). So the instance sustains at least that for this long, and 7.5 is not what limits these tests. |
 | The VM network path | ≈7.4 Gbit/s, one stream or four | VM to VM holds 7.3-7.5 Gbit/s flat for 15 minutes while pods hold 13.9, and retransmits about 10× as much. That is a VM-path limit, not AWS. What has been ruled out is in [FINDINGS.md](FINDINGS.md), issue 1. |

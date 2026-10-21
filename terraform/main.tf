@@ -217,9 +217,12 @@ resource "aws_instance" "node" {
   # Longhorn's data partition -- every VM disk -- lives on this volume.
   root_block_device {
     volume_size = var.volume_size
-    volume_type = "gp3"
-    encrypted   = true
-    kms_key_id  = var.ebs_kms_key_id != "" ? var.ebs_kms_key_id : null
+    volume_type = var.volume_type
+    iops        = var.volume_iops
+    # io1/io2 reject a throughput setting; theirs follows from IOPS.
+    throughput = var.volume_type == "gp3" ? var.volume_throughput : null
+    encrypted  = true
+    kms_key_id = var.ebs_kms_key_id != "" ? var.ebs_kms_key_id : null
   }
 
   # Only node 1 carries the VIP, as a secondary private address.
@@ -249,6 +252,26 @@ resource "aws_instance" "node" {
   # deliberate act: `apply -replace='module.harvester.aws_instance.node[N]'`.
   lifecycle {
     ignore_changes = [ami]
+
+    # Rules that depend on more than one variable, which a variable's own
+    # validation cannot check while the module supports Terraform 1.5.
+    precondition {
+      condition     = var.volume_type == "gp3" || var.volume_iops != null
+      error_message = "volume_type ${var.volume_type} needs volume_iops set."
+    }
+    precondition {
+      condition     = var.volume_type != "gp3" || var.volume_iops == null || var.volume_iops >= 3000
+      error_message = "gp3's minimum is 3000 IOPS (its baseline)."
+    }
+    precondition {
+      condition     = var.volume_type == "gp3" || var.volume_throughput == null
+      error_message = "volume_throughput applies to gp3 only; ${var.volume_type} derives throughput from IOPS."
+    }
+    precondition {
+      # AWS caps gp3 at 0.25 MiB/s per IOPS; unset IOPS means the 3,000 baseline.
+      condition     = var.volume_type != "gp3" || var.volume_throughput == null || var.volume_throughput <= 0.25 * coalesce(var.volume_iops, 3000)
+      error_message = "gp3 allows at most 0.25 MiB/s per IOPS: volume_throughput ${coalesce(var.volume_throughput, 0)} needs volume_iops of at least ${ceil(coalesce(var.volume_throughput, 0) * 4)}."
+    }
   }
 
   tags = {

@@ -206,6 +206,66 @@ variable "volume_size" {
   }
 }
 
+variable "volume_type" {
+  description = <<-EOT
+    EBS type of each node's root volume, which holds the OS, etcd and every
+    Longhorn replica: gp3 (default), io1 or io2. io1/io2 need volume_iops and
+    take no volume_throughput, since their throughput follows from IOPS. io2
+    costs far more per IOPS than gp3; what it buys is lower write latency,
+    which is what bounds fsync-heavy work such as database commits and etcd
+    (see perf/FINDINGS.md). Changeable in place on a running cluster, like the
+    IOPS and throughput settings.
+  EOT
+  type        = string
+  default     = "gp3"
+
+  validation {
+    condition     = contains(["gp3", "io1", "io2"], var.volume_type)
+    error_message = "volume_type must be gp3, io1 or io2."
+  }
+}
+
+variable "volume_iops" {
+  description = <<-EOT
+    Provisioned IOPS for each node's root volume. For gp3, null (the default)
+    gives a NEW volume the baseline, 3,000, but never changes an existing one:
+    the provider keeps the current value, so to lower a provisioned gp3 volume
+    back to baseline, set 3000 explicitly. For io1/io2 it is required. At gp3's
+    baseline the volume caps VM disk writes at 3,000 IOPS for the whole cluster,
+    and VM write load can destabilize etcd (see perf/FINDINGS.md). AWS limits it
+    to 500 per GiB of volume_size (gp3) and the instance has its own EBS limit;
+    beyond that it is paid for but unusable (m8i.4xlarge: 20,000 baseline;
+    c7g.metal: 80,000). Can be changed on a running cluster without replacing
+    nodes, but AWS limits how often a volume can be modified.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.volume_iops == null ? true : var.volume_iops >= 100
+    error_message = "volume_iops must be at least 100 (and at least 3000 for gp3), or null."
+  }
+}
+
+variable "volume_throughput" {
+  description = <<-EOT
+    Provisioned throughput in MiB/s for each node's root volume, gp3 only (io1
+    and io2 derive throughput from IOPS; setting it with them is an error).
+    null (the default) gives a NEW gp3 volume the baseline, 125, but leaves an
+    existing one as it is; set 125 explicitly to lower it. At baseline it caps VM sequential writes at
+    125 MiB/s. AWS allows at most 0.25 MiB/s per provisioned IOPS (so 1,000
+    MiB/s needs 4,000 IOPS), and the instance's EBS bandwidth is a ceiling too
+    (m8i.4xlarge: 625 MB/s baseline). Changeable in place like volume_iops.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.volume_throughput == null ? true : var.volume_throughput >= 125
+    error_message = "volume_throughput must be at least 125 MiB/s, gp3's baseline, or null for the baseline."
+  }
+}
+
 variable "replica_count" {
   description = <<-EOT
     Longhorn replicas. Fixed at bootstrap by node 1 and immutable afterwards, so

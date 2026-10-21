@@ -343,6 +343,8 @@ def sec_guest(d):
     o = load_json(os.path.join(g, "overhead.json"))
     meta = load_json(os.path.join(g, "meta.json"), {})
     out = ["## In-guest workloads: VM against a pod on the same node", ""]
+    if not o and os.path.exists(os.path.join(g, "contention.json")):
+        return []
     if not o:
         single = sec_guest_single(g, meta)
         if single:
@@ -436,6 +438,95 @@ def sec_sustained(d, info):
     return out
 
 
+def sec_pgbench(d):
+    g = os.path.join(d, "guest")
+    runs = {}
+    for mode in ("vm", "pod"):
+        t = (load_json(os.path.join(g, mode, "result.json"), {}).get("tests") or {})
+        if any(k.startswith("pg-") for k in t):
+            runs[mode] = t
+    if not runs:
+        return []
+    init = next((t.get("pg-init") for t in runs.values() if (t.get("pg-init") or {}).get("version")), {}) or {}
+    out = ["### Database: pgbench", ""]
+    if init:
+        out += ["PostgreSQL %s, pgbench's TPC-B-like default at scale %s (database %s), %s s per client "
+                "count, client over a Unix socket on the same machine. Settings: %s. Durability on: every "
+                "commit is fsynced (`wal_sync_method` %s)." % (
+                    init.get("version", "?"), init.get("scale", "?"), gib(init.get("db_bytes")) if init.get("db_bytes") else "?",
+                    next((t.get("pg-c1", {}).get("seconds") for t in runs.values() if t.get("pg-c1")), "?"),
+                    ", ".join("%s=%s" % kv for kv in sorted((init.get("settings") or {}).items())
+                              if kv[0] in ("shared_buffers", "max_wal_size", "max_connections")),
+                    init.get("wal_sync_method", "?")), ""]
+    rows = []
+    for c in (1, 8, 32):
+        cells = ["%d" % c]
+        vals = {}
+        for m in ("pod", "vm"):
+            t = (runs.get(m) or {}).get("pg-c%d" % c) or {}
+            if t.get("error"):
+                cells += ["error", "-"]
+            else:
+                vals[m] = t.get("tps")
+                cells += [num(t.get("tps")), "-" if t.get("latency_avg_ms") is None else "%.2f ms" % t["latency_avg_ms"]]
+        cells.append("%+.1f%%" % (100 * (1 - vals["vm"] / vals["pod"])) if vals.get("vm") and vals.get("pod") else "-")
+        rows.append(cells)
+    out += table(["Clients", "Pod tps", "Pod latency", "VM tps", "VM latency", "VM overhead (tps)"], rows)
+    out.append("")
+    errs = ["%s %s: %s" % (m, k, v["error"][:150]) for m, t in runs.items() for k, v in sorted(t.items())
+            if k.startswith("pg-") and v.get("error")]
+    out += ["> **pgbench error:** %s" % e for e in errs] + ([""] if errs else [])
+    out += ["One client is the per-commit ceiling: each transaction waits for its own commit to be durable. "
+            "More clients share commits, so throughput rises until CPU or disk saturates.", ""]
+    return out
+
+
+def sec_contention(d):
+    c = load_json(os.path.join(d, "guest", "contention.json"))
+    if not c:
+        return []
+    names = {"idle": "Idle (VMs booted, not writing)", "solo-randwrite": "One VM, 4K random write",
+             "all-randwrite": "All VMs, 4K random write", "all-seqwrite": "All VMs, 1 MiB sequential write"}
+    out = ["## Contention: %d VMs writing at once%s" % (c.get("vms", 0), ", disks pre-filled" if c.get("prefill") else ""), "",
+           "Each VM has its own Longhorn data disk on `%s` %s, %d vCPU, placed round-robin across the "
+           "nodes. Phases run %s s each, on one wall-clock schedule. Node figures are each node's EBS "
+           "volume, as its kernel counts writes." % (
+               c.get("data_storage_class"), json.dumps(c.get("data_storage_class_parameters") or {}),
+               c.get("vcpus") or 0, c.get("phase_seconds")), ""]
+    rows = []
+    pf = c.get("prefill")
+    if pf:
+        rows.append(["Pre-fill: each VM writes its whole disk once (1 MiB sequential)", pf.get("vms"),
+                     "-", "%s – %s MiB/s" % (num(pf.get("per_vm_min_mib_s")), num(pf.get("per_vm_max_mib_s"))),
+                     "-", "-", "-", "-", "slowest %s; all done before the schedule: %s" % (
+                         dur(pf.get("seconds_max")), "yes" if pf.get("all_finished_before_start") else "**no**")])
+    for p in c.get("phases") or []:
+        nd = p.get("node_disk") or {}
+        w = [x.get("writes_per_s") for x in nd.values() if x.get("writes_per_s") is not None]
+        mb = [x.get("mib_per_s") for x in nd.values() if x.get("mib_per_s") is not None]
+        api = p.get("apiserver_etcd_p99_ms") or {}
+        rows.append([names.get(p["phase"], p["phase"]), p.get("vms") or "-",
+                     "-" if p.get("total") is None else "%s %s" % (num(p["total"]), p["unit"]),
+                     "-" if p.get("per_vm_min") is None else "%s / %s / %s" % (num(p["per_vm_min"]), num(p["per_vm_mean"]), num(p["per_vm_max"])),
+                     "-" if p.get("clat_p99_ms_max") is None else "%.1f ms" % p["clat_p99_ms_max"],
+                     "-" if not w else "%s–%s" % (num(min(w)), num(max(w))),
+                     "-" if not mb else "%s–%s" % (num(min(mb)), num(max(mb))),
+                     "-" if p.get("etcd_wal_fsync_p99_ms") is None else "%.1f ms" % p["etcd_wal_fsync_p99_ms"],
+                     "-" if not api else "%.1f ms" % max(api.values())])
+    out += table(["Phase", "VMs", "Total", "Per VM min / mean / max", "Worst VM p99", "Node volume writes/s",
+                  "Node volume MiB/s", "etcd WAL fsync p99", "API→etcd p99"], rows)
+    out.append("")
+    late = [p for p in c.get("phases") or [] if (p.get("late_s_max") or 0) > 5]
+    for p in late:
+        out.append("> **Late start:** in %s, a VM started %.0f s late, so that phase overlaps less "
+                   "than planned." % (p["phase"], p["late_s_max"]))
+    errs = [e for p in c.get("phases") or [] for e in p.get("errors") or []]
+    out += ["> **Error:** %s" % e[:200] for e in errs]
+    if late or errs:
+        out.append("")
+    return out
+
+
 def hvg_module():
     """perf/guest/hvg.py, for its FIGURES table and figure(), so the two never disagree."""
     import importlib.util
@@ -511,6 +602,10 @@ def render(d):
     for s in order:
         if s == "guest":
             o = load_json(os.path.join(d, "guest", "overhead.json"))
+            ct = load_json(os.path.join(d, "guest", "contention.json"))
+            if ct and not o:
+                rows.append(["guest (contention)", "PASS", "-", "%d VMs" % ct.get("vms", 0)])
+                continue
             rows.append(["guest", "PASS" if o else "**FAILED**", "-",
                          "%+.1f%% overall VM overhead" % o["overall"]["overhead_pct"] if o and o.get("overall", {}).get("overhead_pct") is not None else "-"])
             continue
@@ -544,6 +639,8 @@ def render(d):
             out += sections[s](results[s])
         if s == "guest":
             out += sec_sustained(d, info)
+            out += sec_pgbench(d)
+            out += sec_contention(d)
 
     raw = sorted(f for f in os.listdir(d) if f.endswith((".json", ".log", ".yaml", ".txt")) and f != "summary.md")
     out += ["---", "", "Raw results in this directory: %s%s." % (

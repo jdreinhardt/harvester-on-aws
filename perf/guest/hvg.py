@@ -9,7 +9,7 @@
                                      cloud-config for the guest
   hvg.py vm NAME NS ROLE NODE IMAGE_NS/IMAGE IMAGE_SC DATA_SC VCPUS MEM ROOT DATA SECRET ARCH RUN_ID
                                      Harvester-style VirtualMachine manifest
-  hvg.py pvc NAME NS SC SIZE         raw-block PVC for the pod-mode data disk
+  hvg.py pvc NAME NS SC SIZE [MODE]  PVC for the pod-mode data disk (Block, or Filesystem for pgbench)
   hvg.py pod NAME NS ROLE NODE IMAGE CONFIGMAP VCPUS MEM [PVC] [PEER_IP]
                                      pod-mode bench or peer: same workloads, no VM layer
   hvg.py sampler NAME NS NODE IMAGE  pod that logs the node's /proc/stat steal every 5 s
@@ -22,6 +22,9 @@
   hvg.py decode CONSOLE_LOG OUT_JSON reassemble the framed payload bench.py sent
   hvg.py summary DIR [DIR...]        key figures; with several DIRs, a comparison
   hvg.py quota DIR                   CPU used and quota throttling per test, per mode
+  hvg.py podmonitor NS               PodMonitor that scrapes etcd during a contention run
+  hvg.py promq START SECONDS GAP     Prometheus queries for each contention phase window
+  hvg.py contention DIR              contention phases: totals, per-VM spread, etcd, node disks
   hvg.py overhead DIR [DIR...]       VM overhead against the pod baseline, per cluster;
                                      with several DIRs, how each compares to the first
 
@@ -76,6 +79,13 @@ def cmd_meta():
         "vm_net_multiqueue": e("MULTIQUEUE", "false") == "true",
         "vm_cpu_limit": e("VM_CPU_LIMIT") or e("VCPUS", ""),
         "sustained_seconds": int(e("SUSTAINED") or 0),
+        "pgbench": e("PGBENCH") == "true",
+        "contention_vms": int(e("CONTENTION") or 0),
+        "contention_start": float(e("CONTENTION_START") or 0),
+        "contention_seconds": int(e("CONTENTION_SECONDS") or 0),
+        "contention_gap": int(e("CONTENTION_GAP") or 0),
+        "contention_nodes": json.loads(e("CONTENTION_NODES") or "{}"),
+        "contention_prefill": e("CONTENTION_PREFILL") == "true",
     }, indent=2))
 
 
@@ -110,11 +120,23 @@ def cmd_userdata(role, bench_py, peer=""):
     args = ["python3", "/opt/hvg/bench.py", role] + (["--peer", peer] if peer else [])
     if role == "bench" and int(os.environ.get("SUSTAINED") or 0) > 0:
         args += ["--sustained", os.environ["SUSTAINED"]]
+    packages = ["fio", "sysbench", "stress-ng", "iperf3"]
+    if role == "contend":
+        e = os.environ.get
+        args = ["python3", "/opt/hvg/bench.py", "contend", "--index", e("CONTEND_INDEX", "0"),
+                "--vms", e("CONTEND_VMS", "1"), "--start", e("CONTEND_START", "0"),
+                "--seconds", e("CONTEND_SECONDS", "120"), "--gap", e("CONTEND_GAP", "30")]
+        if e("CONTEND_PREFILL") == "true":
+            args.append("--prefill")
+        packages = ["fio"]
+    if role == "bench" and os.environ.get("PGBENCH") == "true":
+        args += ["--pgbench"]
+        packages.append("postgresql")
     # JSON is valid YAML, so the cloud-config body is emitted as JSON after the
     # header: no indentation rules to get wrong and no quoting of the payload.
     body = {
         "package_update": True,
-        "packages": ["fio", "sysbench", "stress-ng", "iperf3"],
+        "packages": packages,
         "write_files": [{"path": "/opt/hvg/bench.py", "permissions": "0755",
                          "encoding": "b64", "content": program}],
         "runcmd": [args],
@@ -202,14 +224,14 @@ def cmd_vm(name, ns, role, node, image_id, image_sc, data_sc, vcpus, mem, root, 
 POD_PACKAGES = "python3 fio sysbench stress-ng iperf3 iputils-ping"
 
 
-def cmd_pvc(name, ns, sc, size):
+def cmd_pvc(name, ns, sc, size, mode="Block"):
     print(json.dumps({
         "apiVersion": "v1", "kind": "PersistentVolumeClaim",
         "metadata": {"name": name, "namespace": ns,
                      "labels": {"perf.harvester-aws/guest-bench": "true"}},
         # Block, like the VM's data disk, so fio sees a raw Longhorn device in
         # both modes and the only difference is the virtio and QEMU layer.
-        "spec": {"accessModes": ["ReadWriteOnce"], "volumeMode": "Block",
+        "spec": {"accessModes": ["ReadWriteOnce"], "volumeMode": mode,
                  "resources": {"requests": {"storage": size}}, "storageClassName": sc},
     }))
 
@@ -223,8 +245,17 @@ def cmd_pod(name, ns, role, node, image, configmap, vcpus, mem, pvc="", peer="")
     import os
     if role == "bench" and int(os.environ.get("SUSTAINED") or 0) > 0:
         args += ["--sustained", os.environ["SUSTAINED"]]
+    pg_pvc = os.environ.get("PG_PVC", "") if role == "bench" and os.environ.get("PGBENCH") == "true" else ""
+    packages = POD_PACKAGES
+    if pg_pvc:
+        # The VM formats its data disk itself; a pod cannot mount a block
+        # device without privileges that would skew the baseline, so its
+        # database gets a filesystem-mode PVC of the same storage class, which
+        # Longhorn formats ext4.
+        args += ["--pgbench", "--pg-dir", "/pgdata"]
+        packages += " postgresql"
     script = ("apt-get update -qq && apt-get install -y -qq --no-install-recommends %s >/dev/null"
-              " && exec %s" % (POD_PACKAGES, " ".join(args)))
+              " && exec %s" % (packages, " ".join(args)))
     container = {
         "name": "bench", "image": image, "command": ["bash", "-c", script],
         "env": [{"name": "DEBIAN_FRONTEND", "value": "noninteractive"}],
@@ -238,6 +269,9 @@ def cmd_pod(name, ns, role, node, image, configmap, vcpus, mem, pvc="", peer="")
     if pvc:
         container["volumeDevices"] = [{"name": "data", "devicePath": "/dev/hvgdata"}]
         volumes.append({"name": "data", "persistentVolumeClaim": {"claimName": pvc}})
+    if pg_pvc:
+        container["volumeMounts"].append({"name": "pgdata", "mountPath": "/pgdata"})
+        volumes.append({"name": "pgdata", "persistentVolumeClaim": {"claimName": pg_pvc}})
     print(json.dumps({
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "namespace": ns,
@@ -446,7 +480,18 @@ FIGURES = [
     # overhead_of), so runs with and without it stay comparable.
     ("Net TCP, 4 streams, sustained: first 60 s", "net-tcp-4-sustained", "first_60s_gbit", "Gbit/s", False, True),
     ("Net TCP, 4 streams, sustained: last 120 s", "net-tcp-4-sustained", "last_120s_gbit", "Gbit/s", False, True),
+    # Only with --pgbench. Outside the categories, like the sustained rows.
+    ("pgbench, 1 client", "pg-c1", "tps", "tps", False, True),
+    ("pgbench, 1 client, latency", "pg-c1", "latency_avg_ms", "ms", False, False),
+    ("pgbench, 8 clients", "pg-c8", "tps", "tps", False, True),
+    ("pgbench, 32 clients", "pg-c32", "tps", "tps", False, True),
+    ("pgbench, 32 clients, latency", "pg-c32", "latency_avg_ms", "ms", False, False),
 ]
+
+
+def in_categories(test):
+    """The four profile-1 categories only; optional extras stay out of them."""
+    return not (test.endswith("-sustained") or test.startswith("pg-"))
 
 
 def figure(result, test, field, per_vcpu):
@@ -559,7 +604,7 @@ def overhead_of(d):
         r = None
         if v and p:
             r = v / p if higher else p / v
-            if not test.endswith("-sustained"):
+            if in_categories(test):
                 by_cat.setdefault(category(test), []).append(r)
         rows.append({"figure": label, "test": test, "unit": unit, "pod": p, "vm": v,
                      "ratio": r, "overhead_pct": pct(r), "node_steal_pct": steal.get(test),
@@ -661,6 +706,160 @@ def cmd_quota(d):
         print("  %-28s" % test + "".join(cells))
 
 
+# --- contention ---------------------------------------------------------------
+
+PROM_PATH = ("/api/v1/namespaces/cattle-monitoring-system/services/"
+             "rancher-monitoring-prometheus:9090/proxy/api/v1/query")
+
+
+def contention_windows(start, seconds, gap):
+    """(phase, window start, window end). Mirrors bench.contend_schedule, plus
+    an idle window just before the first phase, for reference."""
+    step = seconds + gap
+    return [("idle", start - seconds, start),
+            ("solo-randwrite", start, start + seconds),
+            ("all-randwrite", start + step, start + step + seconds),
+            ("all-seqwrite", start + 2 * step, start + 2 * step + seconds)]
+
+
+def contention_queries(seconds):
+    w = "%ds" % seconds
+    disk = 'device=~"nvme[0-9]+n1"'
+    by_node = " * on(instance) group_left(nodename) node_uname_info"
+    return {
+        # etcd's own histograms: only present while the PodMonitor scrapes etcd.
+        "etcd_wal_fsync_p99": 'histogram_quantile(0.99, sum by (le, pod) (rate(etcd_disk_wal_fsync_duration_seconds_bucket{namespace="kube-system"}[%s])))' % w,
+        "etcd_commit_p99": 'histogram_quantile(0.99, sum by (le, pod) (rate(etcd_disk_backend_commit_duration_seconds_bucket{namespace="kube-system"}[%s])))' % w,
+        # What the control plane feels: the API server's own etcd request latency.
+        "apiserver_etcd_p99": 'histogram_quantile(0.99, sum by (le, operation) (rate(etcd_request_duration_seconds_bucket{operation=~"create|update|get"}[%s])))' % w,
+        # Each node's EBS volume, as the node's kernel sees it.
+        "node_writes_per_s": "sum by (nodename) (rate(node_disk_writes_completed_total{%s}[%s])%s)" % (disk, w, by_node),
+        "node_write_bytes_per_s": "sum by (nodename) (rate(node_disk_written_bytes_total{%s}[%s])%s)" % (disk, w, by_node),
+        "node_write_await_s": "sum by (nodename) (rate(node_disk_write_time_seconds_total{%s}[%s])%s) / sum by (nodename) (rate(node_disk_writes_completed_total{%s}[%s])%s)" % (disk, w, by_node, disk, w, by_node),
+    }
+
+
+def cmd_promq(start, seconds, gap):
+    """One line per query: phase, name, the API path for `kubectl get --raw`."""
+    import urllib.parse
+    start, seconds, gap = float(start), int(seconds), int(gap)
+    for phase, _, end in contention_windows(start, seconds, gap):
+        for name, q in contention_queries(seconds).items():
+            print("%s\t%s\t%s?%s" % (phase, name, PROM_PATH,
+                                       urllib.parse.urlencode({"query": q, "time": "%.0f" % end})))
+
+
+def cmd_podmonitor(ns):
+    """Scrape etcd for the length of a contention run; deleted with the namespace."""
+    print(json.dumps({
+        "apiVersion": "monitoring.coreos.com/v1", "kind": "PodMonitor",
+        "metadata": {"name": "hvg-etcd", "namespace": ns,
+                     "labels": {"perf.harvester-aws/guest-bench": "true"}},
+        "spec": {"namespaceSelector": {"matchNames": ["kube-system"]},
+                 "selector": {"matchLabels": {"component": "etcd", "tier": "control-plane"}},
+                 "podMetricsEndpoints": [{"port": "metrics", "path": "/metrics", "scheme": "http",
+                                          "interval": "10s", "scrapeTimeout": "10s"}]},
+    }))
+
+
+def prom_samples(path):
+    data = load_json(path, {}) or {}
+    out = []
+    for r in (data.get("data") or {}).get("result") or []:
+        try:
+            v = float(r["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if v == v:
+            out.append((r.get("metric", {}), v))
+    return out
+
+
+def cmd_contention(d):
+    import os
+    meta = load_json(os.path.join(d, "meta.json"), {})
+    cdir = os.path.join(d, "contention")
+    vms = sorted(x for x in os.listdir(cdir) if x.startswith("c") and os.path.isdir(os.path.join(cdir, x)))
+    results = {v: load_json(os.path.join(cdir, v, "result.json")) for v in vms}
+    start, seconds, gap = meta.get("contention_start"), meta.get("contention_seconds"), meta.get("contention_gap")
+    phases = []
+    for phase, w0, w1 in contention_windows(start, seconds, gap):
+        seq = phase.endswith("seqwrite")
+        per_vm = {}
+        for v, r in results.items():
+            t = ((r or {}).get("tests") or {}).get(phase)
+            if not t:
+                continue
+            per_vm[v] = {"value": None if t.get("error") else (t["bw_bytes"] / 1048576.0 if seq else t["iops"]),
+                         "clat_p99_ms": None if t.get("error") else t.get("clat_p99_us", 0) / 1000.0,
+                         "late_s": t.get("late_s"), "error": t.get("error"),
+                         "node": (meta.get("contention_nodes") or {}).get(v)}
+        vals = [x["value"] for x in per_vm.values() if x["value"] is not None]
+        prom = {}
+        for name in contention_queries(seconds):
+            prom[name] = prom_samples(os.path.join(cdir, "prom", "%s.%s.json" % (phase, name)))
+        node = {}
+        for name, key, scale in (("node_writes_per_s", "writes_per_s", 1), ("node_write_bytes_per_s", "mib_per_s", 1 / 1048576.0),
+                                 ("node_write_await_s", "await_ms", 1000)):
+            for m, v in prom[name]:
+                node.setdefault(m.get("nodename", "?"), {})[key] = round(v * scale, 2)
+        maxv = lambda name: max([v for _, v in prom[name]], default=None)
+        phases.append({
+            "phase": phase, "window": [w0, w1], "unit": "MiB/s" if seq else "IOPS",
+            "vms": len(per_vm), "total": round(sum(vals), 1) if vals else None,
+            "per_vm_min": round(min(vals), 1) if vals else None,
+            "per_vm_mean": round(sum(vals) / len(vals), 1) if vals else None,
+            "per_vm_max": round(max(vals), 1) if vals else None,
+            "clat_p99_ms_max": max([x["clat_p99_ms"] for x in per_vm.values() if x["clat_p99_ms"] is not None], default=None),
+            "late_s_max": max([x["late_s"] or 0 for x in per_vm.values()], default=None),
+            "errors": [v + ": " + x["error"] for v, x in sorted(per_vm.items()) if x["error"]],
+            "per_vm": per_vm,
+            "etcd_wal_fsync_p99_ms": None if maxv("etcd_wal_fsync_p99") is None else round(maxv("etcd_wal_fsync_p99") * 1000, 2),
+            "etcd_commit_p99_ms": None if maxv("etcd_commit_p99") is None else round(maxv("etcd_commit_p99") * 1000, 2),
+            "apiserver_etcd_p99_ms": {m.get("operation", "?"): round(v * 1000, 2) for m, v in prom["apiserver_etcd_p99"]},
+            "node_disk": node,
+        })
+    fills = {}
+    for v, r in results.items():
+        t = ((r or {}).get("tests") or {}).get("prefill")
+        if t:
+            fills[v] = {"mib_per_s": None if t.get("error") else round(t["bw_bytes"] / 1048576.0, 1),
+                        "seconds": t.get("seconds"), "finished_before_start": t.get("finished_before_start"),
+                        "error": t.get("error")}
+    prefill = None
+    if fills:
+        rates = [x["mib_per_s"] for x in fills.values() if x["mib_per_s"] is not None]
+        prefill = {"vms": len(fills), "per_vm": fills,
+                   "per_vm_min_mib_s": min(rates, default=None), "per_vm_max_mib_s": max(rates, default=None),
+                   "seconds_max": max([x["seconds"] or 0 for x in fills.values()], default=None),
+                   "all_finished_before_start": all(x["finished_before_start"] for x in fills.values())}
+    out = {"label": meta.get("label"), "harvester": meta.get("harvester"), "arch": meta.get("arch"),
+           "prefill": prefill,
+           "vms": len(vms), "vcpus": meta.get("vcpus"), "data_storage_class": meta.get("data_storage_class"),
+           "data_storage_class_parameters": meta.get("data_storage_class_parameters"),
+           "phase_seconds": seconds, "phases": phases}
+    with open(os.path.join(d, "contention.json"), "w") as fh:
+        json.dump(out, fh, indent=2, sort_keys=True)
+    print("\n  Contention: %d VMs, %s s per phase, data disks on %s%s" % (
+        len(vms), seconds, meta.get("data_storage_class"), ", disks pre-filled" if prefill else ""))
+    if prefill:
+        print("  pre-fill: %d VMs, %s-%s MiB/s each, slowest took %s s, all done before the schedule: %s" % (
+            prefill["vms"], fmt(prefill["per_vm_min_mib_s"]), fmt(prefill["per_vm_max_mib_s"]),
+            fmt(prefill["seconds_max"]), "yes" if prefill["all_finished_before_start"] else "NO"))
+    print("  %-16s %4s %10s %-6s %18s %9s %9s %9s %11s" % ("phase", "VMs", "total", "unit", "per VM min/max",
+                                                         "p99 ms", "etcd WAL", "API etcd", "node w/s"))
+    for p in phases:
+        nw = [x.get("writes_per_s") for x in p["node_disk"].values() if x.get("writes_per_s") is not None]
+        api = p["apiserver_etcd_p99_ms"]
+        print("  %-16s %4s %10s %-6s %18s %9s %9s %9s %11s" % (
+            p["phase"], p["vms"] or "-", fmt(p["total"]), p["unit"] if p["vms"] else "",
+            "-" if p["per_vm_min"] is None else "%s / %s" % (fmt(p["per_vm_min"]), fmt(p["per_vm_max"])),
+            fmt(p["clat_p99_ms_max"]), fmt(p["etcd_wal_fsync_p99_ms"]), fmt(max(api.values(), default=None)),
+            "-" if not nw else "%s-%s" % (fmt(min(nw)), fmt(max(nw)))))
+        for e in p["errors"]:
+            print("    error: " + e[:160])
+
+
 def main(argv):
     cmds = {
         "nodes": (cmd_nodes, 0), "meta": (cmd_meta, 0), "imagestatus": (cmd_imagestatus, 0),
@@ -672,6 +871,12 @@ def main(argv):
         return cmd_summary(argv[2:])
     if len(argv) == 3 and argv[1] == "quota":
         return cmd_quota(argv[2])
+    if len(argv) == 3 and argv[1] == "contention":
+        return cmd_contention(argv[2])
+    if len(argv) == 5 and argv[1] == "promq":
+        return cmd_promq(*argv[2:])
+    if len(argv) == 3 and argv[1] == "podmonitor":
+        return cmd_podmonitor(argv[2])
     if len(argv) >= 2 and argv[1] == "overhead" and len(argv) >= 3:
         return cmd_overhead(argv[2:])
     if len(argv) >= 2 and argv[1] == "pod" and len(argv) in (10, 11, 12):
@@ -681,6 +886,8 @@ def main(argv):
     fn, nargs = cmds[argv[1]]
     args = argv[2:]
     if argv[1] == "userdata" and len(args) in (2, 3):
+        return fn(*args)
+    if argv[1] == "pvc" and len(args) == 5 and args[4] in ("Block", "Filesystem"):
         return fn(*args)
     if nargs is None or len(args) != nargs:
         sys.exit(__doc__)

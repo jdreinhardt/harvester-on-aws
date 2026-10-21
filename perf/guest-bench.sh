@@ -50,6 +50,19 @@ ALLOW_ARM64_V19="false"
 MULTIQUEUE="false"
 VM_CPU_LIMIT=""
 SUSTAINED=0
+PGBENCH="false"
+CONTENTION=0
+# 180 s, not shorter: Harvester's Prometheus scrapes node-exporter and the API
+# server once a minute, and a rate() over a phase needs at least three samples.
+CONTENTION_SECONDS=180
+CONTENTION_GAP=30
+CONTENTION_PREP=480
+CONTENTION_START=0
+CONTENTION_NODES="{}"
+CONTENTION_PREFILL="false"
+# Budget for the pre-fill, added to the prep time. At gp3's baseline the whole
+# cluster writes 125 MiB/s, so six 10 GiB disks take about 8 minutes.
+CONTENTION_FILL_SECONDS=900
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HVG=(python3 -I "$HERE/guest/hvg.py")
@@ -78,6 +91,26 @@ Usage: $0 [options]
                       10 s, after the standard tests. The 30 s tests fit
                       inside an EC2 network burst; 900 drains it on the sizes
                       that burst. Default: 0 (off). Adds to each mode's run.
+  --pgbench           Also run PostgreSQL 16's pgbench (TPC-B-like, scale 100,
+                      1/8/32 clients, 120 s each) with the database on the data
+                      disk's storage class. The VM formats its data disk after
+                      fio; the pod gets a filesystem PVC. About 10 minutes per mode.
+  --contention N      Instead of the VM/pod comparison: N VMs (spread across
+                      nodes, each with its own data disk) writing on one
+                      wall-clock schedule. VM 0 alone first, then all N doing 4K
+                      random writes, then all N doing 1M sequential writes.
+                      Records per-VM results, each node's EBS writes per second,
+                      and etcd latency (a temporary PodMonitor scrapes etcd).
+  --contention-seconds S
+                      Length of each phase. Default: ${CONTENTION_SECONDS}
+  --contention-prep S Time from creating the VMs to the first phase, for boot
+                      and package install. Default: ${CONTENTION_PREP}. A VM
+                      that is not ready in time starts late, and records how late.
+  --contention-prefill
+                      Each VM writes its whole data disk once before the
+                      schedule, so the phases measure overwrites rather than
+                      first writes to thin, unallocated Longhorn space. Adds
+                      --contention-fill-seconds (default ${CONTENTION_FILL_SECONDS}) to the prep.
   --memory Q          Memory per VM and pod. Default: ${MEMORY}
   --data-size Q       Longhorn data disk for fio. Default: ${DATA_SIZE}
   --storage-class SC  Data disk storage class. Default: the cluster default.
@@ -117,6 +150,12 @@ while [[ $# -gt 0 ]]; do
         --multiqueue)    MULTIQUEUE="true"; shift ;;
         --vm-cpu-limit)  VM_CPU_LIMIT="$2"; shift 2 ;;
         --sustained)     SUSTAINED="$2"; shift 2 ;;
+        --pgbench)       PGBENCH="true"; shift ;;
+        --contention)    CONTENTION="$2"; shift 2 ;;
+        --contention-seconds) CONTENTION_SECONDS="$2"; shift 2 ;;
+        --contention-prep) CONTENTION_PREP="$2"; shift 2 ;;
+        --contention-prefill) CONTENTION_PREFILL="true"; shift ;;
+        --contention-fill-seconds) CONTENTION_FILL_SECONDS="$2"; shift 2 ;;
         --keep)          KEEP="true"; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -128,11 +167,15 @@ want() { [ "$MODE" = "both" ] || [ "$MODE" = "$1" ]; }
 [[ "$NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { echo "ERROR: bad --namespace" >&2; exit 1; }
 [[ "$VCPUS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --vcpus takes a positive integer" >&2; exit 1; }
 [[ "$SUSTAINED" =~ ^[0-9]+$ ]] || { echo "ERROR: --sustained takes seconds" >&2; exit 1; }
+for n in "$CONTENTION" "$CONTENTION_SECONDS" "$CONTENTION_PREP" "$CONTENTION_FILL_SECONDS"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "ERROR: --contention, --contention-seconds and --contention-prep take integers" >&2; exit 1; }
+done
 [[ -z "$VM_CPU_LIMIT" || "$VM_CPU_LIMIT" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --vm-cpu-limit takes a positive integer" >&2; exit 1; }
 [[ -z "$VM_CPU_LIMIT" || "$VM_CPU_LIMIT" -ge "$VCPUS" ]] || { echo "ERROR: --vm-cpu-limit below --vcpus would starve the vCPUs" >&2; exit 1; }
 [[ "$TIMEOUT_MIN" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --timeout takes minutes" >&2; exit 1; }
-# The sustained test runs inside the same per-mode deadline.
+# The sustained test and pgbench run inside the same per-mode deadline.
 TIMEOUT_MIN=$(( TIMEOUT_MIN + (SUSTAINED + 59) / 60 ))
+[ "$PGBENCH" = "true" ] && TIMEOUT_MIN=$(( TIMEOUT_MIN + 20 ))
 for q in "$MEMORY" "$DATA_SIZE" "$ROOT_SIZE"; do
     [[ "$q" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || { echo "ERROR: '$q' is not a quantity like 8Gi" >&2; exit 1; }
 done
@@ -159,7 +202,7 @@ ARCH="${ARCHES%% *}"
 [ "$(wc -w <<<"$ARCHES")" -eq 1 ] || { echo "ERROR: mixed node architectures: $ARCHES" >&2; exit 1; }
 case "$ARCH" in amd64|arm64) ;; *) echo "ERROR: unsupported architecture '$ARCH'" >&2; exit 1 ;; esac
 
-if want vm && [ "$ARCH" = "arm64" ] && [[ "$HARVESTER" == v1.9.* ]] && [ "$ALLOW_ARM64_V19" != "true" ]; then
+if { want vm || [ "$CONTENTION" -gt 0 ]; } && [ "$ARCH" = "arm64" ] && [[ "$HARVESTER" == v1.9.* ]] && [ "$ALLOW_ARM64_V19" != "true" ]; then
     echo "ERROR: arm64 ${HARVESTER} guests dead-loop in their UEFI firmware and never boot" >&2
     echo "       (see the repository README, 'What has been tested'). There is nothing" >&2
     echo "       to measure. Use v1.8.2, --mode pod, or --allow-arm64-v19 to try anyway." >&2
@@ -200,13 +243,21 @@ IMAGE_NAME="hvg-ubuntu-2404-${ARCH}"
 echo "    harvester ${HARVESTER} (kubernetes ${KUBE}), ${ARCH}, $(wc -l <<<"$NODES" | tr -d ' ') node(s)"
 echo "    mode ${MODE}: bench on ${BENCH_NODE}, peer on ${PEER_NODE}$([ "$SAME_NODE" = "true" ] && echo ' (SAME node: network figures are node-local)')"
 [ "$SUSTAINED" -eq 0 ] || echo "    sustained network test: ${SUSTAINED} s per mode"
+[ "$PGBENCH" = "false" ] || echo "    pgbench: PostgreSQL 16, scale 100, 1/8/32 clients, database on ${DATA_SC}"
 echo "    ${VCPUS} vCPU / ${MEMORY} each, VM CPU limit ${VM_CPU_LIMIT:-$VCPUS}, VM net multiqueue ${MULTIQUEUE}, data disk ${DATA_SIZE} on ${DATA_SC} ${DATA_SC_PARAMS}"
 [ -z "$OVERCOMMIT" ] || echo "    overcommit-config: ${OVERCOMMIT}"
 
-LABEL="$LABEL" RUN_ID="$RUN_ID" HARVESTER="$HARVESTER" KUBE="$KUBE" ARCH="$ARCH" \
-VCPUS="$VCPUS" MEMORY="$MEMORY" DATA_SIZE="$DATA_SIZE" DATA_SC="$DATA_SC" \
-DATA_SC_PARAMS="$DATA_SC_PARAMS" BENCH_NODE="$BENCH_NODE" PEER_NODE="$PEER_NODE" \
-IMAGE_URL="$IMAGE_URL" OVERCOMMIT="$OVERCOMMIT" MULTIQUEUE="$MULTIQUEUE" VM_CPU_LIMIT="$VM_CPU_LIMIT" SUSTAINED="$SUSTAINED" "${HVG[@]}" meta > "$OUT/meta.json"
+write_meta() {
+    LABEL="$LABEL" RUN_ID="$RUN_ID" HARVESTER="$HARVESTER" KUBE="$KUBE" ARCH="$ARCH" \
+    VCPUS="$VCPUS" MEMORY="$MEMORY" DATA_SIZE="$DATA_SIZE" DATA_SC="$DATA_SC" \
+    DATA_SC_PARAMS="$DATA_SC_PARAMS" BENCH_NODE="$BENCH_NODE" PEER_NODE="$PEER_NODE" \
+    IMAGE_URL="$IMAGE_URL" OVERCOMMIT="$OVERCOMMIT" MULTIQUEUE="$MULTIQUEUE" VM_CPU_LIMIT="$VM_CPU_LIMIT" \
+    SUSTAINED="$SUSTAINED" PGBENCH="$PGBENCH" CONTENTION="$CONTENTION" CONTENTION_START="$CONTENTION_START" \
+    CONTENTION_SECONDS="$CONTENTION_SECONDS" CONTENTION_GAP="$CONTENTION_GAP" CONTENTION_NODES="$CONTENTION_NODES" \
+    CONTENTION_PREFILL="$CONTENTION_PREFILL" \
+    "${HVG[@]}" meta > "$OUT/meta.json"
+}
+write_meta
 
 # --- namespace ---------------------------------------------------------------
 # Owned or nothing: cleanup deletes the whole namespace, so it must never be
@@ -330,8 +381,8 @@ echo "==> steal sampler on ${BENCH_NODE}"
 pod_ip hvg-sampler >/dev/null
 
 # --- VM mode -------------------------------------------------------------------
-run_vm() {
-    mkdir -p "$OUT/vm"
+IMAGE_SC="-"
+import_image() {   # sets IMAGE_SC
     echo "==> image ${IMAGE_NAME}"
     "${HVG[@]}" image "$IMAGE_NAME" "$NAMESPACE" "$IMAGE_URL" | tee "$OUT/manifests/image.json" | kubectl apply -f - >/dev/null
     local imported="-" retry_exceeded="-" progress="0" image_sc="-"
@@ -349,6 +400,13 @@ run_vm() {
     [ "$imported" = "True" ] || { echo "ERROR: image not imported after 20 minutes" >&2; exit 1; }
     [ "$image_sc" != "-" ] || image_sc="longhorn-${IMAGE_NAME}"
     echo "    imported; root disks use storage class ${image_sc}"
+    IMAGE_SC="$image_sc"
+}
+
+run_vm() {
+    mkdir -p "$OUT/vm"
+    import_image
+    local image_sc="$IMAGE_SC"
 
     # The peer goes first: the bench VM's cloud-init needs its address. With
     # masquerade, a VM is reachable on its virt-launcher pod's IP, which the pod
@@ -374,9 +432,12 @@ run_vm() {
         --wait=true --timeout=300s >/dev/null 2>&1 || true
 }
 
-create_vm() {   # role node peer-ip image-sc
-    local role="$1" node="$2" peer="$3" image_sc="$4" name="hvg-$1"
-    SUSTAINED="$SUSTAINED" "${HVG[@]}" userdata "$role" "$HERE/guest/bench.py" ${peer:+"$peer"} > "$OUT/manifests/${name}-userdata.yaml"
+create_vm() {   # role node peer-ip image-sc [name]
+    local role="$1" node="$2" peer="$3" image_sc="$4" name="${5:-hvg-$1}"
+    SUSTAINED="$SUSTAINED" PGBENCH="$PGBENCH" CONTEND_INDEX="${CONTEND_INDEX:-0}" CONTEND_VMS="$CONTENTION" \
+    CONTEND_START="$CONTENTION_START" CONTEND_SECONDS="$CONTENTION_SECONDS" CONTEND_GAP="$CONTENTION_GAP" \
+    CONTEND_PREFILL="$CONTENTION_PREFILL" \
+    "${HVG[@]}" userdata "$role" "$HERE/guest/bench.py" ${peer:+"$peer"} > "$OUT/manifests/${name}-userdata.yaml"
     k create secret generic "${name}-cloudinit" --from-file=userdata="$OUT/manifests/${name}-userdata.yaml" \
         --dry-run=client -o json | k apply -f - >/dev/null
     MULTIQUEUE="$MULTIQUEUE" VM_CPU_LIMIT="$VM_CPU_LIMIT" "${HVG[@]}" vm "$name" "$NAMESPACE" "$role" "$node" "${NAMESPACE}/${IMAGE_NAME}" "$image_sc" "$DATA_SC" \
@@ -418,6 +479,10 @@ run_pod() {
     echo "==> pod mode: peer on ${PEER_NODE}"
     k create configmap hvg-program --from-file=bench.py="$HERE/guest/bench.py" \
         --dry-run=client -o json | k apply -f - >/dev/null
+    if [ "$PGBENCH" = "true" ]; then
+        "${HVG[@]}" pvc hvg-pod-pgdata "$NAMESPACE" "$DATA_SC" "$DATA_SIZE" Filesystem \
+            | tee "$OUT/manifests/pod-pgdata-pvc.json" | k apply -f - >/dev/null
+    fi
     "${HVG[@]}" pvc hvg-pod-data "$NAMESPACE" "$DATA_SC" "$DATA_SIZE" \
         | tee "$OUT/manifests/pod-data-pvc.json" | k apply -f - >/dev/null
     "${HVG[@]}" pod hvg-pod-peer "$NAMESPACE" peer "$PEER_NODE" "$POD_IMAGE" hvg-program "$VCPUS" "$MEMORY" \
@@ -426,7 +491,7 @@ run_pod() {
     peer_ip="$(pod_ip hvg-pod-peer)"
     echo "    running, pod IP ${peer_ip}"
     echo "==> pod mode: bench on ${BENCH_NODE}"
-    SUSTAINED="$SUSTAINED" "${HVG[@]}" pod hvg-pod-bench "$NAMESPACE" bench "$BENCH_NODE" "$POD_IMAGE" hvg-program "$VCPUS" "$MEMORY" \
+    SUSTAINED="$SUSTAINED" PGBENCH="$PGBENCH" PG_PVC=hvg-pod-pgdata "${HVG[@]}" pod hvg-pod-bench "$NAMESPACE" bench "$BENCH_NODE" "$POD_IMAGE" hvg-program "$VCPUS" "$MEMORY" \
         hvg-pod-data "$peer_ip" | tee "$OUT/manifests/pod-bench.json" | k apply -f - >/dev/null
     pod_ip hvg-pod-bench >/dev/null
     k get pod hvg-pod-bench hvg-pod-peer -o json > "$OUT/pod/pods.json" 2>/dev/null || true
@@ -442,10 +507,85 @@ fetch_pod_logs() {
     k logs hvg-pod-peer > "$OUT/pod/peer.log" 2>/dev/null || true
 }
 
+# --- contention mode -------------------------------------------------------------
+utc() { python3 -c 'import sys, time; print(time.strftime("%H:%M:%SZ", time.gmtime(float(sys.argv[1]))))' "$1"; }
+
+run_contention() {
+    local cdir="$OUT/contention" i node state states last="" deadline last_end
+    mkdir -p "$cdir/prom"
+    import_image
+    if kubectl get crd podmonitors.monitoring.coreos.com >/dev/null 2>&1; then
+        "${HVG[@]}" podmonitor "$NAMESPACE" | tee "$OUT/manifests/podmonitor.json" | k apply -f - >/dev/null \
+            && echo "    etcd PodMonitor created for this run (needs etcd-expose-metrics for data)"
+    else
+        echo "    no PodMonitor CRD (rancher-monitoring off?): etcd and node figures will be empty"
+    fi
+
+    # The schedule is fixed now, after the image import, so its prep time is
+    # spent only on VM boot and package install.
+    CONTENTION_START=$(( $(date +%s) + CONTENTION_PREP ))
+    if [ "$CONTENTION_PREFILL" = "true" ]; then
+        CONTENTION_START=$(( CONTENTION_START + CONTENTION_FILL_SECONDS ))
+        echo "    pre-fill: every data disk written once first (budget ${CONTENTION_FILL_SECONDS} s)"
+    fi
+    CONTENTION_NODES="{"
+    for ((i = 0; i < CONTENTION; i++)); do
+        node="${CANDIDATES[$(( i % ${#CANDIDATES[@]} ))]}"
+        [ "$i" -eq 0 ] || CONTENTION_NODES+=", "
+        CONTENTION_NODES+="\"c${i}\": \"${node}\""
+    done
+    CONTENTION_NODES+="}"
+    write_meta
+    last_end=$(( CONTENTION_START + 3 * CONTENTION_SECONDS + 2 * CONTENTION_GAP ))
+    echo "==> contention: ${CONTENTION} VMs across ${#CANDIDATES[@]} node(s), ${CONTENTION_SECONDS} s phases"
+    echo "    solo $(utc "$CONTENTION_START"), all random $(utc $(( CONTENTION_START + CONTENTION_SECONDS + CONTENTION_GAP ))), all sequential $(utc $(( CONTENTION_START + 2 * (CONTENTION_SECONDS + CONTENTION_GAP) ))), done $(utc "$last_end")"
+    for ((i = 0; i < CONTENTION; i++)); do
+        node="${CANDIDATES[$(( i % ${#CANDIDATES[@]} ))]}"
+        mkdir -p "$cdir/c$i"
+        CONTEND_INDEX="$i" create_vm contend "$node" "" "$IMAGE_SC" "hvg-c$i"
+    done
+    echo "    created; waiting for every VM's results"
+
+    deadline=$(( last_end + 900 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        states=""
+        for ((i = 0; i < CONTENTION; i++)); do
+            k logs "$(k get pod -l "vm.kubevirt.io/name=hvg-c$i" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" \
+                -c guest-console-log > "$cdir/c$i/bench.log" 2>/dev/null || true
+            state="$("${HVG[@]}" status "$cdir/c$i/bench.log" 2>/dev/null || echo none)"
+            states+="${state%%:*} "
+        done
+        if [ "$states" != "$last" ]; then
+            echo "    $(date -u +%H:%M:%SZ) $(tr ' ' '\n' <<<"$states" | grep -v '^$' | sort | uniq -c | awk '{printf "%s %s, ", $1, $2}' | sed 's/, $//')"
+            last="$states"
+        fi
+        case " $states " in *" running "*|*" none "*|*" ready "*) sleep 30 ;; *) break ;; esac
+    done
+    for ((i = 0; i < CONTENTION; i++)); do
+        state="$("${HVG[@]}" status "$cdir/c$i/bench.log" 2>/dev/null || echo none)"
+        case "$state" in
+            done) "${HVG[@]}" decode "$cdir/c$i/bench.log" "$cdir/c$i/result.json" >/dev/null ;;
+            *) echo "WARNING: hvg-c$i ended in state '${state}'; its results are missing" ;;
+        esac
+    done
+
+    # Prometheus needs the last window to be over and scraped before querying it.
+    while [ "$(date +%s)" -lt $(( last_end + 45 )) ]; do sleep 5; done
+    "${HVG[@]}" promq "$CONTENTION_START" "$CONTENTION_SECONDS" "$CONTENTION_GAP" \
+        | while IFS=$'\t' read -r phase name path; do
+            kubectl get --raw "$path" > "$cdir/prom/${phase}.${name}.json" 2>/dev/null || true
+        done
+    "${HVG[@]}" contention "$OUT"
+}
+
 # --- run ---------------------------------------------------------------------
 # One mode at a time, never overlapping: each is the other's baseline.
-if want vm; then run_vm; fi
-if want pod; then run_pod; fi
+if [ "$CONTENTION" -gt 0 ]; then
+    run_contention
+else
+    if want vm; then run_vm; fi
+    if want pod; then run_pod; fi
+fi
 
 collect_sampler
 for m in vm pod; do

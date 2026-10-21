@@ -74,6 +74,8 @@ instance type does not match the architecture 'x86_64' of the specified AMI"*.
 | `mtu` | Defaults to 1500. What matters is that it is set at all. |
 | `overlay_client_cidr` | Opens the nodes to this source on **all** protocols. Only with a VPC route for the overlay CIDR. |
 | `replica_count` | Fixed at bootstrap and immutable afterwards. |
+| `volume_type` | `gp3` (default), `io1` or `io2` for each node's root volume. io1/io2 need `volume_iops`, and take no `volume_throughput`: io2's throughput follows from IOPS, at 0.256 MiB/s per IOPS up to 4,000 MiB/s. io2 costs far more per IOPS; what it buys is lower write latency, which bounds commit-heavy work. Changes in place. |
+| `volume_iops` / `volume_throughput` | Provisioning for each node's root volume, which holds the OS, etcd and every Longhorn replica. Unset gives a new gp3 volume the baseline, 3,000 IOPS / 125 MiB/s, but leaves an existing volume unchanged, so to go back to baseline set `3000` / `125` explicitly. **Do not run write-active VMs at gp3's baseline:** it caps the whole cluster's VM writes and can destabilize etcd (see [perf/FINDINGS.md](../perf/FINDINGS.md)). Like `volume_type`, these change **in place** on a running cluster, with no node replacement. AWS allows up to four modifications per volume in a rolling 24 hours, each only after the previous one completes, and a large volume can take hours to finish optimizing. Provisioning beyond the instance's own EBS limit is paid for but unusable. gp3 allows at most 0.25 MiB/s per IOPS, so 2,000 MiB/s (its maximum) needs at least 8,000 IOPS. **Changing an existing volume from io1/io2 to gp3 above 750 MiB/s fails** with a throughput-to-IOPS ratio error: the AWS provider sends only the attributes that changed, leaves out the unchanged IOPS, and AWS assumes gp3's 3,000. Make that change with `aws ec2 modify-volume --volume-type gp3 --iops N --throughput M` instead, after which `tofu plan` shows no changes; doing it in two applies would use two of the four modifications. |
 | `disable_source_dest_check` | Default `false`. Set `true` only alongside `overlay_client_cidr` and a VPC route for the overlay. |
 | `cluster_token` | At least 16 characters of `A-Za-z0-9._+/=-`; `openssl rand -hex 24`. Stored in plain text in state and in instance user-data — protect both. |
 
@@ -85,7 +87,8 @@ Terraform report success while the running cluster kept the old configuration.
 
 The practical consequence matches CloudFormation, where `LaunchTemplate` is a
 create-only property: anything feeding user-data — `mtu`, `cluster_token`,
-`replica_count`, `control_plane_via_nlb` — is a **deploy-time** decision.
+`replica_count`, `control_plane_via_nlb` — is a **deploy-time** decision. The
+volume settings are the exception: they change in place.
 Changing it rebuilds the cluster.
 
 ## The AMI is not followed automatically

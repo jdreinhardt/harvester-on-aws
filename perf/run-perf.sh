@@ -52,6 +52,10 @@ GUEST_MODE="both"
 GUEST_MULTIQUEUE="false"
 GUEST_VM_CPU_LIMIT=""
 GUEST_SUSTAINED=0
+GUEST_STORAGE_CLASS=""
+GUEST_PGBENCH="false"
+GUEST_CONTENTION=0
+GUEST_CONTENTION_PREFILL="false"
 # hvperf's own default is 0, meaning "keep adding VMIs until a health check
 # trips". Bounded by default so a first run measures boot latency without
 # taking the cluster to its edge; pass --max-vms 0 for the real ramp.
@@ -105,6 +109,20 @@ Usage: $0 [options]
                     guest: also run a 4-stream iperf for S seconds, sampled
                     every 10 s, to find the sustained rate after the EC2
                     network burst runs out. 900 is enough. Default: 0 (off).
+  --guest-storage-class SC
+                    guest: storage class for the fio data disk, in both the
+                    VM and the pod (root disks keep the image's class).
+                    Default: the cluster's default class.
+  --guest-pgbench   guest: also run pgbench (PostgreSQL 16, scale 100, 1/8/32
+                    clients) with the database on the data disk's storage
+                    class, in the VM and the pod. About 10 minutes per mode.
+  --guest-contention N
+                    guest: instead of the VM/pod comparison, N VMs writing at
+                    once (one alone first for reference), with each node's EBS
+                    writes and etcd latency recorded. About 30 minutes.
+  --guest-contention-prefill
+                    guest: write every contention VM's disk once before
+                    measuring (steady state, not first writes). Adds up to 15 minutes.
   --guest-mode M    guest: both (default; VM and pod, which gives the VM
                     overhead), vm or pod.
   --allow-arm64-density
@@ -139,6 +157,10 @@ while [[ $# -gt 0 ]]; do
         --guest-multiqueue) GUEST_MULTIQUEUE="true"; shift ;;
         --guest-vm-cpu-limit) GUEST_VM_CPU_LIMIT="$2"; shift 2 ;;
         --guest-sustained) GUEST_SUSTAINED="$2"; shift 2 ;;
+        --guest-storage-class) GUEST_STORAGE_CLASS="$2"; shift 2 ;;
+        --guest-pgbench) GUEST_PGBENCH="true"; shift ;;
+        --guest-contention) GUEST_CONTENTION="$2"; shift 2 ;;
+        --guest-contention-prefill) GUEST_CONTENTION_PREFILL="true"; shift ;;
         --allow-arm64-density) ALLOW_ARM64_DENSITY="true"; shift ;;
         --allow-arm64-v19) ALLOW_ARM64_DENSITY="true"; ALLOW_ARM64_GUEST="true"; shift ;;
         --keep-namespace) KEEP_NAMESPACE="true"; shift ;;
@@ -167,6 +189,9 @@ done
     echo "ERROR: --container-disk does not look like an image reference" >&2; exit 1; }
 [[ "$GUEST_VCPUS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --guest-vcpus takes a positive integer" >&2; exit 1; }
 [[ "$GUEST_SUSTAINED" =~ ^[0-9]+$ ]] || { echo "ERROR: --guest-sustained takes seconds" >&2; exit 1; }
+[[ "$GUEST_CONTENTION" =~ ^[0-9]+$ ]] || { echo "ERROR: --guest-contention takes a VM count" >&2; exit 1; }
+[[ -z "$GUEST_STORAGE_CLASS" || "$GUEST_STORAGE_CLASS" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || {
+    echo "ERROR: --guest-storage-class must be a Kubernetes object name" >&2; exit 1; }
 [[ -z "$GUEST_VM_CPU_LIMIT" || "$GUEST_VM_CPU_LIMIT" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --guest-vm-cpu-limit takes a positive integer" >&2; exit 1; }
 case "$GUEST_MODE" in both|vm|pod) ;; *) echo "ERROR: --guest-mode must be both, vm or pod" >&2; exit 1 ;; esac
 [[ -z "$PERF_REF" || "$PERF_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || {
@@ -444,6 +469,10 @@ if has_suite guest; then
     [ "$GUEST_MULTIQUEUE" = "true" ] && GUEST_EXTRA+=" --multiqueue"
     [ -n "$GUEST_VM_CPU_LIMIT" ] && GUEST_EXTRA+=" --vm-cpu-limit ${GUEST_VM_CPU_LIMIT}"
     [ "$GUEST_SUSTAINED" -gt 0 ] && GUEST_EXTRA+=" --sustained ${GUEST_SUSTAINED}"
+    [ -n "$GUEST_STORAGE_CLASS" ] && GUEST_EXTRA+=" --storage-class ${GUEST_STORAGE_CLASS}"
+    [ "$GUEST_PGBENCH" = "true" ] && GUEST_EXTRA+=" --pgbench"
+    [ "$GUEST_CONTENTION" -gt 0 ] && GUEST_EXTRA+=" --contention ${GUEST_CONTENTION}"
+    [ "$GUEST_CONTENTION_PREFILL" = "true" ] && GUEST_EXTRA+=" --contention-prefill"
     printf 'GUEST_ARGS=(--label %q --vcpus %q --mode %q%s)\n' "$GUEST_LABEL" "$GUEST_VCPUS" "$GUEST_MODE" "$GUEST_EXTRA" \
         | runner 'cat > ~/perf-run/guest.env'
 fi

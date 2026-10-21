@@ -24,6 +24,8 @@ Two modes, the same workloads:
          vCPUs look like.
 
   bench.py bench [--peer IP] [--mode vm|pod] [--vcpus N] [--disk PATH] [--sustained SECONDS]
+                 [--pgbench [--pg-dir DIR]]
+  bench.py contend --index I --vms N --start EPOCH --seconds S --gap G [--prefill]
   bench.py peer  [--mode vm|pod]
 
 Results leave the guest on its SERIAL CONSOLE, which the harness reads with
@@ -41,6 +43,7 @@ bump it: results are only comparable within one profile.
 """
 
 import base64
+import glob
 import gzip
 import hashlib
 import json
@@ -74,6 +77,19 @@ PING_COUNT = 100
 # long enough to drain it and show the sustained rate. 0 = not run.
 SUSTAINED_SECONDS = 0
 NET_INTERVAL = 10
+# Optional, outside PROFILE: PostgreSQL's pgbench (its TPC-B-like default) with
+# the database on the Longhorn data disk, run after fio has finished with the
+# raw device. Client on the same machine over a Unix socket, so the network is
+# not in it. Same distro build in both modes: Ubuntu 24.04's PostgreSQL 16.
+PGBENCH = False
+PG_DIR = ""            # pod: a filesystem PVC mounted here; VM: "" = format DATA_DISK
+PG_SCALE = 100         # about 1.5 GB: larger than shared_buffers, smaller than RAM
+PG_SECONDS = 120
+PG_CLIENTS = (1, 8, 32)
+PG_PORT = 5433         # not 5432, which the distro's own cluster may hold
+PG_SETTINGS = {"shared_buffers": "1GB", "max_connections": "100", "max_wal_size": "4GB",
+               "listen_addresses": "''", "unix_socket_directories": "/tmp", "port": str(PG_PORT)}
+PG_STATE = {}
 
 
 # --- console output ----------------------------------------------------------
@@ -297,14 +313,20 @@ FIO_JOBS = [
 ]
 
 
-def fio_job(name, args):
+def fio_job(name, args, seconds=None):
+    """seconds: run exactly this long with no ramp (contention phases must line
+    up across VMs); None: the profile's FIO_SECONDS after FIO_RAMP."""
     def fn():
         need("fio")
         if not os.path.exists(DATA_DISK):
             raise RuntimeError("data disk %s not present" % DATA_DISK)
         dev = os.path.realpath(DATA_DISK)
-        timed = [] if "--size=100%" in args else [
-            "--time_based", "--runtime=%d" % FIO_SECONDS, "--ramp_time=%d" % FIO_RAMP]
+        if seconds is not None:
+            timed = ["--time_based", "--runtime=%d" % seconds]
+        elif "--size=100%" in args:
+            timed = []
+        else:
+            timed = ["--time_based", "--runtime=%d" % FIO_SECONDS, "--ramp_time=%d" % FIO_RAMP]
         rc, out, err = run(["fio", "--name=" + name, "--filename=" + dev,
                             "--ioengine=libaio", "--direct=1", "--numjobs=1",
                             "--group_reporting", "--output-format=json"] + args + timed)
@@ -324,6 +346,109 @@ def fio_job(name, args):
             "sync_p99_us": job.get("sync", {}).get("lat_ns", {}).get("percentile", {}).get("99.000000", 0) / 1000.0,
         }
     return fn
+
+
+def pg_bin(name):
+    found = sorted(glob.glob("/usr/lib/postgresql/*/bin/" + name))
+    if not found:
+        raise RuntimeError("%s not found under /usr/lib/postgresql (postgresql not installed?)" % name)
+    return found[-1]
+
+
+def as_postgres(cmd, timeout=None):
+    # PostgreSQL refuses to run as root, and this program runs as root.
+    return run(["runuser", "-u", "postgres", "--"] + cmd, timeout=timeout)
+
+
+def pg_sql(query):
+    rc, out, err = as_postgres([pg_bin("psql"), "-h", "/tmp", "-p", str(PG_PORT), "-d", "bench",
+                                "-At", "-c", query])
+    return out.strip() if rc == 0 else None
+
+
+def pg_setup():
+    """A fresh cluster on the data disk, initialized to PG_SCALE."""
+    def fn():
+        os.chdir("/")
+        # The distro's own cluster, if its package started one: not ours, and
+        # it would compete for the same CPUs.
+        for conf in glob.glob("/etc/postgresql/*/main"):
+            run(["pg_ctlcluster", conf.split("/")[3], "main", "stop"])
+        mount = PG_DIR or "/pgdata"
+        if not PG_DIR:
+            # VM: the raw data disk fio used becomes an ext4 filesystem.
+            dev = os.path.realpath(DATA_DISK)
+            rc, _, err = run(["mkfs.ext4", "-F", "-q", dev], timeout=600)
+            if rc != 0:
+                raise RuntimeError("mkfs.ext4: " + err.strip())
+            os.makedirs(mount, exist_ok=True)
+            rc, _, err = run(["mount", dev, mount])
+            if rc != 0:
+                raise RuntimeError("mount: " + err.strip())
+            PG_STATE["mounted"] = mount
+        data = os.path.join(mount, "pg")
+        if os.path.exists(data):
+            shutil.rmtree(data)
+        os.makedirs(data)
+        shutil.chown(data, "postgres", "postgres")
+        os.chmod(data, 0o700)
+        rc, out, err = as_postgres([pg_bin("initdb"), "-D", data, "-U", "postgres",
+                                    "--auth=trust", "-E", "UTF8"], timeout=300)
+        if rc != 0:
+            raise RuntimeError("initdb: " + (err or out).strip()[-300:])
+        opts = " ".join("-c %s=%s" % kv for kv in PG_SETTINGS.items())
+        # The log goes inside the data directory: the mount's root belongs to
+        # root, and the server runs as postgres.
+        rc, out, err = as_postgres([pg_bin("pg_ctl"), "-D", data, "-l", os.path.join(data, "server.log"),
+                                    "-w", "-t", "120", "-o", opts, "start"], timeout=180)
+        if rc != 0:
+            raise RuntimeError("pg_ctl start: " + (err or out).strip()[-300:])
+        PG_STATE["data"] = data
+        rc, out, err = as_postgres([pg_bin("createdb"), "-h", "/tmp", "-p", str(PG_PORT), "bench"])
+        if rc != 0:
+            raise RuntimeError("createdb: " + (err or out).strip()[-300:])
+        t0 = time.time()
+        rc, out, err = as_postgres([pg_bin("pgbench"), "-h", "/tmp", "-p", str(PG_PORT), "-i",
+                                    "-s", str(PG_SCALE), "-q", "bench"], timeout=1800)
+        if rc != 0:
+            raise RuntimeError("pgbench -i: " + (err or out).strip()[-300:])
+        size = pg_sql("select pg_database_size('bench')")
+        return {"version": pg_sql("show server_version"), "scale": PG_SCALE,
+                "settings": PG_SETTINGS, "init_seconds": round(time.time() - t0, 1),
+                "db_bytes": int(size) if size and size.isdigit() else None,
+                "wal_sync_method": pg_sql("show wal_sync_method"),
+                "filesystem": "ext4, guest-formatted data disk" if not PG_DIR else "ext4 PVC at " + PG_DIR}
+    return fn
+
+
+def pgbench_run(clients):
+    def fn():
+        if "data" not in PG_STATE:
+            raise RuntimeError("no database: pg-init failed")
+        threads = min(clients, VCPUS)
+        rc, out, err = as_postgres([pg_bin("pgbench"), "-h", "/tmp", "-p", str(PG_PORT),
+                                    "-c", str(clients), "-j", str(threads),
+                                    "-T", str(PG_SECONDS), "bench"], timeout=PG_SECONDS + 600)
+        text = out + "\n" + err
+        m = re.search(r"tps = ([\d.]+) \((?:without initial connection time|excluding connections establishing)\)", text)
+        if rc != 0 or not m:
+            raise RuntimeError((err or out).strip()[-300:] or "pgbench rc=%d" % rc)
+        lat = re.search(r"latency average = ([\d.]+) ms", text)
+        txn = re.search(r"number of transactions actually processed: (\d+)", text)
+        failed = re.search(r"number of failed transactions: (\d+)", text)
+        return {"clients": clients, "threads": threads, "seconds": PG_SECONDS,
+                "tps": float(m.group(1)),
+                "latency_avg_ms": float(lat.group(1)) if lat else None,
+                "transactions": int(txn.group(1)) if txn else None,
+                "failed": int(failed.group(1)) if failed else 0}
+    return fn
+
+
+def pg_teardown():
+    if "data" in PG_STATE:
+        as_postgres([pg_bin("pg_ctl"), "-D", PG_STATE["data"], "-m", "fast", "-w", "stop"], timeout=120)
+    if "mounted" in PG_STATE:
+        run(["umount", PG_STATE["mounted"]])
 
 
 def wait_for_peer(peer, timeout=600):
@@ -456,7 +581,7 @@ def role_bench(peer):
     progress("bench starting, profile %d, mode %s, %d vCPU" % (PROFILE, MODE, VCPUS))
     results = {}
     payload = {"schema": 1, "profile": PROFILE, "role": "bench", "mode": MODE, "peer": peer,
-               "sustained_seconds": SUSTAINED_SECONDS,
+               "sustained_seconds": SUSTAINED_SECONDS, "pgbench": PGBENCH,
                "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
     try:
         payload["system"] = system_facts()
@@ -473,6 +598,11 @@ def role_bench(peer):
         test(results, "stress-%s" % stressor, stress(stressor, n))
     for name, args in FIO_JOBS:
         test(results, "fio-" + name, fio_job(name, args))
+    if PGBENCH:
+        test(results, "pg-init", pg_setup())
+        for c in PG_CLIENTS:
+            test(results, "pg-c%d" % c, pgbench_run(c))
+        pg_teardown()
     if peer:
         test(results, "net-tcp-1", iperf(peer, 1, False))
         test(results, "net-tcp-4", iperf(peer, 4, False))
@@ -497,14 +627,71 @@ def role_bench(peer):
     return 0
 
 
+# --- contention -----------------------------------------------------------------
+# Several VMs, each with its own Longhorn data disk, writing on one wall-clock
+# schedule. Every VM gets the same absolute start time from the harness, so the
+# phases line up across guests to within clock skew (kvm-clock, NTP).
+CONTEND_RANDW = ["--rw=randwrite", "--bs=4k", "--iodepth=32"]
+CONTEND_SEQW = ["--rw=write", "--bs=1m", "--iodepth=16"]
+# Every block written once before the schedule, so the phases measure
+# overwrites, not the first write to a thin Longhorn volume's unallocated space.
+CONTEND_FILL = ["--rw=write", "--bs=1m", "--iodepth=16", "--size=100%"]
+
+
+def contend_schedule(start, seconds, gap):
+    """(phase, planned start, which VMs run it, fio args). VM 0 alone first, as
+    the same-run reference; then every VM together."""
+    step = seconds + gap
+    return [("solo-randwrite", start, "first", CONTEND_RANDW),
+            ("all-randwrite", start + step, "all", CONTEND_RANDW),
+            ("all-seqwrite", start + 2 * step, "all", CONTEND_SEQW)]
+
+
+def role_contend(index, vms, start, seconds, gap, prefill=False):
+    if MODE == "vm":
+        run(["dmesg", "-n", "1"])
+    payload = {"schema": 1, "profile": PROFILE, "role": "contend", "mode": MODE, "index": index,
+               "vms": vms, "start": start, "phase_seconds": seconds, "gap": gap, "prefill": prefill,
+               "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    try:
+        payload["system"] = system_facts()
+    except Exception as exc:  # noqa: BLE001
+        payload["system"] = {"error": str(exc), "vcpus": VCPUS, "mode": MODE}
+    progress("contend %d of %d ready, first phase in %ds" % (index, vms, int(start - time.time())))
+    results = {}
+    if prefill:
+        # Starts as soon as this VM is up, not on the schedule: VMs boot at
+        # different times, and the fill only has to finish before the first phase.
+        test(results, "prefill", fio_job("prefill", CONTEND_FILL))
+        results["prefill"]["finished_before_start"] = time.time() <= start
+    for name, t0, who, args in contend_schedule(start, seconds, gap):
+        if who == "first" and index != 0:
+            continue
+        wait = t0 - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        late = round(max(0.0, time.time() - t0), 1)
+        test(results, name, fio_job(name, args, seconds))
+        results[name]["planned_t0"] = t0
+        results[name]["late_s"] = late
+    payload["tests"] = results
+    payload["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    progress("sending results")
+    send_payload(payload)
+    emit("HVG:DONE")
+    return 0
+
+
 def opt(argv, name, default):
     return argv[argv.index(name) + 1] if name in argv[:-1] else default
 
 
 def main(argv):
-    global MODE, VCPUS, DATA_DISK, SUSTAINED_SECONDS
-    if len(argv) < 2 or argv[1] not in ("bench", "peer"):
+    global MODE, VCPUS, DATA_DISK, SUSTAINED_SECONDS, PGBENCH, PG_DIR
+    if len(argv) < 2 or argv[1] not in ("bench", "peer", "contend"):
         print("usage: bench.py bench [--peer IP] [--mode vm|pod] [--vcpus N] [--disk PATH] [--sustained SECONDS]\n"
+              "                      [--pgbench [--pg-dir DIR]]\n"
+              "       bench.py contend --index I --vms N --start EPOCH --seconds S --gap G [--prefill]\n"
               "       bench.py peer [--mode vm|pod]", file=sys.stderr)
         return 2
     MODE = opt(argv, "--mode", "vm")
@@ -516,8 +703,18 @@ def main(argv):
     VCPUS = int(opt(argv, "--vcpus", os.cpu_count() or 1))
     DATA_DISK = opt(argv, "--disk", DATA_DISK)
     SUSTAINED_SECONDS = int(opt(argv, "--sustained", "0"))
+    PGBENCH = "--pgbench" in argv
+    PG_DIR = opt(argv, "--pg-dir", "")
     if argv[1] == "peer":
         return role_peer()
+    if argv[1] == "contend":
+        try:
+            return role_contend(int(opt(argv, "--index", "0")), int(opt(argv, "--vms", "1")),
+                                float(opt(argv, "--start", "0")), int(opt(argv, "--seconds", "120")),
+                                int(opt(argv, "--gap", "30")), "--prefill" in argv)
+        except Exception as exc:  # noqa: BLE001
+            emit("HVG:FAIL %s: %s" % (type(exc).__name__, exc))
+            return 1
     peer = opt(argv, "--peer", "")
     try:
         return role_bench(peer)
