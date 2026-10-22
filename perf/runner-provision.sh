@@ -42,7 +42,8 @@ case "$(uname -m)" in
 esac
 
 echo "==> packages"
-sudo dnf -y -q install git tar gzip python3 >/dev/null
+# iperf3: the guest suite's VPC test uses the runner as its VPC host.
+sudo dnf -y -q install git tar gzip python3 iperf3 >/dev/null
 
 # --- Go ----------------------------------------------------------------------
 # AL2023's packaged Go lags upstream, and hvperf's go.mod asks for 1.26+. Take

@@ -56,6 +56,8 @@ GUEST_STORAGE_CLASS=""
 GUEST_PGBENCH="false"
 GUEST_CONTENTION=0
 GUEST_CONTENTION_PREFILL="false"
+GUEST_VPC_NETWORK=""
+GUEST_DATA_VOLUME_MODE=""
 # hvperf's own default is 0, meaning "keep adding VMIs until a health check
 # trips". Bounded by default so a first run measures boot latency without
 # taking the cluster to its edge; pass --max-vms 0 for the real ramp.
@@ -123,6 +125,17 @@ Usage: $0 [options]
   --guest-contention-prefill
                     guest: write every contention VM's disk once before
                     measuring (steady state, not first writes). Adds up to 15 minutes.
+  --guest-vpc-network NS/NAD
+                    guest: instead of the VM/pod comparison, network between
+                    the runner and, on each node, the node itself and a VM on
+                    this overlay VM Network, both directions. The runner is
+                    the VPC client, so size it like a node (--runner-type):
+                    its bandwidth bounds every figure. Needs the VPC route
+                    for the overlay CIDR and the overlay client CIDR (README,
+                    "VM networking on EC2"). About 30 minutes for 3 nodes.
+  --guest-data-volume-mode M
+                    guest: Block (default) or Filesystem, for a data-disk
+                    storage class with no block mode, such as EFS (VMs only).
   --guest-mode M    guest: both (default; VM and pod, which gives the VM
                     overhead), vm or pod.
   --allow-arm64-density
@@ -161,6 +174,8 @@ while [[ $# -gt 0 ]]; do
         --guest-pgbench) GUEST_PGBENCH="true"; shift ;;
         --guest-contention) GUEST_CONTENTION="$2"; shift 2 ;;
         --guest-contention-prefill) GUEST_CONTENTION_PREFILL="true"; shift ;;
+        --guest-vpc-network) GUEST_VPC_NETWORK="$2"; shift 2 ;;
+        --guest-data-volume-mode) GUEST_DATA_VOLUME_MODE="$2"; shift 2 ;;
         --allow-arm64-density) ALLOW_ARM64_DENSITY="true"; shift ;;
         --allow-arm64-v19) ALLOW_ARM64_DENSITY="true"; ALLOW_ARM64_GUEST="true"; shift ;;
         --keep-namespace) KEEP_NAMESPACE="true"; shift ;;
@@ -264,6 +279,22 @@ read -r NET_BASE NET_PEAK EBS_BASE_MBPS EBS_MAX_MBPS EBS_BASE_IOPS EBS_MAX_IOPS 
     --instance-types "$NODE_TYPE" \
     --query 'InstanceTypes[0].[NetworkInfo.NetworkCards[0].BaselineBandwidthInGbps,NetworkInfo.NetworkCards[0].PeakBandwidthInGbps,EbsInfo.EbsOptimizedInfo.BaselineBandwidthInMbps,EbsInfo.EbsOptimizedInfo.MaximumBandwidthInMbps,EbsInfo.EbsOptimizedInfo.BaselineIops,EbsInfo.EbsOptimizedInfo.MaximumIops]' \
     --output text 2>/dev/null || true)"
+# The node the VPC route for an overlay CIDR targets, if any: all inbound VM
+# traffic from the VPC enters there, so the VPC test marks it.
+VPC_ROUTE_NODE=""
+if [ -n "$GUEST_VPC_NETWORK" ]; then
+    VPC_ID="$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)"
+    for rid in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query 'RouteTables[].Routes[?State==`active` && InstanceId!=null].InstanceId' --output text); do
+        if aws ec2 describe-instances --instance-ids "$rid" \
+               --query 'Reservations[0].Instances[0].Tags[?Key==`Name`].Value' --output text 2>/dev/null \
+               | grep -q "^${NAME_PREFIX}-node-"; then
+            VPC_ROUTE_NODE="harvester-${rid#i-}"
+            break
+        fi
+    done
+    echo "    VPC route to the overlay: ${VPC_ROUTE_NODE:-none found targeting a cluster node}"
+fi
 read -r VOL_TYPE VOL_SIZE VOL_IOPS VOL_TPUT <<<"$(aws ec2 describe-volumes \
     --filters "Name=attachment.instance-id,Values=${NODE1_ID}" \
     --query 'Volumes[0].[VolumeType,Size,Iops,Throughput]' --output text 2>/dev/null || true)"
@@ -422,6 +453,12 @@ if has_suite guest; then
         exit 1
     fi
     [ -n "$KUBE_VERSION" ] || { echo "ERROR: could not read the cluster's Kubernetes version for kubectl" >&2; exit 1; }
+    if [ -n "$GUEST_VPC_NETWORK" ]; then
+        case "$RUNNER_TYPE" in t2.*|t3.*|t3a.*|t4g.*)
+            warn "the VPC test's client is the runner, a burstable ${RUNNER_TYPE}: its bandwidth, not the cluster's, bounds the figures (--runner-type ${NODE_TYPE})." ;;
+        esac
+        [ -n "$VPC_ROUTE_NODE" ] || warn "no active VPC route targets a cluster node: connections from the VPC to VMs will fail."
+    fi
     # Its figures are the guest's share of an idle node; anything that loads
     # the cluster first is measured instead.
     for s in "${SUITE_LIST[@]}"; do
@@ -473,6 +510,9 @@ if has_suite guest; then
     [ "$GUEST_PGBENCH" = "true" ] && GUEST_EXTRA+=" --pgbench"
     [ "$GUEST_CONTENTION" -gt 0 ] && GUEST_EXTRA+=" --contention ${GUEST_CONTENTION}"
     [ "$GUEST_CONTENTION_PREFILL" = "true" ] && GUEST_EXTRA+=" --contention-prefill"
+    [ -n "$GUEST_VPC_NETWORK" ] && GUEST_EXTRA+=" --vpc-network ${GUEST_VPC_NETWORK}"
+    [ -n "$GUEST_DATA_VOLUME_MODE" ] && GUEST_EXTRA+=" --data-volume-mode ${GUEST_DATA_VOLUME_MODE}"
+    [ -n "$VPC_ROUTE_NODE" ] && GUEST_EXTRA+=" --vpc-route-node ${VPC_ROUTE_NODE}"
     printf 'GUEST_ARGS=(--label %q --vcpus %q --mode %q%s)\n' "$GUEST_LABEL" "$GUEST_VCPUS" "$GUEST_MODE" "$GUEST_EXTRA" \
         | runner 'cat > ~/perf-run/guest.env'
 fi

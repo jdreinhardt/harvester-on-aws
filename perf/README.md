@@ -361,9 +361,18 @@ one architecture.
 ./perf/run-perf.sh --suites guest --guest-storage-class SC       # fio (and pgbench) data disk on another class
 ./perf/run-perf.sh --suites guest --guest-pgbench                # adds pgbench in the VM and the pod
 ./perf/run-perf.sh --suites guest --guest-contention 6           # 6 VMs writing at once instead of VM vs pod
+./perf/run-perf.sh --suites guest --runner-type m8i.4xlarge \
+    --guest-vpc-network default/overlay-network                    # VM <-> VPC over a kube-ovn overlay, per node
 ./perf/run-perf.sh --perf-ref 6858e2c --keep                     # pin hvperf, keep the runner
 ./perf/run-perf.sh --down
 ```
+
+`--guest-vpc-network` makes the runner the VPC client, so size it like a node:
+a `t3` runner's bandwidth would be what it measures. It needs the overlay set up
+as in the repository README's "VM networking on EC2": the addon, the VM Network
+and its Subnet, the VPC route to a node, and `overlay_client_cidr` covering the
+runner's subnet. The runner shares the nodes' security group, which allows the
+rest.
 
 Suites run in the order you give them. `hvperf run all` is not used, because it
 runs suites **alphabetically**. That would put density first and the
@@ -373,7 +382,8 @@ density. The script warns if density is not last.
 Pin `--perf-ref` when comparing runs. harvester-perf commits most days, and
 `results/<stamp>/cluster.txt` records the commit that ran.
 
-Measured results, configuration by configuration, are collected in [FINDINGS.md](FINDINGS.md).
+Measured results, configuration by configuration, are collected in [FINDINGS.md](FINDINGS.md), and
+the deployment advice drawn from them in [SIZING.md](SIZING.md).
 
 ## Which AWS limit a result is hitting
 

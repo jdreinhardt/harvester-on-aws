@@ -627,6 +627,58 @@ def role_bench(peer):
     return 0
 
 
+def default_route_mtu():
+    """The MTU of the interface the default route uses: what DHCP handed out."""
+    _, out, _ = run(["ip", "-o", "route", "get", "1.1.1.1"])
+    m = re.search(r" dev (\S+)", out)
+    if not m:
+        return None
+    try:
+        return {"interface": m.group(1), "mtu": int(read("/sys/class/net/%s/mtu" % m.group(1)).strip())}
+    except ValueError:
+        return {"interface": m.group(1), "mtu": None}
+
+
+def role_vpc(peer):
+    """A VM on an overlay network, measured against a host elsewhere in the VPC.
+
+    Two paths, which the harness measures from either end:
+      here      connections the VM opens, which leave through its own node,
+                SNATed to the node's address (natOutgoing);
+      harness   connections the VPC host opens to this VM's overlay address,
+                which arrive at whichever node the VPC route names.
+    The iperf3 server started first is what the harness connects to, after
+    this side has sent its results; it outlives the payload.
+    """
+    run(["dmesg", "-n", "1"])
+    need("iperf3")
+    rc, _, err = run(["iperf3", "-s", "-D", "-p", str(IPERF_PORT)])
+    if rc != 0:
+        raise RuntimeError("iperf3 server: %s" % err.strip())
+    started = time.time()
+    progress("vpc starting, profile %d, peer %s" % (PROFILE, peer))
+    payload = {"schema": 1, "profile": PROFILE, "role": "vpc", "mode": "vm", "peer": peer,
+               "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+               "network": default_route_mtu()}
+    try:
+        payload["system"] = system_facts()
+    except Exception as exc:  # noqa: BLE001
+        payload["system"] = {"error": str(exc), "vcpus": VCPUS, "mode": MODE}
+    results = {}
+    test(results, "net-tcp-1", iperf(peer, 1, False))
+    test(results, "net-tcp-4", iperf(peer, 4, False))
+    test(results, "net-tcp-1-reverse", iperf(peer, 1, True))
+    test(results, "net-tcp-4-reverse", iperf(peer, 4, True))
+    test(results, "net-ping", ping(peer))
+    payload["tests"] = results
+    payload["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload["seconds"] = round(time.time() - started, 1)
+    progress("sending results")
+    send_payload(payload)
+    emit("HVG:DONE")
+    return 0
+
+
 # --- contention -----------------------------------------------------------------
 # Several VMs, each with its own Longhorn data disk, writing on one wall-clock
 # schedule. Every VM gets the same absolute start time from the harness, so the
@@ -688,10 +740,11 @@ def opt(argv, name, default):
 
 def main(argv):
     global MODE, VCPUS, DATA_DISK, SUSTAINED_SECONDS, PGBENCH, PG_DIR
-    if len(argv) < 2 or argv[1] not in ("bench", "peer", "contend"):
+    if len(argv) < 2 or argv[1] not in ("bench", "peer", "contend", "vpc"):
         print("usage: bench.py bench [--peer IP] [--mode vm|pod] [--vcpus N] [--disk PATH] [--sustained SECONDS]\n"
               "                      [--pgbench [--pg-dir DIR]]\n"
               "       bench.py contend --index I --vms N --start EPOCH --seconds S --gap G [--prefill]\n"
+              "       bench.py vpc --peer IP\n"
               "       bench.py peer [--mode vm|pod]", file=sys.stderr)
         return 2
     MODE = opt(argv, "--mode", "vm")
@@ -716,6 +769,12 @@ def main(argv):
             emit("HVG:FAIL %s: %s" % (type(exc).__name__, exc))
             return 1
     peer = opt(argv, "--peer", "")
+    if argv[1] == "vpc":
+        try:
+            return role_vpc(peer)
+        except Exception as exc:  # noqa: BLE001
+            emit("HVG:FAIL %s: %s" % (type(exc).__name__, exc))
+            return 1
     try:
         return role_bench(peer)
     except Exception as exc:  # noqa: BLE001 -- say so on the console, or the harness waits out its timeout

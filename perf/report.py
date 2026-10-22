@@ -343,7 +343,7 @@ def sec_guest(d):
     o = load_json(os.path.join(g, "overhead.json"))
     meta = load_json(os.path.join(g, "meta.json"), {})
     out = ["## In-guest workloads: VM against a pod on the same node", ""]
-    if not o and os.path.exists(os.path.join(g, "contention.json")):
+    if not o and (os.path.exists(os.path.join(g, "contention.json")) or os.path.exists(os.path.join(g, "vpc.json"))):
         return []
     if not o:
         single = sec_guest_single(g, meta)
@@ -527,6 +527,39 @@ def sec_contention(d):
     return out
 
 
+def sec_vpc(d):
+    v = load_json(os.path.join(d, "guest", "vpc.json"))
+    if not v:
+        return []
+    out = ["## VM network to and from the VPC", "",
+           "The runner (`%s`, inside the VPC) against each node in turn: the node itself (hostNetwork), "
+           "and a VM whose only NIC is on the overlay VM Network `%s`. Gbit/s for %d s per test; "
+           "**in** is VPC host → node or VM, **out** the reverse. *VM, it connects* are connections the "
+           "VM opens, which leave through its own node SNATed to the node's address. *VM, VPC connects* "
+           "are connections to the VM's overlay address, which arrive through the node the VPC route "
+           "names%s." % (v.get("vpc_peer"), v.get("vpc_network"), v.get("seconds_per_test") or 30,
+                         " (`%s`)" % short_node(v["route_node"]) if v.get("route_node") else ""), ""]
+    f = lambda x: "-" if x is None else "%.2f" % x  # noqa: E731
+    names = {"node": "node itself", "vm-out": "VM, it connects", "vm-in": "VM, VPC connects"}
+    rows = []
+    for n in v.get("nodes") or []:
+        for path in ("node", "vm-out", "vm-in"):
+            p = (n.get("paths") or {}).get(path) or {}
+            rows.append(["%s%s" % (short_node(n["node"]), " (route)" if n.get("route_node") else ""), names[path],
+                         f(p.get("in_1")), f(p.get("in_4")), f(p.get("out_1")), f(p.get("out_4")),
+                         "-" if p.get("rtt_ms") is None else "%.3f ms" % p["rtt_ms"]])
+    out += table(["Node", "Path", "In, 1 stream", "In, 4", "Out, 1 stream", "Out, 4", "Round trip"], rows)
+    out.append("")
+    mtus = sorted({n.get("vm_mtu") for n in v.get("nodes") or [] if n.get("vm_mtu")})
+    if mtus:
+        out += ["VM MTU from DHCP: %s." % ", ".join(str(m) for m in mtus), ""]
+    errs = [e for n in v.get("nodes") or [] for e in n.get("errors") or []]
+    out += ["> **Error:** %s" % e[:200] for e in errs]
+    if errs:
+        out.append("")
+    return out
+
+
 def hvg_module():
     """perf/guest/hvg.py, for its FIGURES table and figure(), so the two never disagree."""
     import importlib.util
@@ -603,6 +636,10 @@ def render(d):
         if s == "guest":
             o = load_json(os.path.join(d, "guest", "overhead.json"))
             ct = load_json(os.path.join(d, "guest", "contention.json"))
+            vp = load_json(os.path.join(d, "guest", "vpc.json"))
+            if vp and not o:
+                rows.append(["guest (VPC network)", "PASS", "-", "%d node(s)" % len(vp.get("nodes") or [])])
+                continue
             if ct and not o:
                 rows.append(["guest (contention)", "PASS", "-", "%d VMs" % ct.get("vms", 0)])
                 continue
@@ -641,6 +678,7 @@ def render(d):
             out += sec_sustained(d, info)
             out += sec_pgbench(d)
             out += sec_contention(d)
+            out += sec_vpc(d)
 
     raw = sorted(f for f in os.listdir(d) if f.endswith((".json", ".log", ".yaml", ".txt")) and f != "summary.md")
     out += ["---", "", "Raw results in this directory: %s%s." % (

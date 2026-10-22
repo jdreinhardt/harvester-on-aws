@@ -25,6 +25,7 @@
   hvg.py podmonitor NS               PodMonitor that scrapes etcd during a contention run
   hvg.py promq START SECONDS GAP     Prometheus queries for each contention phase window
   hvg.py contention DIR              contention phases: totals, per-VM spread, etcd, node disks
+  hvg.py vpc DIR                     VM and node network against a host elsewhere in the VPC
   hvg.py overhead DIR [DIR...]       VM overhead against the pod baseline, per cluster;
                                      with several DIRs, how each compares to the first
 
@@ -86,6 +87,8 @@ def cmd_meta():
         "contention_gap": int(e("CONTENTION_GAP") or 0),
         "contention_nodes": json.loads(e("CONTENTION_NODES") or "{}"),
         "contention_prefill": e("CONTENTION_PREFILL") == "true",
+        "vpc_network": e("VPC_NETWORK", ""), "vpc_peer": e("VPC_PEER", ""),
+        "vpc_route_node": e("VPC_ROUTE_NODE", ""),
     }, indent=2))
 
 
@@ -129,6 +132,8 @@ def cmd_userdata(role, bench_py, peer=""):
         if e("CONTEND_PREFILL") == "true":
             args.append("--prefill")
         packages = ["fio"]
+    if role == "vpc":
+        packages = ["iperf3"]
     if role == "bench" and os.environ.get("PGBENCH") == "true":
         args += ["--pgbench"]
         packages.append("postgresql")
@@ -148,16 +153,19 @@ def cmd_vm(name, ns, role, node, image_id, image_sc, data_sc, vcpus, mem, root, 
            secret, arch, run_id):
     import os
     vcpus = int(vcpus)
-    pvc = lambda disk, size, sc, ann: {  # noqa: E731
+    pvc = lambda disk, size, sc, ann, mode="Block": {  # noqa: E731
         "metadata": {"name": "%s-%s" % (name, disk), "annotations": ann},
-        "spec": {"accessModes": ["ReadWriteMany"], "volumeMode": "Block",
+        "spec": {"accessModes": ["ReadWriteMany"], "volumeMode": mode,
                  "resources": {"requests": {"storage": size}}, "storageClassName": sc},
     }
     # The same shape the Harvester UI and the upstream e2e suite produce: PVCs
     # declared in harvesterhci.io/volumeClaimTemplates, which Harvester's VM
     # controller creates, rather than KubeVirt dataVolumeTemplates.
+    # DATA_VOLUME_MODE=Filesystem for a data disk on storage that has no block
+    # mode, such as EFS: KubeVirt then keeps the disk as disk.img on the mount.
+    # The guest still sees a virtio disk with the same serial.
     claims = [pvc("rootdisk", root, image_sc, {"harvesterhci.io/imageId": image_id}),
-              pvc("datadisk", data, data_sc, {})]
+              pvc("datadisk", data, data_sc, {}, os.environ.get("DATA_VOLUME_MODE") or "Block")]
     domain = {
         "cpu": {"cores": vcpus, "sockets": 1, "threads": 1},
         # The limit covers the whole virt-launcher compute container: the vCPU
@@ -179,6 +187,13 @@ def cmd_vm(name, ns, role, node, image_id, image_sc, data_sc, vcpus, mem, root, 
             "logSerialConsole": True,
         },
     }
+    networks = [{"name": "default", "pod": {}}]
+    # VM_NETWORK=<namespace>/<nad>: the VM's only NIC is on that network instead
+    # of the pod network, the way the UI attaches a VM to a VM Network. For a
+    # kube-ovn overlay NAD, Harvester's webhook swaps the binding to managedtap.
+    if os.environ.get("VM_NETWORK"):
+        domain["devices"]["interfaces"] = [{"name": "default", "model": "virtio", "bridge": {}}]
+        networks = [{"name": "default", "multus": {"networkName": os.environ["VM_NETWORK"]}}]
     # One virtio-net queue per vCPU instead of one in total, so the guest can
     # spread streams over several vhost threads. Off by default, as in Harvester.
     if os.environ.get("MULTIQUEUE") == "true":
@@ -207,7 +222,7 @@ def cmd_vm(name, ns, role, node, image_id, image_sc, data_sc, vcpus, mem, root, 
                     "nodeSelector": {"kubernetes.io/hostname": node},
                     "evictionStrategy": "LiveMigrateIfPossible",
                     "domain": domain,
-                    "networks": [{"name": "default", "pod": {}}],
+                    "networks": networks,
                     "volumes": [
                         {"name": "rootdisk", "persistentVolumeClaim": {"claimName": "%s-rootdisk" % name}},
                         {"name": "datadisk", "persistentVolumeClaim": {"claimName": "%s-datadisk" % name}},
@@ -272,13 +287,19 @@ def cmd_pod(name, ns, role, node, image, configmap, vcpus, mem, pvc="", peer="")
     if pg_pvc:
         container["volumeMounts"].append({"name": "pgdata", "mountPath": "/pgdata"})
         volumes.append({"name": "pgdata", "persistentVolumeClaim": {"claimName": pg_pvc}})
+    spec = {"nodeSelector": {"kubernetes.io/hostname": node}, "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 5, "containers": [container], "volumes": volumes}
+    # HOST_NETWORK=true: the node's own network stack, for the node's ceiling
+    # against a host elsewhere in the VPC. Only the iperf3 peer uses it.
+    if os.environ.get("HOST_NETWORK") == "true":
+        spec["hostNetwork"] = True
+        spec["dnsPolicy"] = "ClusterFirstWithHostNet"
     print(json.dumps({
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "namespace": ns,
                      "labels": {"perf.harvester-aws/guest-bench": "true",
                                 "perf.harvester-aws/role": "pod-" + role}},
-        "spec": {"nodeSelector": {"kubernetes.io/hostname": node}, "restartPolicy": "Never",
-                 "terminationGracePeriodSeconds": 5, "containers": [container], "volumes": volumes},
+        "spec": spec,
     }))
 
 
@@ -860,6 +881,83 @@ def cmd_contention(d):
             print("    error: " + e[:160])
 
 
+def iperf_gbit(path):
+    """Receiver-side Gbit/s from an iperf3 -J file, or None (with the error)."""
+    data = load_json(path)
+    if not data:
+        return None, "missing"
+    if data.get("error"):
+        return None, data["error"]
+    try:
+        return round(data["end"]["sum_received"]["bits_per_second"] / 1e9, 2), None
+    except (KeyError, TypeError):
+        return None, "no end summary"
+
+
+def ping_avg_ms(path):
+    try:
+        with open(path) as fh:
+            m = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", fh.read())
+    except OSError:
+        return None
+    return float(m.group(2)) if m else None
+
+
+def cmd_vpc(d):
+    """Each node's three paths to a VPC host, as Gbit/s each way and round trip.
+
+    Directions are from the VPC host's side: "in" is VPC host -> node or VM,
+    "out" is node or VM -> VPC host, whichever end opened the connection.
+      node      the node's own network (hostNetwork pod), the ceiling
+      vm-out    connections the VM opened: leave via its own node, SNATed
+      vm-in     connections the VPC host opened to the VM's overlay address:
+                arrive via the node the VPC route names
+    """
+    import os
+    meta = load_json(os.path.join(d, "meta.json"), {})
+    vdir = os.path.join(d, "vpc")
+    route_node = meta.get("vpc_route_node") or ""
+    nodes = []
+    for node in sorted(x for x in os.listdir(vdir) if os.path.isdir(os.path.join(vdir, x))):
+        nd = os.path.join(vdir, node)
+        res = load_json(os.path.join(nd, "result.json")) or {}
+        t = res.get("tests") or {}
+        g = lambda name: (t.get(name) or {}).get("gbit_per_sec")  # noqa: E731
+        paths, errors = {}, []
+        for path, prefix in (("node", "node"), ("vm-in", "inbound")):
+            row = {}
+            # From the VPC host, iperf3's forward direction sends to the target.
+            for key, f in (("in_1", "tcp-1"), ("in_4", "tcp-4"), ("out_1", "tcp-1-reverse"), ("out_4", "tcp-4-reverse")):
+                row[key], err = iperf_gbit(os.path.join(nd, "%s-%s.json" % (prefix, f)))
+                if err and err != "missing":
+                    errors.append("%s %s: %s" % (path, f, err))
+            row["rtt_ms"] = ping_avg_ms(os.path.join(nd, "%s-ping.txt" % prefix))
+            paths[path] = row
+        # From the VM, its forward direction sends to the VPC host.
+        paths["vm-out"] = {"out_1": g("net-tcp-1"), "out_4": g("net-tcp-4"),
+                           "in_1": g("net-tcp-1-reverse"), "in_4": g("net-tcp-4-reverse"),
+                           "rtt_ms": (t.get("net-ping") or {}).get("rtt_avg_ms")}
+        errors += ["vm-out %s: %s" % (k, v["error"]) for k, v in t.items() if isinstance(v, dict) and v.get("error")]
+        nodes.append({"node": node, "route_node": node == route_node,
+                      "vm_mtu": (res.get("network") or {}).get("mtu"), "paths": paths, "errors": errors})
+    out = {"label": meta.get("label"), "vpc_network": meta.get("vpc_network"), "vpc_peer": meta.get("vpc_peer"),
+           "route_node": route_node, "seconds_per_test": 30, "nodes": nodes}
+    with open(os.path.join(d, "vpc.json"), "w") as fh:
+        json.dump(out, fh, indent=2, sort_keys=True)
+    f = lambda v: "-" if v is None else "%.2f" % v  # noqa: E731
+    print("  VPC host %s; overlay %s; VPC route -> %s" % (out["vpc_peer"], out["vpc_network"], route_node or "unknown"))
+    print("  %-30s %-7s %8s %8s %8s %8s %8s" % ("node", "path", "in x1", "in x4", "out x1", "out x4", "rtt ms"))
+    for n in nodes:
+        for path in ("node", "vm-out", "vm-in"):
+            p = n["paths"][path]
+            print("  %-30s %-7s %8s %8s %8s %8s %8s" % (n["node"] + (" (route)" if n["route_node"] else ""), path,
+                                                     f(p["in_1"]), f(p["in_4"]), f(p["out_1"]), f(p["out_4"]),
+                                                     "-" if p["rtt_ms"] is None else "%.3f" % p["rtt_ms"]))
+        for e in n["errors"]:
+            print("    error: %s" % e[:200])
+    return 0
+
+
 def main(argv):
     cmds = {
         "nodes": (cmd_nodes, 0), "meta": (cmd_meta, 0), "imagestatus": (cmd_imagestatus, 0),
@@ -873,6 +971,8 @@ def main(argv):
         return cmd_quota(argv[2])
     if len(argv) == 3 and argv[1] == "contention":
         return cmd_contention(argv[2])
+    if len(argv) == 3 and argv[1] == "vpc":
+        return cmd_vpc(argv[2])
     if len(argv) == 5 and argv[1] == "promq":
         return cmd_promq(*argv[2:])
     if len(argv) == 3 and argv[1] == "podmonitor":

@@ -36,6 +36,7 @@ MEMORY="8Gi"
 ROOT_SIZE="10Gi"
 DATA_SIZE="10Gi"
 DATA_SC=""
+DATA_VOLUME_MODE="Block"
 BENCH_NODE=""
 PEER_NODE=""
 # Dated, not "release" or "latest": both images are part of what is compared.
@@ -63,6 +64,9 @@ CONTENTION_PREFILL="false"
 # Budget for the pre-fill, added to the prep time. At gp3's baseline the whole
 # cluster writes 125 MiB/s, so six 10 GiB disks take about 8 minutes.
 CONTENTION_FILL_SECONDS=900
+VPC_NETWORK=""
+VPC_PEER=""
+VPC_ROUTE_NODE=""
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HVG=(python3 -I "$HERE/guest/hvg.py")
@@ -111,9 +115,23 @@ Usage: $0 [options]
                       schedule, so the phases measure overwrites rather than
                       first writes to thin, unallocated Longhorn space. Adds
                       --contention-fill-seconds (default ${CONTENTION_FILL_SECONDS}) to the prep.
+  --vpc-network NS/NAD
+                      Instead of the VM/pod comparison: network between the
+                      host running this script and, on each node in turn, the
+                      node itself (hostNetwork) and a VM whose only NIC is on
+                      this overlay VM Network. Measures connections the VM
+                      opens (SNATed at its node) and connections this host
+                      opens to the VM's overlay address (through the node the
+                      VPC route names). Needs iperf3 here, the VPC route, and
+                      this host inside the cluster's overlay client CIDR.
+  --vpc-route-node N  Node the VPC route for the overlay CIDR points at, so
+                      the results can mark it. Recorded only.
   --memory Q          Memory per VM and pod. Default: ${MEMORY}
   --data-size Q       Longhorn data disk for fio. Default: ${DATA_SIZE}
   --storage-class SC  Data disk storage class. Default: the cluster default.
+  --data-volume-mode M
+                      Block (default) or Filesystem, for storage with no block
+                      mode such as EFS. VMs only: refused with pod mode.
   --bench-node N      Node for the benchmark. Default: first schedulable node.
   --peer-node N       Node for the network peer. Default: the next one (the
                       same node on a single-node cluster, which is recorded).
@@ -141,6 +159,7 @@ while [[ $# -gt 0 ]]; do
         --memory)        MEMORY="$2"; shift 2 ;;
         --data-size)     DATA_SIZE="$2"; shift 2 ;;
         --storage-class) DATA_SC="$2"; shift 2 ;;
+        --data-volume-mode) DATA_VOLUME_MODE="$2"; shift 2 ;;
         --bench-node)    BENCH_NODE="$2"; shift 2 ;;
         --peer-node)     PEER_NODE="$2"; shift 2 ;;
         --image-url)     IMAGE_URL="$2"; shift 2 ;;
@@ -156,6 +175,8 @@ while [[ $# -gt 0 ]]; do
         --contention-prep) CONTENTION_PREP="$2"; shift 2 ;;
         --contention-prefill) CONTENTION_PREFILL="true"; shift ;;
         --contention-fill-seconds) CONTENTION_FILL_SECONDS="$2"; shift 2 ;;
+        --vpc-network)   VPC_NETWORK="$2"; shift 2 ;;
+        --vpc-route-node) VPC_ROUTE_NODE="$2"; shift 2 ;;
         --keep)          KEEP="true"; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -163,8 +184,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in both|vm|pod) ;; *) echo "ERROR: --mode must be both, vm or pod" >&2; exit 1 ;; esac
+case "$DATA_VOLUME_MODE" in Block|Filesystem) ;; *) echo "ERROR: --data-volume-mode must be Block or Filesystem" >&2; exit 1 ;; esac
 want() { [ "$MODE" = "both" ] || [ "$MODE" = "$1" ]; }
 [[ "$NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { echo "ERROR: bad --namespace" >&2; exit 1; }
+if [ "$DATA_VOLUME_MODE" = "Filesystem" ] && [ "$CONTENTION" -eq 0 ] && [ -z "$VPC_NETWORK" ] && want pod; then
+    echo "ERROR: --data-volume-mode Filesystem is VM-only (the pod uses a raw block device): add --mode vm" >&2; exit 1
+fi
 [[ "$VCPUS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --vcpus takes a positive integer" >&2; exit 1; }
 [[ "$SUSTAINED" =~ ^[0-9]+$ ]] || { echo "ERROR: --sustained takes seconds" >&2; exit 1; }
 for n in "$CONTENTION" "$CONTENTION_SECONDS" "$CONTENTION_PREP" "$CONTENTION_FILL_SECONDS"; do
@@ -180,6 +205,8 @@ for q in "$MEMORY" "$DATA_SIZE" "$ROOT_SIZE"; do
     [[ "$q" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || { echo "ERROR: '$q' is not a quantity like 8Gi" >&2; exit 1; }
 done
 
+[[ -z "$VPC_NETWORK" || "$VPC_NETWORK" =~ ^[a-z0-9-]+/[a-z0-9.-]+$ ]] || { echo "ERROR: --vpc-network takes NAMESPACE/NAD" >&2; exit 1; }
+[[ -z "$VPC_NETWORK" ]] || command -v iperf3 >/dev/null || { echo "ERROR: --vpc-network needs iperf3 on this host" >&2; exit 1; }
 command -v kubectl >/dev/null || { echo "ERROR: kubectl not found" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "ERROR: python3 not found" >&2; exit 1; }
 kubectl version >/dev/null 2>&1 || { echo "ERROR: kubectl cannot reach the cluster" >&2; exit 1; }
@@ -247,6 +274,15 @@ echo "    mode ${MODE}: bench on ${BENCH_NODE}, peer on ${PEER_NODE}$([ "$SAME_N
 echo "    ${VCPUS} vCPU / ${MEMORY} each, VM CPU limit ${VM_CPU_LIMIT:-$VCPUS}, VM net multiqueue ${MULTIQUEUE}, data disk ${DATA_SIZE} on ${DATA_SC} ${DATA_SC_PARAMS}"
 [ -z "$OVERCOMMIT" ] || echo "    overcommit-config: ${OVERCOMMIT}"
 
+if [ -n "$VPC_NETWORK" ]; then
+    kubectl get network-attachment-definitions -n "${VPC_NETWORK%%/*}" "${VPC_NETWORK#*/}" >/dev/null 2>&1 \
+        || { echo "ERROR: VM Network ${VPC_NETWORK} not found (namespace/name of its NetworkAttachmentDefinition)" >&2; exit 1; }
+    NODE_IP="$(kubectl get node "$BENCH_NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')"
+    VPC_PEER="$(ip -o route get "$NODE_IP" | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+    [ -n "$VPC_PEER" ] || { echo "ERROR: cannot tell this host's address toward ${NODE_IP}" >&2; exit 1; }
+    echo "    VPC test: this host ${VPC_PEER} against each node and a VM on ${VPC_NETWORK}${VPC_ROUTE_NODE:+; VPC route -> ${VPC_ROUTE_NODE}}"
+fi
+
 write_meta() {
     LABEL="$LABEL" RUN_ID="$RUN_ID" HARVESTER="$HARVESTER" KUBE="$KUBE" ARCH="$ARCH" \
     VCPUS="$VCPUS" MEMORY="$MEMORY" DATA_SIZE="$DATA_SIZE" DATA_SC="$DATA_SC" \
@@ -255,6 +291,7 @@ write_meta() {
     SUSTAINED="$SUSTAINED" PGBENCH="$PGBENCH" CONTENTION="$CONTENTION" CONTENTION_START="$CONTENTION_START" \
     CONTENTION_SECONDS="$CONTENTION_SECONDS" CONTENTION_GAP="$CONTENTION_GAP" CONTENTION_NODES="$CONTENTION_NODES" \
     CONTENTION_PREFILL="$CONTENTION_PREFILL" \
+    VPC_NETWORK="$VPC_NETWORK" VPC_PEER="$VPC_PEER" VPC_ROUTE_NODE="$VPC_ROUTE_NODE" \
     "${HVG[@]}" meta > "$OUT/meta.json"
 }
 write_meta
@@ -304,6 +341,7 @@ cg_stop() {
 
 cleanup() {
     local rc=$?
+    [ -z "${VPC_IPERF_PID:-}" ] || kill "$VPC_IPERF_PID" 2>/dev/null || true
     cg_stop
     collect_sampler || true
     if [ "$KEEP" = "true" ]; then
@@ -341,10 +379,10 @@ pod_ip() {   # pod-name -> IP once Running (or already finished), else exits
     exit 1
 }
 
-# wait_results DIR LOG_FN: poll LOG_FN (which writes DIR/bench.log and
-# DIR/peer.log) until the bench side reports DONE or FAIL, then decode.
+# wait_results DIR LOG_FN [nopeer]: poll LOG_FN (which writes DIR/bench.log
+# and DIR/peer.log) until the bench side reports DONE or FAIL, then decode.
 wait_results() {
-    local dir="$1" fetch="$2" state="none" last="" peer_state deadline
+    local dir="$1" fetch="$2" nopeer="${3:-}" state="none" last="" peer_state deadline
     deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         "$fetch"
@@ -356,8 +394,10 @@ wait_results() {
         sleep 30
     done
     "$fetch"
-    peer_state="$("${HVG[@]}" status "$dir/peer.log" 2>/dev/null || echo none)"
-    [ "$peer_state" = "ready" ] || echo "WARNING: peer state '${peer_state}'; network tests will have failed."
+    if [ -z "$nopeer" ]; then
+        peer_state="$("${HVG[@]}" status "$dir/peer.log" 2>/dev/null || echo none)"
+        [ "$peer_state" = "ready" ] || echo "WARNING: peer state '${peer_state}'; network tests will have failed."
+    fi
     case "$state" in
         done) "${HVG[@]}" decode "$dir/bench.log" "$dir/result.json" | sed 's/^/    /' ;;
         fail:*) echo "ERROR: the benchmark reported failure: ${state#fail:} (see $dir/bench.log)" >&2
@@ -440,7 +480,7 @@ create_vm() {   # role node peer-ip image-sc [name]
     "${HVG[@]}" userdata "$role" "$HERE/guest/bench.py" ${peer:+"$peer"} > "$OUT/manifests/${name}-userdata.yaml"
     k create secret generic "${name}-cloudinit" --from-file=userdata="$OUT/manifests/${name}-userdata.yaml" \
         --dry-run=client -o json | k apply -f - >/dev/null
-    MULTIQUEUE="$MULTIQUEUE" VM_CPU_LIMIT="$VM_CPU_LIMIT" "${HVG[@]}" vm "$name" "$NAMESPACE" "$role" "$node" "${NAMESPACE}/${IMAGE_NAME}" "$image_sc" "$DATA_SC" \
+    DATA_VOLUME_MODE="$DATA_VOLUME_MODE" VM_NETWORK="${VM_NETWORK:-}" MULTIQUEUE="$MULTIQUEUE" VM_CPU_LIMIT="$VM_CPU_LIMIT" "${HVG[@]}" vm "$name" "$NAMESPACE" "$role" "$node" "${NAMESPACE}/${IMAGE_NAME}" "$image_sc" "$DATA_SC" \
         "$VCPUS" "$MEMORY" "$ROOT_SIZE" "$DATA_SIZE" "${name}-cloudinit" "$ARCH" "$RUN_ID" \
         | tee "$OUT/manifests/${name}.json" | k apply -f - >/dev/null
     # Harvester's VM controller creates the PVCs from the volumeClaimTemplates
@@ -578,9 +618,82 @@ run_contention() {
     "${HVG[@]}" contention "$OUT"
 }
 
+# --- VPC mode --------------------------------------------------------------------
+VPC_IPERF_PID=""
+wait_port() {   # ip port seconds
+    local deadline=$(( $(date +%s) + $3 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null && return 0
+        sleep 5
+    done
+    return 1
+}
+
+# From this host to TARGET: 30 s each, 1 and 4 streams, each direction, then
+# 100 pings. Files PREFIX-tcp-{1,4}[-reverse].json and PREFIX-ping.txt.
+vpc_client_tests() {   # target prefix
+    local s r
+    for s in 1 4; do
+        for r in "" "-reverse"; do
+            iperf3 -c "$1" -p 5201 -t 30 -P "$s" ${r:+-R} -J > "$2-tcp-${s}${r}.json" 2>/dev/null || true
+        done
+    done
+    ping -c 100 -i 0.2 -q "$1" > "$2-ping.txt" 2>&1 || true
+}
+
+run_vpc() {
+    local vdir="$OUT/vpc" node d ip
+    mkdir -p "$vdir"
+    import_image
+    # This host's iperf3 server, for connections the VMs open.
+    iperf3 -s -D -p 5201 --pidfile "$vdir/iperf3.pid" >/dev/null 2>&1 \
+        || { echo "ERROR: cannot start iperf3 -s on port 5201 here (already running?)" >&2; exit 1; }
+    VPC_IPERF_PID="$(cat "$vdir/iperf3.pid" 2>/dev/null || true)"
+    k create configmap hvg-program --from-file=bench.py="$HERE/guest/bench.py" \
+        --dry-run=client -o json | k apply -f - >/dev/null
+    # One node at a time, so no two tests share a link.
+    for node in "${CANDIDATES[@]}"; do
+        d="$vdir/$node"
+        mkdir -p "$d"
+        echo "==> VPC: ${node}$([ "$node" = "$VPC_ROUTE_NODE" ] && echo ' (the VPC route node)')"
+        HOST_NETWORK=true "${HVG[@]}" pod hvg-host-peer "$NAMESPACE" peer "$node" "$POD_IMAGE" hvg-program "$VCPUS" "$MEMORY" \
+            | tee "$OUT/manifests/host-peer-${node}.json" | k apply -f - >/dev/null
+        ip="$(pod_ip hvg-host-peer)"
+        if wait_port "$ip" 5201 600; then
+            echo "    node ${ip}: host network"
+            vpc_client_tests "$ip" "$d/node"
+        else
+            echo "WARNING: node ${node}'s iperf3 never listened; no node figures"
+        fi
+        k delete pod hvg-host-peer --wait=true --timeout=120s >/dev/null 2>&1 || true
+
+        VM_NETWORK="$VPC_NETWORK" create_vm vpc "$node" "$VPC_PEER" "$IMAGE_SC" hvg-vpc
+        pod_ip "$(launcher_pod hvg-vpc)" >/dev/null
+        echo "    VM running; its tests first, then this host's"
+        fetch_vpc_logs() { local pod; pod="$(k get pod -l vm.kubevirt.io/name=hvg-vpc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+                           [ -n "$pod" ] && k logs "$pod" -c guest-console-log > "$d/bench.log" 2>/dev/null || true; }
+        wait_results "$d" fetch_vpc_logs nopeer
+        k get vmi hvg-vpc -o json > "$d/vmi.json" 2>/dev/null || true
+        ip="$(k get vmi hvg-vpc -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || true)"
+        if [ -n "$ip" ] && wait_port "$ip" 5201 120; then
+            echo "    VM ${ip}: from this host"
+            vpc_client_tests "$ip" "$d/inbound"
+        else
+            echo "WARNING: cannot reach the VM's overlay address '${ip}' on 5201 from here (VPC route? security group?)"
+        fi
+        k delete vm hvg-vpc --wait=true --timeout=300s >/dev/null 2>&1 || true
+        k delete pvc hvg-vpc-rootdisk hvg-vpc-datadisk --wait=true --timeout=300s >/dev/null 2>&1 || true
+    done
+    [ -z "$VPC_IPERF_PID" ] || kill "$VPC_IPERF_PID" 2>/dev/null || true
+    VPC_IPERF_PID=""
+    "${HVG[@]}" vpc "$OUT"
+}
+
 # --- run ---------------------------------------------------------------------
 # One mode at a time, never overlapping: each is the other's baseline.
-if [ "$CONTENTION" -gt 0 ]; then
+if [ -n "$VPC_NETWORK" ]; then
+    run_vpc
+elif [ "$CONTENTION" -gt 0 ]; then
     run_contention
 else
     if want vm; then run_vm; fi
