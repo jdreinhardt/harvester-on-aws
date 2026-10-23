@@ -624,9 +624,9 @@ Resources:
           - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
-          # 1: configure.sh fetches user-data from the host itself. Anything
-          # higher lets pods read user-data, which holds the cluster token.
-          HttpPutResponseHopLimit: 1
+          # 2: pods can reach IMDS, which the EFS CSI controller needs (README,
+          # "EFS for VM disks"). Pods can also read user-data (the cluster token).
+          HttpPutResponseHopLimit: 2
           HttpEndpoint: enabled
         BlockDeviceMappings:
           - DeviceName: /dev/sda1
@@ -701,9 +701,9 @@ Resources:
           - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
-          # 1: configure.sh fetches user-data from the host itself. Anything
-          # higher lets pods read user-data, which holds the cluster token.
-          HttpPutResponseHopLimit: 1
+          # 2: pods can reach IMDS, which the EFS CSI controller needs (README,
+          # "EFS for VM disks"). Pods can also read user-data (the cluster token).
+          HttpPutResponseHopLimit: 2
           HttpEndpoint: enabled
         BlockDeviceMappings:
           - DeviceName: /dev/sda1
@@ -780,9 +780,9 @@ Resources:
           - NestedVirtualization: enabled
         MetadataOptions:
           HttpTokens: required
-          # 1: configure.sh fetches user-data from the host itself. Anything
-          # higher lets pods read user-data, which holds the cluster token.
-          HttpPutResponseHopLimit: 1
+          # 2: pods can reach IMDS, which the EFS CSI controller needs (README,
+          # "EFS for VM disks"). Pods can also read user-data (the cluster token).
+          HttpPutResponseHopLimit: 2
           HttpEndpoint: enabled
         BlockDeviceMappings:
           - DeviceName: /dev/sda1

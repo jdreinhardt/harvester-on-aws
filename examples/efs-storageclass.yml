@@ -1,0 +1,21 @@
+# StorageClass for VM disks on Amazon EFS, through the AWS EFS CSI driver.
+# See the README, "EFS for VM disks", for the IAM role, security group rule and
+# driver install this needs first.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap               # one EFS access point per PVC (dynamic provisioning)
+  fileSystemId: <fs-xxxxxxxxxxxxxxxxx>   # your EFS file system
+  directoryPerms: "700"
+  basePath: /harvester                   # every access point's directory goes under this
+  # Required for VM disks. KubeVirt creates disk.img on the volume and chowns it
+  # to QEMU's user, 107. An access point makes every NFS call as its own user,
+  # 50000 by default, which may not give a file away to 107, so the VM never
+  # starts ("preparing host-disks failed: chown ... operation not permitted").
+  uid: "107"
+  gid: "107"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate

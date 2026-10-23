@@ -204,13 +204,12 @@ resource "aws_instance" "node" {
     }
   }
 
-  # IMDSv2 only; /oem/aws/configure.sh does the token handshake from the host,
-  # so a hop limit of 1 is all it needs. Nothing else here uses IMDS -- no
-  # instance role, no cloud controller -- and a higher limit would let any pod
-  # read user-data, which holds the cluster token and any password hash.
+  # IMDSv2 only; /oem/aws/configure.sh does the token handshake. Hop limit 2 so
+  # pods can reach IMDS: the EFS CSI controller runs on the pod network and
+  # exits without it.
   metadata_options {
     http_tokens                 = "required"
-    http_put_response_hop_limit = 1
+    http_put_response_hop_limit = 2
     http_endpoint               = "enabled"
   }
 

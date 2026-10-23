@@ -1480,6 +1480,48 @@ kubectl get subnet <name> -o jsonpath='{.spec.mtu}{"\n"}'
 Guests need a new lease to pick up a changed value — reboot the VM, or renew
 its DHCP lease.
 
+### Known issue: kube-ovn's databases do not survive a node reboot
+
+`ovn-central` keeps each member's OVN Raft database on its node, in hostPath
+`/etc/origin/ovn`. On the Harvester node OS, `/etc` is a writable overlay on
+tmpfs and only the paths in `PERSISTENT_STATE_PATHS` persist; `/etc/origin`
+is not one of them. Every reboot of a node wipes that member's copy, and its
+`ovn-central` rejoins as a **new** member while the cluster keeps listing the
+old one. The first reboot leaves a four-member cluster with one dead member;
+**the second leaves too few live members to elect a leader**, and all three
+`ovn-central` pods crash-loop with `ovn-nbctl: ... database connection failed
+(Connection refused)`, each node's `ovn-appctl -t /var/run/ovn/ovnnb_db.ctl
+cluster/status OVN_Northbound` showing "disconnected from the cluster
+(election timeout)". Overlay VMs keep their existing connectivity, but nothing
+about the overlay can change while it is down. Found in perf testing
+(perf/FINDINGS.md, "Node failure").
+
+**Not fixed in this repository.** Two ways to prevent it: add `/etc/origin/ovn`
+to the node's persistent paths, or point kube-ovn's database at a path that
+is already persistent.
+
+**Recovering a deadlocked cluster: not verified end to end.** An attempt on
+the perf cluster was stopped before step 3 and the cluster torn down, so
+treat these as the planned steps, not a tested procedure. `cluster/kick`
+needs a leader, so rebuild from a surviving member's database, for each of
+the northbound and southbound databases:
+
+1. Back up `/etc/origin/ovn` on every node (to `/home`, which persists).
+2. Scale the kube-ovn operator (`kubeovn-operator-controller-manager`) to 0
+   first: it owns `ovn-central` and would restore its replicas. Then scale
+   `ovn-central` to 0.
+3. Seed from the **first address in `ovn-central`'s `NODE_IPS`**: kube-ovn's
+   `start-db.sh` bootstraps a new cluster only on that node. With `ovsdb-tool`
+   from the kube-ovn image (a temporary pod mounting `/etc/origin/ovn`):
+   `cluster-to-standalone`, then `create-cluster` at that node's Raft
+   address (`tcp:[<ip>]:6643` northbound, `6644` southbound), replacing
+   `ovn{nb,sb}_db.db`, owned by 65534. Move its `ovn{nb,sb}_db.hdr` aside.
+4. On the other nodes, move `ovn{nb,sb}_db.db` **and** `ovn{nb,sb}_db.hdr`
+   aside. With a header left in place, `start-db.sh` rejoins the old
+   cluster.
+5. Scale `ovn-central` and the operator back to their replica counts, and
+   check that `cluster/status` lists three members and a leader.
+
 ### natOutgoing — check it is set
 
 **v1.9.0 exposes `natOutgoing` in the UI. Earlier releases do not.**
@@ -1653,6 +1695,144 @@ Sources: [Setting up Layer 2 Networking on Amazon EC2](https://aws.amazon.com/bl
 [Limit (filter) traffic by MAC address](https://repost.aws/questions/QU3QRvQ45jTxiF6Hw1asP-KQ/limit-filter-traffic-by-mac-address).
 
 ---
+
+## EFS for VM disks
+
+VM disks can live on Amazon EFS through the
+[AWS EFS CSI driver](https://github.com/kubernetes-sigs/aws-efs-csi-driver),
+with an EFS access point created for each volume. Nothing here sets this up
+for you: the IAM role and the NFS rule are deliberate, manual steps, so that no
+cluster gets them without someone choosing to.
+
+Verified on v1.8.2 (x86, 2026-10-22): a VM's **data disk** on EFS, applied as a
+VM manifest. Not yet verified: a root disk on EFS, or creating the volume
+through the Harvester UI.
+
+### Known limitations
+
+* **No VM backups.** Harvester backs up only Longhorn volumes. For every other
+  CSI driver its backup ability is fixed at *no* (`pkg/webhook/util/snapshot.go`,
+  `defaultAbility()`), and the check covers all of a VM's volumes, so one EFS
+  disk makes the whole VM unbackupable.
+* **No VM snapshots.** Harvester snapshots a third-party volume through the
+  VolumeSnapshotClass named for its driver in the `csi-driver-config`
+  setting. The EFS CSI driver does not implement CSI snapshots, so there is
+  no class to name.
+* **Leave EFS out of `csi-driver-config`.** That setting is read only for VM
+  backups and snapshots, so EFS volumes work without an entry. The UI insists
+  on a snapshot class name before it adds a driver there, and EFS has none.
+* **Data protection for EFS volumes is outside Harvester**, for example AWS
+  Backup on the file system. Not tested here.
+* **Deleting a volume does not delete its data.** With the chart's default
+  `controller.deleteAccessPointRootDir: false`, deleting a PVC removes its
+  access point but leaves its directory and data under the StorageClass's
+  `basePath`, still billed. On the perf cluster that left 77 GiB behind after
+  the test volumes were deleted. Clean up under `basePath` by hand, or set
+  that chart value (not tested here).
+
+### Before you start
+
+* **An EFS file system** in the cluster's VPC, with a **mount target in the
+  nodes' Availability Zone**. A mount resolves the file system's DNS name to
+  the mount target in the client's own zone, so the nodes' zone needs one.
+  Tested with General Purpose performance mode and Elastic throughput.
+* **DNS resolution and DNS hostnames enabled on the VPC**, for that name. Both
+  are on in a default VPC.
+
+### Steps
+
+**1. Instance metadata hop limit 2.** Every launch path in this repository
+already sets it. The EFS controller runs on the pod network, one hop further
+from instance metadata than the node, and at a hop limit of 1 it fails with:
+
+```
+could not get metadata: did not find aws instance ID in node providerID string
+```
+
+It falls back to the node's `providerID` and finds RKE2's `rke2://<node>`,
+which holds no AWS instance ID.
+
+**2. An instance role for the nodes.** The controller creates an access point
+per volume through the EFS API, with the credentials of the node it runs on
+(RKE2 has no OIDC provider for IRSA). AWS's managed policy covers it:
+
+```bash
+aws iam create-role --role-name harvester-efs-csi \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name harvester-efs-csi \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy
+aws iam create-instance-profile --instance-profile-name harvester-efs-csi
+aws iam add-role-to-instance-profile --instance-profile-name harvester-efs-csi \
+  --role-name harvester-efs-csi
+
+# For each node:
+aws ec2 associate-iam-instance-profile --instance-id i-xxxxxxxx \
+  --iam-instance-profile Name=harvester-efs-csi
+```
+
+A later `tofu apply` of the Terraform module leaves an associated profile in
+place. **With a hop limit of 2, every pod on a node can use this role**, as
+well as read the node's user-data (see [Notes and gotchas](#notes-and-gotchas)).
+
+**3. NFS from the nodes to the mount targets.** Nodes mount EFS over NFS, TCP
+port 2049, to the mount target in their zone. One inbound rule allows it, on
+the mount targets' security group; nothing changes on the nodes' side. Without
+it, mounts hang. The two groups:
+
+* **`sg-<mount-targets>`**: the security group on the EFS file system's **mount
+  targets**. Each mount target has its own, so check them all. In the console,
+  the file system's **Network** tab; or:
+
+  ```bash
+  aws efs describe-mount-targets --file-system-id fs-<id> \
+    --query 'MountTargets[].MountTargetId' --output text
+  aws efs describe-mount-target-security-groups --mount-target-id fsmt-<id>
+  ```
+
+* **`sg-<nodes>`**: the security group on the Harvester nodes. Terraform:
+  `tofu output security_group_id`; CloudFormation: the stack's node security
+  group; or any node's **Security** tab in the EC2 console.
+
+```bash
+aws ec2 authorize-security-group-ingress --group-id sg-<mount-targets> \
+  --ip-permissions 'IpProtocol=tcp,FromPort=2049,ToPort=2049,UserIdGroupPairs=[{GroupId=sg-<nodes>}]'
+```
+
+The source is the nodes' group rather than an address range, so nodes added
+or replaced later are covered, and nothing else in the subnet is. Replies need
+no rule: security groups are stateful, and the nodes already allow all
+outbound traffic. Adding the nodes to the mount targets' group instead would
+also work, but if that group allows all traffic from itself, as a VPC's
+default group does, it opens much more than NFS.
+
+**4. Install the driver with its default values.**
+
+```bash
+helm repo add aws-efs-csi-driver https://kubernetes-sigs.github.io/aws-efs-csi-driver/
+helm upgrade --install aws-efs-csi-driver aws-efs-csi-driver/aws-efs-csi-driver \
+  --namespace kube-system
+```
+
+Tested with chart 4.5.2 (driver 3.5.2).
+
+**5. Create the StorageClass** from
+[`examples/efs-storageclass.yml`](examples/efs-storageclass.yml), with your
+file system ID. `provisioningMode: efs-ap` is the driver's only mode for EFS:
+it creates one access point per volume, up to 10,000 per file system. The
+other mode, `s3files-ap`, is for Amazon S3 Files file systems. For static
+provisioning instead, without the controller or the IAM role, see the driver's
+[static provisioning example](https://github.com/kubernetes-sigs/aws-efs-csi-driver/tree/master/examples/kubernetes/static_provisioning).
+A StorageClass's parameters cannot be changed after it is created; delete it
+and create it again. Its `uid` and `gid` of 107 are required for VM disks: without
+them the VM never starts, with
+`preparing host-disks failed: chown /proc/self/fd/NN: operation not permitted`.
+
+**6. Use it for a VM disk in Filesystem mode** (`volumeMode: Filesystem`; EFS
+has no block mode). KubeVirt keeps the disk as `disk.img` on the volume; the
+guest still sees an ordinary virtio disk.
+
+---
+
 
 ## Watching a bootstrap
 
@@ -1857,7 +2037,8 @@ The same values stay in the instance's EC2 user-data for its whole life, so
 `ec2:DescribeLaunchTemplateVersions`) amounts to read access to the token —
 CloudFormation's `NoEcho` and Terraform's `sensitive` do not change that, and
 Terraform state holds it in plain text. Every launch path sets the IMDS hop
-limit to 1 so pods on the node cannot fetch it.
+limit to 2, which the EFS CSI controller needs, so **pods on the node can fetch
+it** too, along with the credentials of any instance role attached for EFS.
 
 **An OS upgrade replaces `active.img`**, reverting the `bootargs.cfg` console
 and `net.ifnames` patches. The `grubcustom` copy is the fallback; after an

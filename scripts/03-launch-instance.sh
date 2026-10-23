@@ -603,12 +603,10 @@ LAUNCH_ARGS=(
     --security-group-ids "$SG"
     # Encrypted: Longhorn's data partition -- every VM disk -- is on this volume.
     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${VOLUME_SIZE},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true,\"Encrypted\":true}}]"
-    # IMDSv2 only. /oem/aws/configure.sh does the token handshake from the host
-    # network namespace, so a hop limit of 1 is all it needs. Nothing else here
-    # uses IMDS -- there is no instance role and no cloud controller -- and a
-    # higher limit would let any pod read user-data, which holds the cluster
-    # token and any password hash.
-    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
+    # IMDSv2 only. Hop limit 2 so pods can reach IMDS, which the EFS CSI
+    # controller needs (README, "EFS for VM disks"). Pods can also read
+    # user-data, which holds the cluster token and any password hash.
+    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled"
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME_TAG}}]"
     --user-data "file://$USERDATA_FILE"
 )
