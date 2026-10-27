@@ -1696,6 +1696,68 @@ Sources: [Setting up Layer 2 Networking on Amazon EC2](https://aws.amazon.com/bl
 
 ---
 
+## A second disk for VM data
+
+Each node's root volume holds the OS, etcd and, by default, Longhorn's disk,
+so every VM write competes with etcd (perf/FINDINGS.md). Giving each node a
+second EBS volume for VM data keeps them apart: in testing, VMs saturating
+the second disks left the root volumes idle and etcd at its idle latency,
+with the root volume still at gp3 baseline. Nothing here sets this up for
+you; these are manual steps on a running cluster.
+
+Verified on v1.8.2 (3 × `m8i.16xlarge`, 2026-10-26) for VM **data** disks.
+Not yet verified: root (image) disks on the second disk.
+
+**1. Create and attach one volume per node**, in the nodes' Availability
+Zone (EBS volumes attach only within their zone):
+
+```bash
+aws ec2 create-volume --availability-zone us-east-2a --volume-type gp3 \
+  --size 500 --iops 16000 --throughput 1000 --encrypted \
+  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=<cluster>-node-N-vmdata}]'
+aws ec2 attach-volume --volume-id vol-xxxxxxxx --instance-id i-xxxxxxxx --device /dev/sdf
+```
+
+The volume appears on the node as a second NVMe disk (`/dev/nvme1n1`).
+These volumes are not in Terraform: they survive `tofu destroy` and keep
+costing until deleted by hand.
+
+**2. Add each disk to Longhorn with the same tag**, for example `vmdata`
+(Harvester UI: **Hosts → Edit → Disks**, add the disk, set a disk tag).
+**Every node's disk needs the tag**: with three replicas and only two tagged
+disks, a volume cannot place its third replica.
+
+**3. Create a StorageClass that selects the tag**, and use it for VM disks:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: xtradisk-vmdata
+provisioner: driver.longhorn.io
+parameters:
+  diskSelector: vmdata
+  numberOfReplicas: "3"
+  staleReplicaTimeout: "30"
+  migratable: "true"
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+```
+
+Notes:
+
+* **Volumes without a disk selector can land on the second disks too.** The
+  default `harvester-longhorn` StorageClass has none, so Longhorn uses any
+  schedulable disk; on the test cluster, some of the monitoring add-on's
+  replicas went to the second disks. To keep a disk for tagged volumes only,
+  every other StorageClass would need a selector of its own.
+* **The root volume can stay at gp3 baseline** once VM data is elsewhere: it
+  carried etcd, the OS, images and monitoring at about 60 writes/s.
+* **The instance's EBS bandwidth is shared** by every volume on a node, so a
+  second disk separates the volumes' limits but not the instance's. Size the
+  instance for the root and data disks together.
+
 ## EFS for VM disks
 
 VM disks can live on Amazon EFS through the

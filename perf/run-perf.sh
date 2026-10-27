@@ -295,8 +295,11 @@ if [ -n "$GUEST_VPC_NETWORK" ]; then
     done
     echo "    VPC route to the overlay: ${VPC_ROUTE_NODE:-none found targeting a cluster node}"
 fi
+# The root volume specifically: a node can also have data disks attached.
+NODE1_ROOT_DEV="$(aws ec2 describe-instances --instance-ids "$NODE1_ID" \
+    --query 'Reservations[0].Instances[0].RootDeviceName' --output text 2>/dev/null || true)"
 read -r VOL_TYPE VOL_SIZE VOL_IOPS VOL_TPUT <<<"$(aws ec2 describe-volumes \
-    --filters "Name=attachment.instance-id,Values=${NODE1_ID}" \
+    --filters "Name=attachment.instance-id,Values=${NODE1_ID}" "Name=attachment.device,Values=${NODE1_ROOT_DEV}" \
     --query 'Volumes[0].[VolumeType,Size,Iops,Throughput]' --output text 2>/dev/null || true)"
 
 # --- launch the runner ------------------------------------------------------
