@@ -20,3 +20,6 @@ results/
 *.tfvars.json
 
 __pycache__/
+
+# vip-controller
+*.tar.gz

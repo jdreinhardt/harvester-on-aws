@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "FindVipHolder",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeNetworkInterfaces",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ClaimVipInClusterSubnet",
+      "Effect": "Allow",
+      "Action": "ec2:AssignPrivateIpAddresses",
+      "Resource": "arn:aws:ec2:REGION:ACCOUNT_ID:network-interface/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:Subnet": "arn:aws:ec2:REGION:ACCOUNT_ID:subnet/SUBNET_ID"
+        }
+      }
+    }
+  ]
+}

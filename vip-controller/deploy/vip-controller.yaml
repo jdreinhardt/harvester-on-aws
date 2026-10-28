@@ -1,0 +1,97 @@
+# vip-controller: moves the VIP's secondary IP to whichever control-plane node
+# holds kube-vip's lease. See vip-controller/README.md.
+#
+# Before applying: set VIP below, import the image on every node (README), and
+# attach deploy/iam-policy.json to the nodes' instance role.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vip-controller
+  namespace: harvester-system
+---
+# Read access to kube-vip's lease and the optional routes ConfigMap, nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vip-controller
+  namespace: harvester-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["plndr-svcs-lock"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["vip-controller-routes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vip-controller
+  namespace: harvester-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vip-controller
+subjects:
+  - kind: ServiceAccount
+    name: vip-controller
+    namespace: harvester-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vip-controller
+  namespace: harvester-system
+  labels:
+    app.kubernetes.io/name: vip-controller
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vip-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vip-controller
+    spec:
+      serviceAccountName: vip-controller
+      # Control-plane nodes only. Joined nodes start as agents and get this
+      # label when promoted, so the pod follows promotion on its own.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      # Like kube-vip: no dependence on the CNI during a failover, and instance
+      # metadata is one hop away.
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: vip-controller
+          image: harvester-aws/vip-controller:0.2.0
+          # Imported from an archive on each node; never pulled.
+          imagePullPolicy: Never
+          env:
+            - name: VIP
+              value: "SET-ME"  # the cluster VIP, e.g. 172.31.0.182
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Talk to this node's own API server rather than the service IP,
+            # so the controller needs nothing but the node it runs on.
+            - name: KUBERNETES_SERVICE_HOST
+              value: "127.0.0.1"
+            - name: KUBERNETES_SERVICE_PORT
+              value: "6443"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
