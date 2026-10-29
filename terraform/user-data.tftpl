@@ -9,6 +9,9 @@ aws:
 %{ if etcd_expose_metrics ~}
   etcd_expose_metrics: true
 %{ endif ~}
+%{ if vip_controller ~}
+  vip_controller: true
+%{ endif ~}
 scheme_version: 1
 token: "${cluster_token}"
 %{ if server_url != "" ~}

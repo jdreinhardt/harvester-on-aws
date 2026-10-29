@@ -2,7 +2,8 @@
 
 Makes the VPC follow kube-vip's election, so the Harvester VIP fails over on
 EC2. Optionally, VPC routes follow it too. Status: **both have been run on a
-cluster by hand (results below); not yet built into the image.** The
+cluster by hand (results below). Every AMI from `make ami` now carries the
+image; that AMI path has not been run yet.** The
 design and the reasoning behind it are in the main README, under "The VIP does
 not fail over" → "Proposed design".
 
@@ -168,7 +169,48 @@ the hop limit does not matter for it. **Every pod on a node can use this
 role**, though, because the hop limit is 2 for EFS (main README, "Notes and
 gotchas").
 
-## Try it on a test cluster
+## In the AMI
+
+`make ami` builds the archive for the AMI's architecture (`make
+vip-controller`, needs docker) and phase 2 stages it with the manifest on
+`COS_OEM`. On first boot:
+
+* **Every node** copies the image into `/var/lib/rancher/rke2/agent/images/`,
+  and RKE2 imports it whenever it starts. Always, whatever the flag says.
+* **With `aws.vip_controller: true`** (Terraform `vip_controller = true`,
+  CloudFormation `VipController=true`, or `03-launch-instance.sh
+  --vip-controller` on the first node), the
+  node that creates the cluster also writes the manifest, with its VIP filled
+  in, to `/var/lib/rancher/rke2/server/manifests/harvester-aws-vip-controller.yaml`.
+  RKE2 applies it and keeps it applied.
+
+Add the instance role (above) before or after; until then the controller logs
+`UnauthorizedOperation` and moves nothing.
+
+**Turning it on later**, on a cluster deployed with the flag off: the image is
+already on every node, so only the manifest is needed.
+
+```bash
+sed 's/value: "SET-ME".*/value: "<the cluster VIP>"/' deploy/vip-controller.yaml | kubectl apply -f -
+```
+
+**Turning it off** where the flag deployed it:
+
+1. Delete `/var/lib/rancher/rke2/server/manifests/harvester-aws-vip-controller.yaml`
+   on node 1 first, so RKE2 has nothing to re-apply. Deleting the file alone
+   removes nothing: the objects, and RKE2's record of the file, stay.
+2. `kubectl delete -f deploy/vip-controller.yaml`.
+3. Remove RKE2's stale record of the file:
+   `kubectl -n kube-system delete addons.k3s.cattle.io harvester-aws-vip-controller`.
+
+The VIP stays wherever it was last moved to. Both directions were run on a
+cluster from the AMI: the objects stayed gone, and re-applying with the
+`sed | kubectl apply` line above brought the controller back, moving the VIP
+and the route on the next re-election.
+
+## Try it on a cluster without the AMI image
+
+For an AMI built before the image was added, or to test a new build:
 
 1. Attach the policy to the instance role.
 2. Copy the archive for the cluster's architecture to every control-plane node
@@ -323,13 +365,143 @@ issue), so this shows the route following the VIP, not traffic reaching a VM
 through it. Overlay reachability
 through a routed node was measured separately (perf test 13).
 
+## Measured: from the AMI, holding node rebooted (2026-10-28)
+
+v1.8.2 amd64 AMI built by `make ami`, three m8i.4xlarge nodes, Terraform
+`vip_controller = true`, the routes ConfigMap and `iam-policy-routes.json`.
+
+**First boot.** Every node imported the image, and RKE2 marks it pinned
+(`io.cri-containerd.pinned=pinned`), so kubelet's image garbage collection
+will not remove it while it is unused. Only node 1 wrote the manifest, with
+its VIP filled in, and the DaemonSet came up on all three nodes. Until the
+instance role was attached, the holder logged `no EC2 IMDS role found` every
+2 s, then started working without a restart. It repointed the route, left
+`blackhole` by an earlier cluster, to node 1.
+
+**Node 1, the holder, rebooted** with `aws ec2 reboot-instances` at
+20:52:48 UTC. Nodes 2 and 3 pinged the VIP every 0.2 s:
+
+| UTC | |
+| --- | --- |
+| 20:52:49 | node 2's controller holds the lease: node 1's kube-vip released it on shutdown |
+| 20:52:50 | VIP claimed **and** `10.60.0.0/24` repointed to node 2, in the same pass |
+| +2.45 to +4.52 s | pings from node 3 lost: about 2 s of outage. Node 2's never dropped; it held the VIP locally from the moment its kube-vip bound it |
+| 20:55:28 | node 1 `Ready` again; the lease stayed on node 2 |
+
+Far faster than the two `stop-instances` tests (9 s and 94 s). There, the
+stopping node did not release the lease, and the surviving kube-vips then had
+to win an election through the service IP while the node shut down.
+
+## Measured: traffic to an overlay VM through the route (2026-10-28)
+
+Same AMI cluster. A VM on the `10.60.0.0/24` overlay ran on node 3; a t3.micro
+in the subnet pinged it, and the VIP, every 0.2 s. The VPC route for
+`10.60.0.0/24` pointed at whichever node held the VIP; the VM's own node never
+changed.
+
+| | VIP | VM through the route |
+| --- | --- | --- |
+| Forced re-election, route moved node 2 → node 1 (both healthy) | about 3 s unreachable | **no packet lost** |
+| `stop-instances --force` on node 1, the holder and the route's target; route moved to node 3 | 3.6 s unreachable (VIP and route both on node 3 by +3.6 s) | **no packet lost** |
+
+The VM's traffic does not drop because the old node keeps forwarding until
+`ReplaceRoute` switches the route in one call, and on the forced stop because
+EC2 runs a short shutdown first (below) and the route had moved before the
+node went dark.
+
+**`stop-instances --force` is not a crash.** Node 1's journal shows EC2 still
+pressing the virtual power button (`Power key pressed short`, then `Powering
+off...`), Harvester shutting down and kube-vip releasing the lease; the hard
+power-off came about 8 s later. So this measures a forced stop, and kube-vip
+still handed over gracefully. kube-ovn's databases kept their three members
+through this restart as well.
+
+## Measured: holding node crashed (2026-10-28)
+
+Same AMI cluster. Node 2 held the lease, the VIP and the route, and was the
+Raft leader for both kube-ovn databases. It was powered off instantly with
+`echo o > /proc/sysrq-trigger` at 22:06:59.7 UTC (its journal ends at that
+command: no shutdown at all). A probe in the subnet pinged the VIP every
+0.2 s.
+
+| t (s) | |
+| --- | --- |
+| +1.2 | VIP stops answering |
+| +7.6 | node 3's kube-vip acquires the lease. Nothing released it: it had to expire (`leaseDurationSeconds` 5) |
+| +9.3 | node 3's controller claims the VIP and repoints the route |
+| **+21.1** | **VIP answers again** |
+
+The controller added about 1.7 s, as in every other run. The unexpected part
+is the **12 s between the claim and traffic recovering**; after every graceful
+move it was about 1.5 s. It resembles the unexplained 50 s outage in the first
+stop test: both times the instance the address was moved *off* had powered
+off around the time of the move. A working theory, not established: EC2's
+processing of the stopped instance briefly overrides a reassignment off its
+ENI.
+
+Node 2 came back with the same Raft server IDs; both databases kept three
+members, and leadership had moved to the survivors.
+
+## Measured: v1.9.0 from the AMI, nodes rebooted (2026-10-29)
+
+v1.9.0 amd64 AMI built by `make ami` (`ami-093d8890dc83951cb`), three
+m8i.4xlarge nodes, Terraform `vip_controller = true`, the kube-ovn add-on, a
+`10.60.0.0/24` overlay, the routes ConfigMap and `iam-policy-routes.json`.
+
+**First boot.** As on v1.8.2: every node imported the image and RKE2 pinned
+it, only node 1 wrote the manifest, and the DaemonSet ran on all three. The
+holder logged `no EC2 IMDS role found` until the role was attached, then
+repointed the route, left pointing at a deleted ENI from an earlier cluster,
+to itself. v1.9.0's kube-ovn add-on is v1.16.2, and its `Configuration` still
+has `ovnDir: /etc/origin/ovn`; that directory was bind-mounted from
+persistent state on every node.
+
+**Node 2 rebooted** (not the holder): `Ready` again about 2 min 20 s later,
+with the same Raft server IDs and its original `.hdr` files.
+
+**Node 1 rebooted**: the holder, and the Raft leader for both databases.
+`aws ec2 reboot-instances` at 17:58:04.3 UTC; node 3 pinged the VIP every
+0.2 s.
+
+| t (s) | |
+| --- | --- |
+| +1.0 | node 1 starts powering off |
+| +1.2 | VIP stops answering |
+| +19.3 | node 2's kube-vip acquires the lease |
+| +21.7 | node 2's controller claims the VIP and repoints the route |
+| **+22.2** | **VIP answers again**: 21 s of outage |
+| 18:01:51 | node 1 `Ready` again; the lease stayed on node 2 |
+
+The controller took about 2 s after the lease moved, as in every other run.
+The rest is kube-vip:
+
+* **Node 1's kube-vip did not release the lease.** Its log has nothing after
+  startup, so the lease had to expire. On v1.8.2 the same test took 2 s,
+  because the shutting-down kube-vip released it. v1.9.0 runs kube-vip v1.1.2;
+  whether the version is the difference was not checked.
+* **Then the election stalled on `10.53.0.1`.** Node 3's kube-vip logged
+  `Error retrieving lease lock ... https://10.53.0.1:443 ... deadline
+  exceeded` for about 80 s; node 2's got through at +19.3 s. This is the same
+  stall as in the slow stop test.
+
+Afterwards both databases had three members with the same server IDs, and
+leadership had moved to node 3.
+
+HTTPS to the VIP from a cluster node is not a test of the VIP: kube-proxy
+answers the service address locally and spreads requests across the
+ingress's endpoints, so it flapped for about 90 s as node 1's endpoints went
+away. Ping from a node, or anything from a host outside the cluster, is.
+
 ## Still to verify
 
 * Why kube-vip's API requests through `10.53.0.1` fail while a node shuts down.
   kube-vip takes its API address from the in-cluster defaults, which is part
-  of Harvester's chart; changing it would mean changing that chart.
-* The 50 s second outage in the first stop test.
-* A crash rather than a clean stop (`stop-instances --force`), where kube-vip
-  gets no chance to release anything.
-* Route following when the holding node is stopped. It runs in the same pass
-  as the VIP claim, so it should take the same time.
+  of Harvester's chart; changing it would mean changing that chart. On
+  v1.9.0 it also slows a plain reboot of the holder (21 s, against 2 s on
+  v1.8.2).
+* The extra recovery time when the old holder's instance is powered off: 12 s
+  after the claim in the crash test, and the 50 s second outage in the first
+  stop test. Testing the theory above means reassigning an address off a
+  stopped instance's ENI with nothing else changing, and timing when traffic
+  arrives.
+* The AMI path on arm64.

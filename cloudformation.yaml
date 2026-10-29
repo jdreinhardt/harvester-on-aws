@@ -46,7 +46,7 @@ Metadata:
       - Label: {default: "5. Storage"}
         Parameters: [VolumeSize, ReplicaCount, EbsKmsKeyId]
       - Label: {default: "6. Advanced"}
-        Parameters: [ControlPlaneViaNlb, DisableSourceDestCheck, Mtu, PasswordHash]
+        Parameters: [VipController, ControlPlaneViaNlb, DisableSourceDestCheck, Mtu, PasswordHash]
     ParameterLabels:
       AmiSsmParameter:          {default: "SSM Parameter Store Value"}
       AmiIdOverride:  {default: "Raw AMI ID (optional, overrides SSM)"}
@@ -64,6 +64,7 @@ Metadata:
       ReplicaCount:   {default: "Storage replica count"}
       EbsKmsKeyId:    {default: "KMS key for root volumes (optional)"}
       Mtu:            {default: "Management interface MTU"}
+      VipController:  {default: "Fail the VIP over (vip-controller)"}
       ControlPlaneViaNlb: {default: "Enable Kubernetes APIs in NLB"}
       DisableSourceDestCheck: {default: "Disable EC2 source/destination check"}
       PasswordHash:   {default: "OS password hash (optional)"}
@@ -255,6 +256,17 @@ Parameters:
   # a parameter. The console cannot hide one, and this is the click-to-deploy
   # path, where enabling it by accident is easiest. It is Terraform-only, for
   # test clusters; see perf/README.md. Do not add it here for parity.
+  VipController:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Deploys vip-controller, which moves the VIP to whichever node kube-vip
+      elects, so the management VIP fails over. Needs an instance role added
+      by hand to every node; see vip-controller/README.md in the repository.
+      The image is in every AMI built by make ami either way, so on a running
+      cluster turn it on with kubectl instead.
+
   ControlPlaneViaNlb:
     Type: String
     Default: 'false'
@@ -346,6 +358,7 @@ Conditions:
   NlbEnabled:     !Not [!Equals [!Ref ManagementNlb, 'none']]
   NlbPublic:      !Equals [!Ref ManagementNlb, 'internet-facing']
   ControlPlaneNlb:     !And [!Condition NlbEnabled, !Equals [!Ref ControlPlaneViaNlb, 'true']]
+  VipControllerEnabled: !Equals [!Ref VipController, 'true']
 
 Resources:
 
@@ -642,7 +655,7 @@ Resources:
             Fn::Sub:
               - |
                 aws:
-                  data_disk_size: "max"${TlsSansBlock}
+                  data_disk_size: "max"${TlsSansBlock}${VipControllerBlock}
                 scheme_version: 1
                 token: "${ClusterToken}"
                 install:
@@ -679,6 +692,12 @@ Resources:
                     - NlbPublic
                     - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName, "\n", '    - ', !Ref NlbEip]]
                     - !Join ['', ["\n", '  tls_sans:', "\n", '    - ', !Ref VipAddress, "\n", '    - ', !GetAtt ManagementLoadBalancer.DNSName]]
+                  - ''
+                # Create node only: the node that creates the cluster deploys
+                # vip-controller for every node (configure.sh, section 6c).
+                VipControllerBlock: !If
+                  - VipControllerEnabled
+                  - !Join ['', ["\n", '  vip_controller: true']]
                   - ''
 
   # server_url is top-level, not under install: its presence is what makes

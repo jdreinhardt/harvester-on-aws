@@ -239,6 +239,8 @@ resource "aws_instance" "node" {
     tls_sans      = local.tls_sans
 
     etcd_expose_metrics = var.etcd_expose_metrics
+    # Only the creating node deploys it, so only node 1's user-data carries it.
+    vip_controller = count.index == 0 && var.vip_controller
   })
 
   # User-data is only read once, at first boot, so a change means a new node.

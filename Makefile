@@ -125,12 +125,22 @@ KEY_FILE          ?= $(HOME)/.ssh/$(KEY_NAME).pem
 SSH_CIDR          ?= $(shell curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '\n')/32
 
 AWS               := aws
+
+# vip-controller (vip-controller/README.md). Every AMI carries its image, built
+# locally with docker for $(ARCH) and staged on COS_OEM by phase 2. The tag is
+# read from the manifest so the two can never disagree.
+VIPC_DIR          := vip-controller
+VIPC_IMAGE        := $(shell sed -n 's|^ *image: *\(harvester-aws/vip-controller:[^ ]*\).*|\1|p' $(VIPC_DIR)/deploy/vip-controller.yaml)
+VIPC_ARCHIVE      := $(VIPC_DIR)/vip-controller-$(ARCH).tar.gz
+VIPC_SOURCES      := $(wildcard $(VIPC_DIR)/*.go) $(VIPC_DIR)/go.mod $(VIPC_DIR)/go.sum \
+                     $(VIPC_DIR)/Dockerfile $(VIPC_DIR)/deploy/vip-controller.yaml
+
 # Per-architecture, so two builds never share a stamp file.
 STATE_ROOT        := .make
 STATE             := $(STATE_ROOT)/$(ARCH)
 SSH_OPTS          := -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$(STATE)/known_hosts -o ConnectTimeout=10
 
-.PHONY: help ami ami-all teardown teardown-all clean rebuild check migrate
+.PHONY: help ami ami-all teardown teardown-all clean rebuild check migrate vip-controller
 .DEFAULT_GOAL := help
 
 help:
@@ -142,6 +152,7 @@ help:
 	@echo "  make rebuild    teardown + clear stamps so 'make ami' runs again"
 	@echo "  make clean      teardown, plus discard local state"
 	@echo "  make teardown-all  teardown both architectures"
+	@echo "  make vip-controller  build the vip-controller image archive for ARCH (needs docker)"
 	@echo ""
 	@echo "Required:  SUBNET_ID=subnet-xxxx KEY_NAME=my-key"
 	@echo "Optional:  ARCH HARVESTER_VERSION HELPER_OS HELPER_TYPE HELPER_ROOT_SIZE"
@@ -155,7 +166,10 @@ help:
 	@echo "Resumable: progress is stamped under $(STATE)/, so a failed run picks up"
 	@echo "where it stopped instead of repeating the install."
 
-check: migrate
+# The vip-controller archive is a prerequisite here, so a missing docker or a
+# failed image build stops `make ami` before anything is created in AWS rather
+# than an hour in, at phase 2.
+check: migrate $(VIPC_ARCHIVE)
 	@test -n "$(SUBNET_ID)" || { echo "ERROR: set SUBNET_ID=subnet-xxxx"; exit 1; }
 	@test -n "$(KEY_NAME)"  || { echo "ERROR: set KEY_NAME=my-key"; exit 1; }
 	@test -f "$(KEY_FILE)"  || { echo "ERROR: key file $(KEY_FILE) not found (set KEY_FILE=)"; exit 1; }
@@ -170,6 +184,21 @@ check: migrate
 
 $(STATE):
 	@mkdir -p $(STATE)
+
+# One archive per architecture, each tagged $(VIPC_IMAGE) to match the manifest.
+# The default docker buildx driver cannot write an archive directly, so build
+# into the local engine and `docker save`. Not safe to run for both
+# architectures at once (they share the tag), which is why ami-all builds both
+# archives before starting the parallel builds.
+$(VIPC_ARCHIVE): $(VIPC_SOURCES)
+	@command -v docker >/dev/null || { echo "ERROR: docker not found; it builds the vip-controller image ($@)"; exit 1; }
+	@test -n "$(VIPC_IMAGE)" || { echo "ERROR: no harvester-aws/vip-controller image in $(VIPC_DIR)/deploy/vip-controller.yaml"; exit 1; }
+	@echo "==> vip-controller image $(VIPC_IMAGE) for $(ARCH)"
+	@docker buildx build --quiet --platform linux/$(ARCH) -t $(VIPC_IMAGE) --load $(VIPC_DIR) >/dev/null
+	@docker save $(VIPC_IMAGE) | gzip -9 > $@.part && mv $@.part $@
+	@echo "    $@ ($$(du -h $@ | cut -f1))"
+
+vip-controller: $(VIPC_ARCHIVE)
 
 # A pre-arch build left its stamps directly in .make/. Those name a real
 # snapshot and AMI -- the same reason `clean` keeps them -- so migrate rather
@@ -270,13 +299,18 @@ $(STATE)/built: $(STATE)/provisioned
 			./scripts/01-build-instance.sh --device \$$DEV"
 	@touch $@
 
-$(STATE)/customized: $(STATE)/built
+# The archive is order-only: rebuilding it after this step ran must not redo
+# the customisation by itself.
+$(STATE)/customized: $(STATE)/built | $(VIPC_ARCHIVE)
 	@echo "==> customising for AWS"
 	@IP=$$($(AWS) ec2 describe-instances --instance-ids $$(cat $(STATE)/instance-id) \
 		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text); \
+	ssh $(SSH_OPTS) -i $(KEY_FILE) $(REMOTE)@$$IP 'mkdir -p ~/vip-controller'; \
+	scp $(SSH_OPTS) -i $(KEY_FILE) $(VIPC_ARCHIVE) $(REMOTE)@$$IP:~/vip-controller/vip-controller.tar.gz ; \
+	scp $(SSH_OPTS) -i $(KEY_FILE) $(VIPC_DIR)/deploy/vip-controller.yaml $(REMOTE)@$$IP:~/vip-controller/vip-controller.yaml ; \
 	ssh $(SSH_OPTS) -i $(KEY_FILE) $(REMOTE)@$$IP \
 		"set -eu; DEV=\$$(lsblk -dbpno NAME,SIZE | grep -v \"\$$(lsblk -no pkname \$$(findmnt -no SOURCE /))\" | awk -v w=\$$(( $(VOLUME_SIZE) * 1073741824 )) '\$$2 >= w {print \$$1; exit}'); \
-		 sudo ./scripts/02-customize-instance.sh \$$DEV"
+		 sudo ./scripts/02-customize-instance.sh \$$DEV --vip-controller \$$HOME/vip-controller"
 	@touch $@
 
 # --- snapshot, register, publish --------------------------------------------
@@ -327,6 +361,8 @@ ami-all:
 	@echo "    follow with:  tail -f $(STATE_ROOT)/amd64/build.log"
 	@echo "                  tail -f $(STATE_ROOT)/arm64/build.log"
 	@echo ""
+	@$(MAKE) --no-print-directory vip-controller ARCH=amd64
+	@$(MAKE) --no-print-directory vip-controller ARCH=arm64
 	@mkdir -p $(STATE_ROOT)/amd64 $(STATE_ROOT)/arm64; RC=0; \
 		$(MAKE) --no-print-directory ami ARCH=amd64 SSH_CIDR=$(SSH_CIDR) BUILD_ID=$(BUILD_ID) \
 			>$(STATE_ROOT)/amd64/build.log 2>&1 & A=$$!; \

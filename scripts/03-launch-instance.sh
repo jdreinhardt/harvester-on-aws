@@ -59,6 +59,7 @@ HOSTNAME_OVERRIDE=""
 USER_DATA_FILE=""
 DATA_DISK_SIZE="max"
 MTU="1500"
+VIP_CONTROLLER="false"
 DRY_RUN="false"
 NAME_TAG="harvester-node"
 
@@ -131,6 +132,12 @@ Options:
   --hostname       Node hostname. Default: harvester-<instance-id>
   --user-data-file Use this file as the Harvester configuration verbatim
                    instead of generating one.
+  --vip-controller Deploy vip-controller, so the VIP follows kube-vip's
+                   election (vip-controller/README.md). Create mode only: the
+                   first node deploys it for the cluster. Needs the instance
+                   role from that README, added by hand. The image is in every
+                   AMI from \`make ami\` either way; on a running cluster, turn
+                   it on with kubectl instead.
   --name           Name tag. Default: ${NAME_TAG}
   --dry-run        Print the configuration and the launch parameters, then stop.
   -h, --help       Show this help.
@@ -164,6 +171,7 @@ while [[ $# -gt 0 ]]; do
         --user-data-file) USER_DATA_FILE="$2"; shift 2 ;;
         --data-disk-size) DATA_DISK_SIZE="$2"; shift 2 ;;
         --mtu)            MTU="$2"; shift 2 ;;
+        --vip-controller) VIP_CONTROLLER="true"; shift ;;
         --name)           NAME_TAG="$2"; shift 2 ;;
         --dry-run)        DRY_RUN="true"; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -201,7 +209,19 @@ esac
 # -----------------------------------------------------------------------------
 # Mode
 # -----------------------------------------------------------------------------
+if [ "$VIP_CONTROLLER" = "true" ] && [ -n "$USER_DATA_FILE" ]; then
+    echo "ERROR: --vip-controller has no effect with --user-data-file." >&2
+    echo "       Put 'vip_controller: true' under 'aws:' in the file instead." >&2
+    exit 1
+fi
+
 if [ "$MODE" = "join" ]; then
+    if [ "$VIP_CONTROLLER" = "true" ]; then
+        echo "ERROR: --vip-controller is for the first node (create mode)." >&2
+        echo "       The node that creates the cluster deploys it for every node;" >&2
+        echo "       joining nodes already carry the image." >&2
+        exit 1
+    fi
     if [ -n "$VIP" ]; then
         echo "ERROR: --vip and --join are mutually exclusive." >&2
         echo "       The VIP belongs to the cluster, not to the node. A joining" >&2
@@ -526,6 +546,12 @@ if [ -n "$SERVER_URL" ]; then
 server_url: \"${SERVER_URL}\""
 fi
 
+VIP_CONTROLLER_BLOCK=""
+if [ "$VIP_CONTROLLER" = "true" ]; then
+    VIP_CONTROLLER_BLOCK="
+  vip_controller: true"
+fi
+
 if [ -n "$USER_DATA_FILE" ]; then
     [ -f "$USER_DATA_FILE" ] || { echo "ERROR: $USER_DATA_FILE not found" >&2; exit 1; }
     cat "$USER_DATA_FILE" > "$USERDATA_FILE"
@@ -537,7 +563,7 @@ else
 # aws.* is consumed by /oem/aws/configure.sh on the node and stripped before
 # the file is handed to harvester-installer.
 aws:
-  data_disk_size: "${DATA_DISK_SIZE}"
+  data_disk_size: "${DATA_DISK_SIZE}"${VIP_CONTROLLER_BLOCK}
 scheme_version: 1
 token: "${TOKEN}"${SERVER_URL_BLOCK}
 install:

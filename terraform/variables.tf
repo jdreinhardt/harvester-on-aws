@@ -189,6 +189,21 @@ variable "etcd_expose_metrics" {
   default     = false
 }
 
+variable "vip_controller" {
+  description = <<-EOT
+    Deploy vip-controller, which moves the VIP's secondary IP to whichever
+    control-plane node kube-vip elects, so the VIP fails over on EC2. See
+    vip-controller/README.md. The image is in every AMI from `make ami`
+    whatever this says; this only decides whether node 1 deploys it at first
+    boot. Needs an instance role added by hand (that README, "IAM"); without
+    it the controller runs but cannot move anything. Changing it replaces
+    node 1 (it is user-data): to turn it on for a running cluster, apply
+    deploy/vip-controller.yaml with kubectl instead.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # --- Storage -----------------------------------------------------------------
 
 variable "volume_size" {

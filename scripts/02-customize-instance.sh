@@ -55,6 +55,7 @@ set -euo pipefail
 DISK=""
 GROW_DATA_DISK="false"
 SERIAL_CONSOLE="true"
+VIPC_DIR=""
 
 usage() {
     cat <<USAGE
@@ -68,6 +69,10 @@ Options:
   --no-serial-console   Leave the console configuration as the installer left
                         it (console=ttyS0 console=tty1) instead of forcing
                         serial-only.
+  --vip-controller DIR  Stage the vip-controller image and manifest on COS_OEM.
+                        DIR holds vip-controller.tar.gz (for this image's
+                        architecture) and vip-controller.yaml. \`make ami\`
+                        always passes it; see vip-controller/README.md.
   -h, --help            Show this help.
 USAGE
 }
@@ -76,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --grow-data-disk)    GROW_DATA_DISK="true"; shift ;;
         --no-serial-console) SERIAL_CONSOLE="false"; shift ;;
+        --vip-controller)    VIPC_DIR="${2:-}"; shift 2 ;;
         -h|--help)           usage; exit 0 ;;
         -*)                  echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
         *)                   DISK="$1"; shift ;;
@@ -100,6 +106,12 @@ fi
 for tool in blkid lsblk mount umount sed awk; do
     command -v "$tool" >/dev/null || { echo "ERROR: $tool not found" >&2; exit 1; }
 done
+
+if [ -n "$VIPC_DIR" ]; then
+    for f in vip-controller.tar.gz vip-controller.yaml; do
+        [ -f "$VIPC_DIR/$f" ] || { echo "ERROR: --vip-controller: $VIPC_DIR/$f not found" >&2; exit 1; }
+    done
+fi
 
 # Refuse to touch the helper instance's own root disk.
 ROOT_SRC="$(findmnt -no SOURCE / 2>/dev/null || true)"
@@ -378,6 +390,36 @@ echo "[4/7] Installing AWS first-boot glue..."
 
 rm -rf "$MNT_OEM/aws"
 mkdir -p "$MNT_OEM/aws"
+
+# vip-controller: image archive + manifest, copied into RKE2 by configure.sh
+# (section 6c). The archive must match the image's architecture -- RKE2 would
+# import a foreign one without complaint and the pod would never start -- so it
+# is checked against the loader found above. COS_OEM is 50 MiB; the archive is
+# about 10 MB.
+if [ -n "$VIPC_DIR" ]; then
+    case "$BOOT_EFI" in
+        BOOTX64.EFI)  IMAGE_ARCH=amd64 ;;
+        BOOTAA64.EFI) IMAGE_ARCH=arm64 ;;
+    esac
+    VIPC_CFG="$(tar -xzOf "$VIPC_DIR/vip-controller.tar.gz" manifest.json | grep -o '"Config":"[^"]*"' | cut -d'"' -f4)"
+    VIPC_ARCH="$(tar -xzOf "$VIPC_DIR/vip-controller.tar.gz" "$VIPC_CFG" | grep -o '"architecture":"[^"]*"' | cut -d'"' -f4)"
+    if [ "$VIPC_ARCH" != "$IMAGE_ARCH" ]; then
+        echo "ERROR: vip-controller.tar.gz is ${VIPC_ARCH:-unreadable}, this image is ${IMAGE_ARCH}" >&2
+        exit 1
+    fi
+    NEED_KB=$(( $(du -k "$VIPC_DIR/vip-controller.tar.gz" | cut -f1) + 8192 ))
+    FREE_KB="$(df -Pk "$MNT_OEM" | awk 'NR==2 {print $4}')"
+    if [ "$FREE_KB" -lt "$NEED_KB" ]; then
+        echo "ERROR: COS_OEM has ${FREE_KB} KiB free; the vip-controller image needs ${NEED_KB} KiB with headroom" >&2
+        exit 1
+    fi
+    mkdir -p "$MNT_OEM/aws/vip-controller"
+    cp "$VIPC_DIR/vip-controller.tar.gz" "$VIPC_DIR/vip-controller.yaml" "$MNT_OEM/aws/vip-controller/"
+    chmod 0644 "$MNT_OEM/aws/vip-controller/"*
+    echo "  Staged the vip-controller image (${VIPC_ARCH}) and manifest; $(df -Pk "$MNT_OEM" | awk 'NR==2 {print $4}') KiB left on COS_OEM"
+else
+    echo "  No --vip-controller: this AMI will not carry the vip-controller image"
+fi
 
 # ---------------------------------------------------------------------------
 # stage-initramfs.sh -- runs from the yip `initramfs` stage, i.e. inside the
@@ -952,6 +994,78 @@ if [ "$(yq -r '.aws.etcd_expose_metrics // false' "$WORK/user-data.yaml" 2>/dev/
     say "wrote 95-aws-etcd-metrics.yaml"
 fi
 
+# --- 6b. Keep kube-ovn's databases across reboots (always) -----------------
+# The kube-ovn add-on keeps each ovn-central member's Raft database in hostPath
+# /etc/origin/ovn (the operator's ovnDir default), and /etc is a tmpfs overlay
+# here: only PERSISTENT_STATE_PATHS survive a reboot, and /etc/origin is not
+# one of them in v1.8.2 or v1.9.0. Each reboot then wipes that member, it
+# rejoins as a new one, and the second reboot leaves too few members to elect
+# a leader. See the README, "Known issue: kube-ovn's databases do not survive
+# a node reboot".
+#
+# Unconditional: harmless if kube-ovn is never enabled, and the add-on can be
+# enabled at any time after install. Appended, so user-data's own list is kept.
+# configureInstalledNode() renders it into the rootfs stage of
+# /oem/99_custom.yaml, which takes effect from the next boot.
+yq -i '.os.persistent_state_paths = ((.os.persistent_state_paths // []) + ["/etc/origin/ovn"] | unique)' \
+    "$WORK/merged.yaml"
+say "os.persistent_state_paths includes /etc/origin/ovn"
+
+# That rootfs stage only runs in the initrd, so on THIS boot /etc/origin/ovn is
+# still on tmpfs -- and the add-on may well be enabled before any reboot. Bind
+# the directory the next boot's stage will use, so nothing written now is lost.
+# The name follows the existing ones under /usr/local/.state (etc-rancher.bind
+# for /etc/rancher). Same idea as mount_data_partition() above.
+OVN_STATE=/usr/local/.state/etc-origin-ovn.bind
+if ! findmnt -n /etc/origin/ovn >/dev/null 2>&1; then
+    mkdir -p "$OVN_STATE" /etc/origin/ovn
+    if mount --bind "$OVN_STATE" /etc/origin/ovn; then
+        say "bound $OVN_STATE at /etc/origin/ovn for this boot"
+    else
+        say "WARNING: could not bind $OVN_STATE at /etc/origin/ovn; kube-ovn data written"
+        say "         before the first reboot will be lost"
+    fi
+fi
+
+# --- 6c. vip-controller ----------------------------------------------------
+# Makes the VPC follow kube-vip's election (vip-controller/README.md).
+#
+# The image is always imported, on every node, whatever the flag says: joined
+# nodes start as agents and are promoted later, and it lets the controller be
+# turned on after install with a plain `kubectl apply`. RKE2 imports every
+# archive in agent/images/ when it starts. Never pulled from a registry.
+VIPC_SRC=/oem/aws/vip-controller
+if [ -f "$VIPC_SRC/vip-controller.tar.gz" ]; then
+    mkdir -p /var/lib/rancher/rke2/agent/images
+    install -m 0644 "$VIPC_SRC/vip-controller.tar.gz" \
+        /var/lib/rancher/rke2/agent/images/harvester-aws-vip-controller.tar.gz
+    say "staged the vip-controller image for RKE2 to import"
+else
+    say "no vip-controller image in this AMI ($VIPC_SRC)"
+fi
+
+# aws.vip_controller only decides whether the controller is deployed. Only the
+# node that creates the cluster writes the manifest: it is the one that knows
+# the VIP, and RKE2 keeps the objects applied from there. Off by default.
+if [ "$(yq -r '.aws.vip_controller // false' "$WORK/user-data.yaml" 2>/dev/null)" = "true" ]; then
+    if [ "$MODE" != "create" ]; then
+        say "aws.vip_controller: the creating node deploys it; nothing to do on a $MODE node"
+    elif [ ! -f "$VIPC_SRC/vip-controller.yaml" ]; then
+        say "WARNING: aws.vip_controller is true but this AMI has no $VIPC_SRC/vip-controller.yaml"
+    else
+        VIP="$VIP" yq '(select(.kind == "DaemonSet") | .spec.template.spec.containers[0].env[] | select(.name == "VIP") | .value) = strenv(VIP)' \
+            "$VIPC_SRC/vip-controller.yaml" > "$WORK/vip-controller.yaml"
+        if grep -q 'SET-ME' "$WORK/vip-controller.yaml"; then
+            say "WARNING: could not set VIP in the vip-controller manifest; not deploying it"
+        else
+            mkdir -p /var/lib/rancher/rke2/server/manifests
+            install -o root -g root -m 0600 "$WORK/vip-controller.yaml" \
+                /var/lib/rancher/rke2/server/manifests/harvester-aws-vip-controller.yaml
+            say "wrote the vip-controller manifest (VIP $VIP); needs the instance role in vip-controller/README.md"
+        fi
+    fi
+fi
+
 # --- 7. Stage it -----------------------------------------------------------
 # `aws.*` is ours, not Harvester's. Remove it so the installer only ever sees a
 # clean Harvester configuration file.
@@ -985,6 +1099,9 @@ AWS first-boot glue, installed by 02-customize-instance.sh.
   stage-initramfs.sh  yip `initramfs` stage: bootstrap NetworkManager profile,
                       harvester-aws-config.service, getty ordering.
   configure.sh        harvester-aws-config.service: IMDSv2 -> /oem/userdata.yaml.
+  vip-controller/     image archive (copied to RKE2's agent/images on first
+                      boot) and manifest (deployed only with
+                      aws.vip_controller: true). See vip-controller/README.md.
 
 Logs:
   journalctl -u harvester-aws-config
@@ -1073,6 +1190,8 @@ COS_STATE  active.img + passive.img -> console=ttyS0 only, net.ifnames=0
 COS_OEM    99_aws.yaml            -> runs aws/stage-initramfs.sh each boot
            aws/stage-initramfs.sh -> eth0 NM profile + first-boot unit + getty ordering
            aws/configure.sh       -> IMDSv2 -> /oem/userdata.yaml
+           aws/vip-controller/    -> image for RKE2 to import on every node;
+                                     manifest only with aws.vip_controller: true
            harvester.config       -> untouched (mode: install is required)
 
 First boot sequence:

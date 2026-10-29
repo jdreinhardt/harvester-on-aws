@@ -492,9 +492,16 @@ sudo ./scripts/02-customize-instance.sh /dev/nvme1n1
 | `COS_GRUB` | ESP renamed to `EFI/BOOT/BOOTX64.EFI` — the removable-media path AWS boots for a snapshot-registered AMI |
 | `COS_STATE` | `active.img`/`passive.img` `bootargs.cfg` → `console=ttyS0,115200n8` only, and `net.ifnames=0`; same settings mirrored into `grubcustom` so they survive an OS upgrade |
 | `COS_OEM` | `99_aws.yaml` + `aws/stage-initramfs.sh` + `aws/configure.sh` |
+| `COS_OEM` | `aws/vip-controller/` — the vip-controller image archive and manifest, with `--vip-controller DIR` (`make ami` always passes it) |
 | `COS_OEM` | `harvester.config` — only `install.device` is patched; `mode: install` **must** stay |
 
-Options: `--grow-data-disk`, `--no-serial-console`.
+Options: `--grow-data-disk`, `--no-serial-console`, `--vip-controller DIR`
+(a directory holding `vip-controller.tar.gz` for the image's architecture and
+`vip-controller.yaml`; `make vip-controller` builds the archive).
+
+`make ami` needs **docker** on the machine running it, to build the
+vip-controller image; it stops before creating anything in AWS if docker is
+missing.
 
 Three details worth knowing:
 
@@ -581,6 +588,11 @@ launch if the AMI's architecture does not match the instance type's.
 is set *at all* — an unset MTU produces a node that cannot talk to other nodes.
 `--mtu 9000` is a deliberate opt-in, and `--mtu 0` reproduces the broken case.
 See [MTU](#mtu-set-it-explicitly).
+
+`--vip-controller` deploys vip-controller, so the VIP fails over. Give it only
+on the first node, which deploys it for the whole cluster; the script refuses
+it with `--join`. It needs the instance role from
+[vip-controller/README.md](vip-controller/README.md), attached by hand.
 
 That is *create* mode, which bootstraps a new cluster. To add a node to an
 existing one, use `--join` — see [Clustering](#clustering).
@@ -901,7 +913,8 @@ overlay VIP driven by an agent (below) would fix it properly, by making the AWS
 side follow the election instead of being set once.
 
 Failing over means moving the secondary private IP between ENIs via the EC2 API
-(`unassign-private-ip-addresses` then `assign-private-ip-addresses`), which
+(`assign-private-ip-addresses --allow-reassignment`, which takes it off the old
+ENI in the same call), which
 needs something watching the cluster with IAM permissions — or putting a network
 load balancer in front of the nodes and treating *that* as the management
 endpoint.
@@ -929,13 +942,17 @@ is decided. A TGW multicast domain carries multicast groups between subnets
 (IGMPv2 or static membership) and never affects how a unicast address is
 routed, so it cannot move the VIP no matter how it is configured.
 
-**Two shapes a real fix can take**, both of which the `aws-vpc-move-ip`
-resource agent implements:
+**Two shapes a real fix can take**, each implemented by a Pacemaker resource
+agent in ClusterLabs `resource-agents`:
 
 | Approach | Mechanism | Multi-AZ |
 | --- | --- | --- |
-| Secondary IP reassignment | `assign-private-ip-addresses --allow-reassignment` moves the VIP onto the new leader's ENI. The VIP stays inside the VPC CIDR, so in-VPC clients are unaffected. | **No.** A subnet cannot span AZs, so the VIP is pinned to one. |
-| Route-table `/32` | The VIP lives *outside* the VPC CIDR and a `/32` route points at the active node's ENI, rewritten on failover. The variant SUSE's agent commonly uses for SAP HA. | **Yes.** |
+| Secondary IP reassignment (the `awsvip` agent) | `assign-private-ip-addresses --allow-reassignment` moves the VIP onto the new leader's ENI. The VIP stays inside the VPC CIDR, so in-VPC clients are unaffected. | **No.** A subnet cannot span AZs, so the VIP is pinned to one. |
+| Route-table `/32` (the `aws-vpc-move-ip` agent) | The VIP lives *outside* the VPC CIDR and a `/32` route points at the active node's ENI, rewritten on failover (`describe-route-tables`, `replace-route`). The variant SUSE commonly uses for SAP HA. | **Yes.** |
+
+Both agents run under Pacemaker, which elects the active node and calls
+them; neither works without a Pacemaker/Corosync cluster, and each also adds
+the address to a local interface itself.
 
 Multi-AZ is also on the open list, so the route-table variant is worth weighing
 before taking the simpler one. Its cost is that an address outside the VPC CIDR
@@ -946,6 +963,108 @@ That may not matter, because the load balancer already serves external clients.
 Either way the work has the same shape: something watching the kube-vip lease
 and calling the EC2 API on leader change, plus the IAM policy for it. Nothing
 off the shelf does this for Harvester.
+
+#### Proposed design: a controller that claims the VIP for its own node
+
+Implemented in [`vip-controller/`](vip-controller/README.md) and tested by hand
+on a cluster. Every AMI from `make ami` carries its image, and the deploy flag
+turns it on: Terraform `vip_controller = true`, CloudFormation
+`VipController=true`, or `03-launch-instance.sh --vip-controller` on the first
+node (see "Packaging" below). The AMI path was verified on a v1.8.2 amd64
+build through Terraform.
+
+**The secondary IP is moved, not left unassigned.** Node 1 keeps getting the VIP
+as a secondary address at launch, exactly as today. Bootstrap needs that: node 1
+creates the cluster and the other nodes join through the VIP, all before any
+controller could be running. The controller only takes over afterwards.
+
+**Each control-plane node claims the VIP for itself.** A small Go program
+(client-go and the AWS SDK) runs on every control-plane node and:
+
+1. Watches kube-vip's Lease, `harvester-system/plndr-svcs-lock`.
+2. When `holderIdentity` is its own node and the VIP is not on its own ENI, calls
+   `AssignPrivateIpAddresses` for its own ENI with `AllowReassignment=true`. EC2
+   moves the address in that one call, so the old node does not have to be
+   alive or reachable.
+3. Re-checks every few seconds even without a Lease change. That also fixes the
+   desync problem above: if kube-vip re-elects while node 1 is healthy, the AWS
+   side follows within seconds instead of the address silently going dark.
+
+Its own instance ID, ENI and current addresses come from instance metadata, so
+nothing maps node names to instances, and a node only ever moves the VIP *to
+itself*. It never touches another node's ENI except as the side effect of
+reassignment. kube-vip keeps binding the address on `mgmt-br` as it does now;
+the controller does only the AWS half. (The Pacemaker agents above also manage
+the local interface, which is part of why they do not fit.)
+
+**Packaging, with no image pull.** A core feature should not depend on reaching
+a registry, so the image carries it, as a DaemonSet from a preloaded image:
+
+* `make ami` builds the image archive for the AMI's architecture with docker
+  (`make vip-controller`), before creating anything in AWS. Phase 2 stages it
+  and the manifest on `COS_OEM` (about 10 MB of its 50 MiB), and checks the
+  archive's architecture against the image's.
+* **On every node's first boot**, `configure.sh` copies the archive to
+  `/var/lib/rancher/rke2/agent/images/`, which RKE2 imports when it starts (its
+  air-gap mechanism). This happens whatever the flag says, so the controller
+  can be turned on later with a plain `kubectl apply`.
+* **`aws.vip_controller: true`** (Terraform `vip_controller = true`,
+  CloudFormation `VipController`, `03-launch-instance.sh --vip-controller`) only
+  deploys it: the creating node writes the manifest, with its VIP filled in,
+  to RKE2's auto-deploy directory `/var/lib/rancher/rke2/server/manifests`.
+  The pods run on control-plane nodes only, with `imagePullPolicy: Never`. Off
+  by default.
+
+The other option considered was a host systemd service: simpler packaging, but
+it would read the Lease with the node's RKE2 admin kubeconfig rather than a
+service account limited to that Lease, and it would be invisible from the
+cluster.
+
+**IAM, added by hand and documented, like the EFS role.** An instance-profile
+policy allowing `ec2:AssignPrivateIpAddresses` and `ec2:DescribeNetworkInterfaces`,
+ideally restricted by tag condition to the cluster's own ENIs. The controller
+gets credentials from instance metadata, which the hop limit of 2 already
+allows from pods.
+
+**Why secondary IP rather than the route table.** The route-table variant is
+not a hack. It is AWS's standard overlay-IP pattern and the only way to float an
+address across AZs. But for this module:
+
+* **Reachability.** A route-table VIP is outside the VPC CIDR, so it is reachable
+  only where route tables carry the `/32`. Peered VPCs, VPNs and Direct Connect
+  each need routes. A secondary IP is in the subnet, so anything that reaches
+  the subnet reaches it.
+* **Source/destination check.** The route variant needs it disabled on every
+  node permanently, since the node receives traffic for an address not on its
+  ENI. Today it is off only where an overlay CIDR is routed (see
+  [Source/destination check](#sourcedestination-check)).
+* **Permissions.** `ec2:ReplaceRoute` on a route table is broader than
+  reassigning an address on the cluster's own ENIs.
+* **AZs.** Its one advantage is multi-AZ, and the module puts every node in one
+  subnet.
+
+So secondary-IP reassignment now; the route table only if multi-AZ clusters
+become a goal.
+
+**Failover time** should be roughly kube-vip's lease timeout (5 seconds) plus a
+second or two for the API call. A first version is in `vip-controller/`. With
+the holder's kube-vip pod deleted, which releases the lease gracefully, the VIP
+was unreachable for 1.5 to 3 seconds. With the holding node rebooted from the
+AMI, about 2 seconds; with it force-stopped, 3.6 seconds. The overlay route
+moved in the same pass each time, and a VM reached through it lost no packets.
+With the holder crashed (an instant power-off), 21 seconds: about 8 for the
+lease to expire and a new leader to take it, 1.7 for the controller, then an
+unexplained 12 before traffic followed the moved address.
+On v1.9.0, rebooting the holder took 21 seconds rather than 2: its kube-vip did
+not release the lease on shutdown, and the election then stalled on the
+`kubernetes` service IP, as described below. The controller still followed
+within 2 seconds.
+With the holding node stopped, it was about 9 seconds in one run and about 94
+seconds in a second. Both times
+the controller claimed the address within 2 seconds of kube-vip electing a new
+leader. In the slow run kube-vip's own election stalled: the surviving nodes
+could not reach the API through the `kubernetes` service IP while the stopped
+node was shutting down. See its README.
 
 **How urgent is it? Less than it first looks.** The e2e powercycle module stops
 and starts nodes repeatedly — `test_poweroff_node_trigger_vm_reschedule`,
@@ -965,7 +1084,10 @@ node registration, and whatever addresses the cluster by VIP directly.
   given the load balancer serves external clients anyway.
 * Whether the desync problem above — kube-vip re-electing while node 1 is still
   healthy, leaving the VIP bound on one node and routed to another — is better
-  solved by the same controller, or separately.
+  solved by the same controller, or separately. The proposed design solves it
+  in the same controller, through its periodic re-check.
+* Packaging: preloaded DaemonSet or host service, and whether the image fits on
+  `COS_OEM`.
 
 ---
 
@@ -1265,9 +1387,12 @@ zones — a separate decision.
 * **Set up kube-ovn.** The addon, the NAD and the Subnet are in-cluster
   configuration applied after bootstrap — see
   [VM networking on EC2](#vm-networking-on-ec2).
-* **Make the VIP itself fail over.** It stays a secondary address on node 1's
-  ENI. The load balancer sidesteps this by becoming the endpoint instead — see
-  [Management endpoint](#management-endpoint).
+* **Make the VIP itself fail over, unless `VipController` is `true`.** By
+  default it stays a secondary address on node 1's ENI, and the load balancer
+  sidesteps this by becoming the endpoint instead (see
+  [Management endpoint](#management-endpoint)). With `VipController=true` it
+  follows kube-vip's election, once the instance role from
+  [vip-controller/README.md](vip-controller/README.md) is attached by hand.
 
 ### Parameters worth thinking about
 
@@ -1285,6 +1410,7 @@ zones — a separate decision.
 | `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
 | `ControlPlaneViaNlb` | Adds **6443 only** to the load balancer, for reaching the Kubernetes API from outside the VPC. It does **not** change where joining nodes point — a load balancer cannot be reached by its own registered targets, so `server_url` stays on the VIP. There is deliberately no 9345 listener. Default `false`; needs an AMI whose `configure.sh` writes the tls-san drop-in. |
 | `DisableSourceDestCheck` | Reads as *disable the check*: `true` disables it, `false` (the default) leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
+| `VipController` | Default `false`. `true` has node 1 deploy [vip-controller](vip-controller/README.md) at first boot, so the VIP fails over. Goes into node 1's user-data only. Needs the instance role from that README, attached by hand to every node. The image is in the AMI either way, so on a running stack turn it on with `kubectl apply` rather than a stack update. |
 
 ---
 
@@ -1496,15 +1622,41 @@ cluster/status OVN_Northbound` showing "disconnected from the cluster
 about the overlay can change while it is down. Found in perf testing
 (perf/FINDINGS.md, "Node failure").
 
-**Not fixed in this repository.** Two ways to prevent it: add `/etc/origin/ovn`
-to the node's persistent paths, or point kube-ovn's database at a path that
-is already persistent.
+**Prevented in AMIs built after 2026-10-28.** `configure.sh` adds
+`/etc/origin/ovn` to `os.persistent_state_paths` on every node, so Harvester's
+own rootfs stage keeps it from the second boot on. For the first boot, before
+that stage has ever run, it bind-mounts the directory the stage will use
+(`/usr/local/.state/etc-origin-ovn.bind`), so a kube-ovn add-on enabled
+before any reboot keeps its data too. It is unconditional, and harmless if
+kube-ovn is never enabled.
 
-**Recovering a deadlocked cluster: not verified end to end.** An attempt on
-the perf cluster was stopped before step 3 and the cluster torn down, so
-treat these as the planned steps, not a tested procedure. `cluster/kick`
-needs a leader, so rebuild from a surviving member's database, for each of
-the northbound and southbound databases:
+Verified on a v1.8.2 amd64 AMI (2026-10-28), with the add-on enabled during
+the first boot: two nodes rebooted one after the other, the second being the
+Raft leader for both databases. Each came back mounting the same directory,
+with the same server IDs and the original `.hdr` files. Both databases kept
+three members throughout, and leadership moved to a surviving node and
+stayed there. Two more restarts kept them too: a forced stop and start, and
+a crash (an instant power-off) of the node then leading both databases. Before
+this change, the second reboot deadlocked the cluster.
+Verified on a v1.9.0 amd64 AMI (2026-10-29), kube-ovn v1.16.2: two nodes
+rebooted one after the other, the second being the Raft leader for both
+databases, with the same result.
+Not yet checked: that the path survives a Harvester upgrade.
+
+The same applies to v1.9.0: its `PERSISTENT_STATE_PATHS` are identical to
+v1.8.2's, and every kubeovn-operator release, v1.16.x included, defaults
+`ovnDir` to `/etc/origin/ovn`. Harvester's kube-ovn chart moves Open vSwitch's
+directory to the persistent `/var/lib/rancher/origin/openvswitch` but leaves
+`ovnDir` at that default. Setting the add-on's chart value
+`configurationSpec.ovnDir` to a persistent path would also prevent it, and is
+the natural upstream fix. This repository persists the default path instead,
+because that does not depend on the add-on's values and stays harmless if
+upstream later moves the directory.
+
+**Recovering a deadlocked cluster.** `cluster/kick` needs a leader, so rebuild
+from a surviving member's database, for each of the northbound and southbound
+databases. These steps recovered a deadlocked v1.8.2 cluster (kube-ovn
+v1.15.4) on 2026-10-28; see the note after them for what actually happened.
 
 1. Back up `/etc/origin/ovn` on every node (to `/home`, which persists).
 2. Scale the kube-ovn operator (`kubeovn-operator-controller-manager`) to 0
@@ -1521,6 +1673,26 @@ the northbound and southbound databases:
    cluster.
 5. Scale `ovn-central` and the operator back to their replica counts, and
    check that `cluster/status` lists three members and a leader.
+
+**What happened when these were run.** Within three minutes of step 5, both
+databases had three members, the seed node as leader and both followers
+connected. Every kube-ovn pod was healthy within six minutes: one
+`kube-ovn-cni` pod was in crash backoff from before and recovered on its next
+restart. A new VM on the overlay network then got an address and reached the
+internet.
+
+**But the rebuilt seed database was not used.** On the seed node, kube-ovn's
+start script moved it aside (to `ovnnb_db.db.backup-<timestamp>`) and created a
+new, **empty** cluster (`Creating cluster database` in the pod log). The cluster
+ID was not the one step 3 had made. kube-ovn-controller then rebuilt the
+northbound contents from the Kubernetes objects: the `join`, `ovn-default` and
+overlay subnets' logical switches and the `ovn-cluster` router were back
+within two minutes. So the `ovsdb-tool` step did no harm, but it was not what
+recovered the cluster. That suggests steps 1, 2, 4 for **every** node
+(including the seed) and 5 would be enough, with the subnets coming back from
+Kubernetes. That shorter version has not itself been run. On this cluster no
+overlay VMs were running, so nothing showed whether running VMs keep their
+connectivity through the rebuild.
 
 ### natOutgoing — check it is set
 
@@ -1615,8 +1787,13 @@ aws ec2 replace-route --route-table-id rtb-xxxxxxxx \
   --destination-cidr-block 10.60.0.0/24 --network-interface-id eni-yyyyyyyy   # a surviving node
 ```
 
-That is cheaper than the VIP, which needs an unassign followed by an assign, but
-it is still manual and still needs something watching to be automatic.
+That is the same cost as moving the VIP, which is also one call
+(`assign-private-ip-addresses --allow-reassignment`), and like it, it is still
+manual and still needs something watching to be automatic. `vip-controller/`
+can be that watcher: routes listed in its optional ConfigMap are repointed to
+whichever node holds the VIP (see "Routes that follow the VIP" in its README).
+Tested by hand with a forced re-election; the route moved in the same second as
+the VIP.
 
 A load balancer does not help here the way it does for the management endpoint.
 Network load balancers can take IP targets, but those must sit inside the VPC
@@ -1978,7 +2155,7 @@ of them holds VM disks:
 | Partition | Size on a 250 GiB image | Mounted at | Holds |
 |---|---|---|---|
 | `COS_GRUB` | 64 MiB | ESP | bootloader |
-| `COS_OEM` | 50 MiB | `/oem` | `harvester.config`, `99_custom.yaml`, `grubenv`, this repo's `aws/` glue |
+| `COS_OEM` | 50 MiB | `/oem` | `harvester.config`, `99_custom.yaml`, `grubenv`, this repo's `aws/` glue, including the vip-controller image (about 10 MB) |
 | `COS_RECOVERY` | 8 GiB | — | recovery system image |
 | `COS_STATE` | 15 GiB | — | `cOS/active.img` + `cOS/passive.img`, the A/B OS image pair, and `grub2/grub.cfg` |
 | `COS_PERSISTENT` | **150 GiB** | `/usr/local` | **node** state |
@@ -2101,6 +2278,17 @@ CloudFormation's `NoEcho` and Terraform's `sensitive` do not change that, and
 Terraform state holds it in plain text. Every launch path sets the IMDS hop
 limit to 2, which the EFS CSI controller needs, so **pods on the node can fetch
 it** too, along with the credentials of any instance role attached for EFS.
+
+**VMs on the management network cannot**, measured on v1.8.2 (2026-10-28). From
+a guest on the default pod network (masquerade), the IMDSv2 token request
+timed out: its response is sent with the hop limit as its TTL and does not
+survive the node-to-pod-to-guest forwarding. A plain IMDSv1 `GET` did reach
+instance metadata, and got `401`. So two settings protect guests, and both are
+needed: **`HttpTokens=required`**, which every launch path sets, and a **hop
+limit no higher than 2**. Making tokens optional, or raising the limit to 3,
+would let any VM read user-data and the instance role's credentials. A VM on a
+kube-ovn overlay network (`natOutgoing` on) gave exactly the same results, on
+v1.8.2 and again on v1.9.0 (2026-10-29).
 
 **An OS upgrade replaces `active.img`**, reverting the `bootargs.cfg` console
 and `net.ifnames` patches. The `grubcustom` copy is the fallback; after an
