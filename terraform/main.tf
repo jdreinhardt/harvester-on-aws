@@ -192,6 +192,7 @@ resource "aws_instance" "node" {
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [aws_security_group.nodes.id]
   key_name               = var.key_name
+  iam_instance_profile   = var.iam_instance_profile
   source_dest_check      = !var.disable_source_dest_check
 
   # Opt-in per instance on virtualized types: without it there is no /dev/kvm

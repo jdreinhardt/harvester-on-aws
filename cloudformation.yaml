@@ -46,7 +46,7 @@ Metadata:
       - Label: {default: "5. Storage"}
         Parameters: [VolumeSize, ReplicaCount, EbsKmsKeyId]
       - Label: {default: "6. Advanced"}
-        Parameters: [VipController, ControlPlaneViaNlb, DisableSourceDestCheck, Mtu, PasswordHash]
+        Parameters: [VipController, NodeInstanceProfile, ControlPlaneViaNlb, DisableSourceDestCheck, Mtu, PasswordHash]
     ParameterLabels:
       AmiSsmParameter:          {default: "SSM Parameter Store Value"}
       AmiIdOverride:  {default: "Raw AMI ID (optional, overrides SSM)"}
@@ -65,6 +65,7 @@ Metadata:
       EbsKmsKeyId:    {default: "KMS key for root volumes (optional)"}
       Mtu:            {default: "Management interface MTU"}
       VipController:  {default: "Fail the VIP over (vip-controller)"}
+      NodeInstanceProfile: {default: "Existing instance profile for the nodes (optional)"}
       ControlPlaneViaNlb: {default: "Enable Kubernetes APIs in NLB"}
       DisableSourceDestCheck: {default: "Disable EC2 source/destination check"}
       PasswordHash:   {default: "OS password hash (optional)"}
@@ -261,11 +262,19 @@ Parameters:
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      Deploys vip-controller, which moves the VIP to whichever node kube-vip
-      elects, so the management VIP fails over. Needs an instance role added
-      by hand to every node; see vip-controller/README.md in the repository.
-      The image is in every AMI built by make ami either way, so on a running
-      cluster turn it on with kubectl instead.
+      Deploys vip-controller, which is handles VIP failover on the VPC. It
+      moves the seconardy IP and can update route tables accordingly.
+      Needs an instance role on every node (NodeInstanceProfile, or added by hand).
+
+  # Only names a profile; the stack never creates IAM, so it needs no
+  # CAPABILITY_IAM. The deployer needs iam:PassRole on the profile's role.
+  NodeInstanceProfile:
+    Type: String
+    Default: ''
+    AllowedPattern: '^[\w+=,.@-]{0,128}$'
+    Description: >-
+      (Optional) The name of an EXISTING instance profile to attach to every node,
+      for vip-controller or EFS.
 
   ControlPlaneViaNlb:
     Type: String
@@ -359,6 +368,7 @@ Conditions:
   NlbPublic:      !Equals [!Ref ManagementNlb, 'internet-facing']
   ControlPlaneNlb:     !And [!Condition NlbEnabled, !Equals [!Ref ControlPlaneViaNlb, 'true']]
   VipControllerEnabled: !Equals [!Ref VipController, 'true']
+  HasInstanceProfile: !Not [!Equals [!Ref NodeInstanceProfile, '']]
 
 Resources:
 
@@ -631,6 +641,7 @@ Resources:
         ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
+        IamInstanceProfile: !If [HasInstanceProfile, {Name: !Ref NodeInstanceProfile}, !Ref 'AWS::NoValue']
         CpuOptions: !If
           - IsGravitonMetal
           - !Ref 'AWS::NoValue'
@@ -714,6 +725,7 @@ Resources:
         ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
+        IamInstanceProfile: !If [HasInstanceProfile, {Name: !Ref NodeInstanceProfile}, !Ref 'AWS::NoValue']
         CpuOptions: !If
           - IsGravitonMetal
           - !Ref 'AWS::NoValue'
@@ -793,6 +805,7 @@ Resources:
         ImageId: !If [HasAmiOverride, !Ref AmiIdOverride, !Ref AmiSsmParameter]
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
+        IamInstanceProfile: !If [HasInstanceProfile, {Name: !Ref NodeInstanceProfile}, !Ref 'AWS::NoValue']
         CpuOptions: !If
           - IsGravitonMetal
           - !Ref 'AWS::NoValue'

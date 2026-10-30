@@ -204,6 +204,18 @@ variable "vip_controller" {
   default     = false
 }
 
+variable "iam_instance_profile" {
+  description = <<-EOT
+    Name of an EXISTING instance profile to attach to every node, for
+    vip-controller or EFS. The module never creates IAM: create the role and
+    profile yourself (vip-controller/README.md, "IAM"; README, "EFS for VM
+    disks"). Changes apply in place, without replacing nodes. null attaches
+    nothing and leaves a profile added by hand alone.
+  EOT
+  type        = string
+  default     = null
+}
+
 # --- Storage -----------------------------------------------------------------
 
 variable "volume_size" {
