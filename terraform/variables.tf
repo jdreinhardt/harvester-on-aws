@@ -144,13 +144,12 @@ variable "overlay_client_cidr" {
 variable "management_nlb" {
   description = <<-EOT
     Load balancer in front of the nodes on 443, so the management endpoint
-    survives losing a node -- the VIP does not fail over, because it is a
-    secondary address on one ENI and the VPC ignores kube-vip's ARP.
+    fails over when accessed publicly from outside of the VPC.
     "internet-facing" also allocates an Elastic IP for a fixed public address.
     "none" leaves the VIP as the only endpoint.
   EOT
   type        = string
-  default     = "internet-facing"
+  default     = "none"
 
   validation {
     condition     = contains(["internet-facing", "internal", "none"], var.management_nlb)
@@ -201,7 +200,7 @@ variable "vip_controller" {
     deploy/vip-controller.yaml with kubectl instead.
   EOT
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "iam_instance_profile" {

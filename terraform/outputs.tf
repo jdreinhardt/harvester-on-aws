@@ -1,5 +1,5 @@
 output "management_url" {
-  description = "Load-balanced management endpoint. Survives losing a node, unlike the VIP."
+  description = "Management endpoint: the VIP, or the load balancer when management_nlb is set."
   value       = local.nlb_enabled ? "https://${aws_lb.mgmt[0].dns_name}" : "https://${var.vip_address}"
 }
 

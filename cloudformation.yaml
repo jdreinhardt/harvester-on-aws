@@ -222,11 +222,11 @@ Parameters:
 
   ManagementNlb:
     Type: String
-    Default: internet-facing
+    Default: none
     AllowedValues: [internet-facing, internal, none]
     Description: >-
-      Deploys a NLB in front of the cluster to hande failover of the web UI (and
-      Kubernetes API if enabled below).
+      Deploys a NLB in front of the cluster, for reaching the web UI (and
+      Kubernetes API if enabled below) from outside the VPC.
       internet-facing allocates an Elastic IP. none skips the load balancer.
 
   # --- 5. Storage ---------------------------------------------------------
@@ -259,12 +259,13 @@ Parameters:
   # test clusters; see perf/README.md. Do not add it here for parity.
   VipController:
     Type: String
-    Default: 'false'
+    Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >-
       Deploys vip-controller, which is handles VIP failover on the VPC. It
       moves the seconardy IP and can update route tables accordingly.
-      Needs an instance role on every node (NodeInstanceProfile, or added by hand).
+      Needs an instance role on every node (NodeInstanceProfile, or added by hand);
+      until then it runs but moves nothing.
 
   # Only names a profile; the stack never creates IAM, so it needs no
   # CAPABILITY_IAM. The deployer needs iam:PassRole on the profile's role.

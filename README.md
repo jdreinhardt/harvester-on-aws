@@ -925,9 +925,10 @@ needs something watching the cluster with IAM permissions — or putting a netwo
 load balancer in front of the nodes and treating *that* as the management
 endpoint.
 
-The CloudFormation template takes the second approach; see
-[Management endpoint](#management-endpoint). The VIP still does not move, but it
-stops being the thing *you* connect to.
+The templates first took the second approach. They now do the first, with
+[vip-controller](#proposed-design-a-controller-that-claims-the-vip-for-its-own-node)
+on by default, and the load balancer is optional, off by default, for reaching
+the cluster from outside the VPC; see [Management endpoint](#management-endpoint).
 
 **It does not stop being the thing the cluster connects to.** A load balancer
 cannot serve its own targets, so `server_url` still points at the VIP and a
@@ -1018,8 +1019,9 @@ a registry, so the image carries it, as a DaemonSet from a preloaded image:
   CloudFormation `VipController`, `03-launch-instance.sh --vip-controller`) only
   deploys it: the creating node writes the manifest, with its VIP filled in,
   to RKE2's auto-deploy directory `/var/lib/rancher/rke2/server/manifests`.
-  The pods run on control-plane nodes only, with `imagePullPolicy: Never`. Off
-  by default.
+  The pods run on control-plane nodes only, with `imagePullPolicy: Never`. On
+  by default in CloudFormation and Terraform; `03-launch-instance.sh` still
+  needs the flag.
 
 The other option considered was a host systemd service: simpler packaging, but
 it would read the Lease with the node's RKE2 admin kubeconfig rather than a
@@ -1258,14 +1260,15 @@ a presigned handle URL as the only option.
 
 ### Management endpoint
 
-`ManagementNlb` puts a network load balancer in front of the nodes on 443, which
-is what makes the management endpoint survive losing a node. Three values:
+`ManagementNlb` puts a network load balancer in front of the nodes on 443.
+With vip-controller the VIP already survives losing a node, so the load
+balancer is for reaching the cluster from outside the VPC. Three values:
 
 | | |
 |---|---|
-| `internet-facing` (default) | Load balancer plus an Elastic IP, so the address is fixed and reachable from outside the VPC |
+| `internet-facing` | Load balancer plus an Elastic IP, so the address is fixed and reachable from outside the VPC |
 | `internal` | Load balancer on a private address only |
-| `none` | No load balancer; the VIP stays the only endpoint |
+| `none` (default) | No load balancer; the VIP is the only endpoint |
 
 Every node runs the ingress, so any of them can serve the UI.
 
@@ -1395,12 +1398,11 @@ zones — a separate decision.
 * **Set up kube-ovn.** The addon, the NAD and the Subnet are in-cluster
   configuration applied after bootstrap — see
   [VM networking on EC2](#vm-networking-on-ec2).
-* **Make the VIP itself fail over, unless `VipController` is `true`.** By
-  default it stays a secondary address on node 1's ENI, and the load balancer
-  sidesteps this by becoming the endpoint instead (see
-  [Management endpoint](#management-endpoint)). With `VipController=true` it
-  follows kube-vip's election, once the instance role from
-  [vip-controller/README.md](vip-controller/README.md) is attached by hand.
+* **Create the instance role.** `VipController` is `true` by default, but
+  vip-controller moves nothing until every node has the role from
+  [vip-controller/README.md](vip-controller/README.md): name it in
+  `NodeInstanceProfile`, or attach it by hand. Until then the VIP stays on
+  node 1's ENI.
 
 ### Parameters worth thinking about
 
@@ -1415,10 +1417,10 @@ zones — a separate decision.
 | `OverlayClientCidr` | Optional. Opens the nodes to this source on **all** protocols, which is what routing traffic into overlay VMs requires. Empty unless you have added the VPC route. |
 | `AmiIdOverride` | Optional literal `ami-…`, bypassing the SSM lookup. **Set it for any stack you mean to keep.** `AmiSsmParameter` is re-resolved on every stack update, the AMI reaches the instances through launch templates (a replacement-only property), and `make ami` repoints `…/latest` by default — so without a pinned id, the first update after a build replaces every node and its root volume, VM disks included. |
 | `EbsKmsKeyId` | Optional KMS key ARN. Root volumes are always encrypted; empty uses the account's default `aws/ebs` key. |
-| `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
+| `ManagementNlb` | `none` (default), `internet-facing` or `internal`. Balances 443 across the management nodes, for reaching the UI from outside the VPC; `internet-facing` also allocates an Elastic IP. |
 | `ControlPlaneViaNlb` | Adds **6443 only** to the load balancer, for reaching the Kubernetes API from outside the VPC. It does **not** change where joining nodes point — a load balancer cannot be reached by its own registered targets, so `server_url` stays on the VIP. There is deliberately no 9345 listener. Default `false`; needs an AMI whose `configure.sh` writes the tls-san drop-in. |
 | `DisableSourceDestCheck` | Reads as *disable the check*: `true` disables it, `false` (the default) leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
-| `VipController` | Default `false`. `true` has node 1 deploy [vip-controller](vip-controller/README.md) at first boot, so the VIP fails over. Goes into node 1's user-data only. Needs the instance role from that README on every node: set `NodeInstanceProfile`, or attach it by hand. The image is in the AMI either way, so on a running stack turn it on with `kubectl apply` rather than a stack update. |
+| `VipController` | Default `true`. `true` has node 1 deploy [vip-controller](vip-controller/README.md) at first boot, so the VIP fails over. Goes into node 1's user-data only. Needs the instance role from that README on every node: set `NodeInstanceProfile`, or attach it by hand. The image is in the AMI either way, so on a running stack turn it on with `kubectl apply` rather than a stack update. |
 | `NodeInstanceProfile` | Optional name of an **existing** instance profile, attached to every node. The stack creates no IAM, so it needs no `CAPABILITY_IAM`, but the deployer needs `iam:PassRole` on the profile's role. Create the role and profile first: [vip-controller](vip-controller/README.md#iam-manual), [EFS](#efs-for-vm-disks). **Set it at creation only**: the profile reaches the instances through launch templates, so changing it on an update replaces every node. For a running stack, use `aws ec2 associate-iam-instance-profile`. |
 
 ---
