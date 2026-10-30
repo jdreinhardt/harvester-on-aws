@@ -255,6 +255,12 @@ RNDR instruction path. Fixed upstream by
 2025-05-12, first in `edk2-stable202505`); needs a SUSE package rebuild to
 reach Harvester. **Until then, v1.8.2 is the working arm64 baseline.**
 
+Upgrading an arm64 cluster from v1.8.2 does not stop guests that are already
+running: the firmware only runs at boot. Measured on `c6g.metal`
+(2026-10-29): a VM booted on v1.8.2 live-migrated in 9 s onto an upgraded
+node, into v1.9.0's `virt-launcher`, and kept answering. Once it stops or
+restarts, it hangs as above.
+
 Diagnose any guest hang from the serial log, never the web console — VNC looks
 identical whether the firmware is dead-looping or the guest booted and stopped
 drawing to the framebuffer:
@@ -1058,7 +1064,9 @@ unexplained 12 before traffic followed the moved address.
 On v1.9.0, rebooting the holder took 21 seconds rather than 2: its kube-vip did
 not release the lease on shutdown, and the election then stalled on the
 `kubernetes` service IP, as described below. The controller still followed
-within 2 seconds.
+within 2 seconds. On arm64 (v1.8.2, `c6g.metal`, deployed with
+CloudFormation), rebooting the holder took 1.9 seconds, and a VM reached
+through the route lost no packets.
 With the holding node stopped, it was about 9 seconds in one run and about 94
 seconds in a second. Both times
 the controller claimed the address within 2 seconds of kube-vip electing a new
@@ -1410,7 +1418,8 @@ zones — a separate decision.
 | `ManagementNlb` | `internet-facing` (default), `internal` or `none`. Balances 443 across the management nodes so the endpoint survives losing a node; `internet-facing` also allocates an Elastic IP. |
 | `ControlPlaneViaNlb` | Adds **6443 only** to the load balancer, for reaching the Kubernetes API from outside the VPC. It does **not** change where joining nodes point — a load balancer cannot be reached by its own registered targets, so `server_url` stays on the VIP. There is deliberately no 9345 listener. Default `false`; needs an AMI whose `configure.sh` writes the tls-san drop-in. |
 | `DisableSourceDestCheck` | Reads as *disable the check*: `true` disables it, `false` (the default) leaves EC2's normal behaviour alone. Disabling is required to reach VM addresses from the VPC over a kube-ovn overlay; see below. |
-| `VipController` | Default `false`. `true` has node 1 deploy [vip-controller](vip-controller/README.md) at first boot, so the VIP fails over. Goes into node 1's user-data only. Needs the instance role from that README, attached by hand to every node. The image is in the AMI either way, so on a running stack turn it on with `kubectl apply` rather than a stack update. |
+| `VipController` | Default `false`. `true` has node 1 deploy [vip-controller](vip-controller/README.md) at first boot, so the VIP fails over. Goes into node 1's user-data only. Needs the instance role from that README on every node: set `NodeInstanceProfile`, or attach it by hand. The image is in the AMI either way, so on a running stack turn it on with `kubectl apply` rather than a stack update. |
+| `NodeInstanceProfile` | Optional name of an **existing** instance profile, attached to every node. The stack creates no IAM, so it needs no `CAPABILITY_IAM`, but the deployer needs `iam:PassRole` on the profile's role. Create the role and profile first: [vip-controller](vip-controller/README.md#iam-manual), [EFS](#efs-for-vm-disks). **Set it at creation only**: the profile reaches the instances through launch templates, so changing it on an update replaces every node. For a running stack, use `aws ec2 associate-iam-instance-profile`. |
 
 ---
 
@@ -1640,8 +1649,13 @@ a crash (an instant power-off) of the node then leading both databases. Before
 this change, the second reboot deadlocked the cluster.
 Verified on a v1.9.0 amd64 AMI (2026-10-29), kube-ovn v1.16.2: two nodes
 rebooted one after the other, the second being the Raft leader for both
-databases, with the same result.
-Not yet checked: that the path survives a Harvester upgrade.
+databases, with the same result. And on a v1.8.2 arm64 AMI (`c6g.metal`,
+kube-ovn v1.15.4), two nodes rebooted one after the other.
+An upgrade keeps it too, checked on two nodes: upgrading that arm64 cluster
+to v1.9.0 (2026-10-29), which also took kube-ovn to v1.16.2, nodes 1 and 3
+came back mounting the same directory, with the same server IDs, and node 1
+with its original `.hdr` files; both databases kept three members. The third
+node was not checked through the upgrade.
 
 The same applies to v1.9.0: its `PERSISTENT_STATE_PATHS` are identical to
 v1.8.2's, and every kubeovn-operator release, v1.16.x included, defaults
@@ -2009,6 +2023,10 @@ aws ec2 associate-iam-instance-profile --instance-id i-xxxxxxxx \
   --iam-instance-profile Name=harvester-efs-csi
 ```
 
+For a new cluster, the per-node step can instead be the profile's name at
+deploy time: CloudFormation `NodeInstanceProfile`, or Terraform
+`iam_instance_profile`. Creating the role stays manual either way.
+
 A later `tofu apply` of the Terraform module leaves an associated profile in
 place. **With a hop limit of 2, every pod on a node can use this role**, as
 well as read the node's user-data (see [Notes and gotchas](#notes-and-gotchas)).
@@ -2288,7 +2306,8 @@ needed: **`HttpTokens=required`**, which every launch path sets, and a **hop
 limit no higher than 2**. Making tokens optional, or raising the limit to 3,
 would let any VM read user-data and the instance role's credentials. A VM on a
 kube-ovn overlay network (`natOutgoing` on) gave exactly the same results, on
-v1.8.2 and again on v1.9.0 (2026-10-29).
+v1.8.2 and again on v1.9.0 (2026-10-29), and on arm64 v1.8.2 with an
+instance role attached to the node.
 
 **An OS upgrade replaces `active.img`**, reverting the `bootargs.cfg` console
 and `net.ifnames` patches. The `grubcustom` copy is the fallback; after an

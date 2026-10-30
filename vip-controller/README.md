@@ -161,6 +161,12 @@ aws ec2 associate-iam-instance-profile --instance-id i-xxxxxxxx \
   --iam-instance-profile Name=harvester-node-role
 ```
 
+For a new cluster, skip the per-node step: pass the profile name at deploy
+time, as CloudFormation `NodeInstanceProfile` or Terraform
+`iam_instance_profile`, and every node starts with it. The role and profile
+are still yours to create. On a running CloudFormation stack keep the
+per-node command, since changing the parameter replaces every node.
+
 To switch to the routes policy later, run `put-role-policy` again with
 `iam-policy-routes.json` and the same policy name; it replaces the old one.
 
@@ -492,6 +498,58 @@ answers the service address locally and spreads requests across the
 ingress's endpoints, so it flapped for about 90 s as node 1's endpoints went
 away. Ping from a node, or anything from a host outside the cluster, is.
 
+## Measured: arm64 from the AMI, CloudFormation, nodes rebooted (2026-10-29)
+
+v1.8.2 arm64 AMI built by `make ami` (`ami-0adf7b96728827440`), three
+`c6g.metal` nodes from the CloudFormation template with `VipController=true`
+and `NodeInstanceProfile=harvester-node-role`, the kube-ovn add-on (v1.15.4),
+a `10.60.0.0/24` overlay, the routes ConfigMap and `iam-policy-routes.json`.
+
+**First boot.** Every node launched with the role, so nothing was attached by
+hand. The DaemonSet ran on all three, and node 1's controller repointed the
+route, left pointing at an ENI from an earlier cluster, to itself. While the
+other nodes joined, it logged "lease no longer held" a few times, naming
+itself as holder: kube-vip renewed more than 5 s late, so the lease counted as
+expired. Nothing else held it, and the controller did not touch the VIP.
+`/etc/origin/ovn` was bind-mounted from persistent state on every node.
+
+An Ubuntu 24.04 arm64 VM on the overlay (EFI firmware, as Harvester's arm64
+default) reached the internet through `natOutgoing`. Instance metadata
+behaved as on amd64, now with a role attached: the IMDSv2 token request
+timed out and IMDSv1 got `401`. A probe instance in the subnet reached it
+through the VPC route.
+
+**Node 3 rebooted** (not the holder, not a Raft leader): `Ready` again after
+15 min, as bare metal restarts slowly, with the same Raft server IDs and its
+original `.hdr` files.
+
+**Node 1 rebooted**, the holder. `aws ec2 reboot-instances` at 22:49:14.3 UTC;
+the probe instance, outside the cluster, pinged the VIP and the overlay VM
+every 0.2 s.
+
+| t (s) | |
+| --- | --- |
+| +1.8 | last VIP reply |
+| +2.4 | node 3's kube-vip holds the lease: node 1's released it on shutdown |
+| +3.3 | node 3's controller claims the VIP |
+| +3.6 | and repoints the route |
+| **+3.8** | **VIP answers again**: 1.9 s of outage |
+| +926 | node 1 `Ready` again, with the same Raft server IDs and `.hdr` files; the lease stayed on node 3 |
+
+The overlay VM, on node 2, lost no pings at all, although its route moved
+from node 1 to node 3. As on amd64 v1.8.2, kube-vip released the lease and the
+whole failover took about 2 s, against 21 s on amd64 v1.9.0.
+
+**Upgraded to v1.9.0**, the same cluster, checked through node 1 only. The
+lease moved to another node as each node was drained (seen once a minute,
+not timed), and each time the controller there claimed the VIP and
+repointed the route. While a node's API server restarted, its controller
+logged `connection refused` and then, for a few seconds, `forbidden` on the
+lease, until authorization was ready; it recovered unaided. Afterwards node 1
+ran v1.9.0 and kube-vip v1.1.2, and the VIP and the overlay VM answered from
+the probe instance. The holder was not rebooted on v1.9.0, so this does not
+settle the kube-vip question below.
+
 ## Still to verify
 
 * Why kube-vip's API requests through `10.53.0.1` fail while a node shuts down.
@@ -504,4 +562,6 @@ away. Ping from a node, or anything from a host outside the cluster, is.
   stop test. Testing the theory above means reassigning an address off a
   stopped instance's ENI with nothing else changing, and timing when traffic
   arrives.
-* The AMI path on arm64.
+* Whether kube-vip v1.1.2 is why v1.9.0 does not release the lease. Upgrading
+  the arm64 cluster above to v1.9.0 and rebooting the holder again would
+  compare the two releases on the same nodes.

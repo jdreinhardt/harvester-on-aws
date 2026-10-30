@@ -6,7 +6,7 @@
 # the destructive ones LAST:
 #
 #   cpu_pinning / powercycle  mutate node state
-#   apis/test_hosts.py        maintenance_mode (known to fail on v1.8.2 and
+#   apis/test_hosts.py        maintenance_mode (known to fail on v1.8.2 and v1.9.0, and
 #                             leave a node cordoned) and delete_host, which is
 #                             IRREVERSIBLE -- the suite cannot add a node back,
 #                             so it is deliberately the very last test.
