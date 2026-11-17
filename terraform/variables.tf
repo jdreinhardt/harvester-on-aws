@@ -197,7 +197,7 @@ variable "vip_controller" {
     boot. Needs an instance role added by hand (that README, "IAM"); without
     it the controller runs but cannot move anything. Changing it replaces
     node 1 (it is user-data): to turn it on for a running cluster, apply
-    deploy/vip-controller.yaml with kubectl instead.
+    its HelmChart with kubectl instead (that README, "Turning it on later").
   EOT
   type        = bool
   default     = true

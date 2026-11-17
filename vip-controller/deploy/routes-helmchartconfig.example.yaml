@@ -1,0 +1,23 @@
+# Optional: VPC routes that follow the VIP. Without routes the controller never
+# touches a route table.
+#
+# Each key under routes is a route table ID; each value lists destination
+# CIDRs in that table. The routes must already exist, pointing at any node --
+# the controller only replaces their target, as aws-vpc-move-ip does.
+#
+# A HelmChartConfig adds values to the HelmChart of the same name and
+# namespace, so the VIP that node 1 set stays as it is. Applying or editing it
+# re-runs the chart, which rewrites the ConfigMap
+# harvester-system/vip-controller-routes; the controller picks that up within
+# one RECHECK_INTERVAL. Needs deploy/iam-policy-routes.json on the instance
+# role.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: harvester-aws-vip-controller
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    routes:
+      rtb-0123456789abcdef0:
+        - 10.60.0.0/24

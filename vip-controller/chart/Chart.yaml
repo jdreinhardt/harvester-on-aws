@@ -1,0 +1,8 @@
+apiVersion: v2
+name: vip-controller
+description: Moves the Harvester VIP, and optionally VPC routes, to whichever control-plane node holds kube-vip's lease, so the VIP fails over on EC2.
+type: application
+version: 0.2.0
+# The image tag. The Makefile reads it from here, so the image archive and the
+# chart can never disagree.
+appVersion: "0.2.0"

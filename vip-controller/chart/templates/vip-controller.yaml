@@ -1,8 +1,15 @@
-# vip-controller: moves the VIP's secondary IP to whichever control-plane node
-# holds kube-vip's lease. See vip-controller/README.md.
-#
-# Before applying: set VIP below, import the image on every node (README), and
-# attach deploy/iam-policy.json to the nodes' instance role.
+{{- /*
+vip-controller: moves the VIP's secondary IP to whichever control-plane node
+holds kube-vip's lease. See vip-controller/README.md.
+
+Everything is in harvester-system whatever the release namespace: that is
+where kube-vip's lease is, and the controller reads it and the routes
+ConfigMap from there. The image is imported on every node, never pulled, and
+the nodes' instance role needs deploy/iam-policy.json.
+*/ -}}
+{{- if or (not .Values.vip) (eq .Values.vip "SET-ME") }}
+{{- fail "vip is required: set it to the cluster VIP" }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -68,12 +75,16 @@ spec:
         - operator: Exists
       containers:
         - name: vip-controller
-          image: harvester-aws/vip-controller:0.2.0
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           # Imported from an archive on each node; never pulled.
           imagePullPolicy: Never
           env:
             - name: VIP
-              value: "SET-ME"  # the cluster VIP, e.g. 172.31.0.182
+              value: {{ .Values.vip | quote }}
+            {{- with .Values.recheckInterval }}
+            - name: RECHECK_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
             - name: NODE_NAME
               valueFrom:
                 fieldRef:

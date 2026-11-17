@@ -1,0 +1,20 @@
+# The template for the manifest that deploys vip-controller. `make
+# vip-controller` fills in chartContent with the packaged chart/ and writes
+# vip-controller/vip-controller.yaml; node 1 replaces SET-ME with the VIP at
+# first boot and puts the result in RKE2's manifests directory. RKE2's
+# helm-controller installs the chart from chartContent, so nothing is
+# downloaded.
+#
+# Settings beyond the VIP, such as routes, go in a HelmChartConfig of the same
+# name (deploy/routes-helmchartconfig.example.yaml), never here: RKE2 owns this
+# object, and its values are merged with the HelmChartConfig's.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: harvester-aws-vip-controller
+  namespace: kube-system
+spec:
+  targetNamespace: harvester-system
+  chartContent: CHART-CONTENT
+  valuesContent: |-
+    vip: "SET-ME"

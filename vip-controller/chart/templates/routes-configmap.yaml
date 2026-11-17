@@ -1,0 +1,17 @@
+{{- /*
+The routes that follow the VIP (routes.go). Only rendered when routes are set,
+so a cluster that never uses them has no ConfigMap and the controller touches
+no route table. The controller re-reads it on every check.
+*/ -}}
+{{- with .Values.routes }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vip-controller-routes
+  namespace: harvester-system
+data:
+  {{- range $table, $cidrs := . }}
+  {{- /* A list, or one string of CIDRs as the controller itself accepts. */}}
+  {{ $table }}: {{ (kindIs "string" $cidrs | ternary $cidrs (join "\n" $cidrs)) | quote }}
+  {{- end }}
+{{- end }}

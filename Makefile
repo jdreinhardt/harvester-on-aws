@@ -127,20 +127,25 @@ SSH_CIDR          ?= $(shell curl -s --max-time 10 https://checkip.amazonaws.com
 AWS               := aws
 
 # vip-controller (vip-controller/README.md). Every AMI carries its image, built
-# locally with docker for $(ARCH) and staged on COS_OEM by phase 2. The tag is
-# read from the manifest so the two can never disagree.
+# locally with docker for $(ARCH), and its Helm chart, packaged into an RKE2
+# HelmChart manifest; phase 2 stages both on COS_OEM. The image name and tag
+# are read from the chart so the two can never disagree.
 VIPC_DIR          := vip-controller
-VIPC_IMAGE        := $(shell sed -n 's|^ *image: *\(harvester-aws/vip-controller:[^ ]*\).*|\1|p' $(VIPC_DIR)/deploy/vip-controller.yaml)
+VIPC_CHART        := $(VIPC_DIR)/chart
+VIPC_IMAGE        := $(shell sed -n 's|^ *repository: *\([^ ]*\).*|\1|p' $(VIPC_CHART)/values.yaml):$(shell sed -n 's|^appVersion: *"*\([^" ]*\)"*.*|\1|p' $(VIPC_CHART)/Chart.yaml)
 VIPC_ARCHIVE      := $(VIPC_DIR)/vip-controller-$(ARCH).tar.gz
 VIPC_SOURCES      := $(wildcard $(VIPC_DIR)/*.go) $(VIPC_DIR)/go.mod $(VIPC_DIR)/go.sum \
-                     $(VIPC_DIR)/Dockerfile $(VIPC_DIR)/deploy/vip-controller.yaml
+                     $(VIPC_DIR)/Dockerfile $(VIPC_CHART)/Chart.yaml $(VIPC_CHART)/values.yaml
+# Architecture-independent: the same manifest goes into every AMI.
+VIPC_MANIFEST     := $(VIPC_DIR)/vip-controller.yaml
+VIPC_CHART_FILES  := $(shell find $(VIPC_CHART) -type f) $(VIPC_DIR)/deploy/helmchart.yaml
 
 # Per-architecture, so two builds never share a stamp file.
 STATE_ROOT        := .make
 STATE             := $(STATE_ROOT)/$(ARCH)
 SSH_OPTS          := -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$(STATE)/known_hosts -o ConnectTimeout=10
 
-.PHONY: help ami ami-all teardown teardown-all clean rebuild check migrate vip-controller
+.PHONY: help ami ami-all teardown teardown-all clean rebuild check migrate vip-controller vip-controller-manifest
 .DEFAULT_GOAL := help
 
 help:
@@ -153,6 +158,8 @@ help:
 	@echo "  make clean      teardown, plus discard local state"
 	@echo "  make teardown-all  teardown both architectures"
 	@echo "  make vip-controller  build the vip-controller image archive for ARCH (needs docker)"
+	@echo "                       and its HelmChart manifest"
+	@echo "  make vip-controller-manifest  only the manifest (no docker needed)"
 	@echo ""
 	@echo "Required:  SUBNET_ID=subnet-xxxx KEY_NAME=my-key"
 	@echo "Optional:  ARCH HARVESTER_VERSION HELPER_OS HELPER_TYPE HELPER_ROOT_SIZE"
@@ -169,7 +176,7 @@ help:
 # The vip-controller archive is a prerequisite here, so a missing docker or a
 # failed image build stops `make ami` before anything is created in AWS rather
 # than an hour in, at phase 2.
-check: migrate $(VIPC_ARCHIVE)
+check: migrate $(VIPC_ARCHIVE) $(VIPC_MANIFEST)
 	@test -n "$(SUBNET_ID)" || { echo "ERROR: set SUBNET_ID=subnet-xxxx"; exit 1; }
 	@test -n "$(KEY_NAME)"  || { echo "ERROR: set KEY_NAME=my-key"; exit 1; }
 	@test -f "$(KEY_FILE)"  || { echo "ERROR: key file $(KEY_FILE) not found (set KEY_FILE=)"; exit 1; }
@@ -192,13 +199,27 @@ $(STATE):
 # archives before starting the parallel builds.
 $(VIPC_ARCHIVE): $(VIPC_SOURCES)
 	@command -v docker >/dev/null || { echo "ERROR: docker not found; it builds the vip-controller image ($@)"; exit 1; }
-	@test -n "$(VIPC_IMAGE)" || { echo "ERROR: no harvester-aws/vip-controller image in $(VIPC_DIR)/deploy/vip-controller.yaml"; exit 1; }
+	@case "$(VIPC_IMAGE)" in :*|*:) echo "ERROR: could not read the image from $(VIPC_CHART)/values.yaml and Chart.yaml"; exit 1 ;; esac
 	@echo "==> vip-controller image $(VIPC_IMAGE) for $(ARCH)"
 	@docker buildx build --quiet --platform linux/$(ARCH) -t $(VIPC_IMAGE) --load $(VIPC_DIR) >/dev/null
 	@docker save $(VIPC_IMAGE) | gzip -9 > $@.part && mv $@.part $@
 	@echo "    $@ ($$(du -h $@ | cut -f1))"
 
-vip-controller: $(VIPC_ARCHIVE)
+# The chart, packaged and base64-encoded into an RKE2 HelmChart, so first boot
+# only has to copy a file into place (vip-controller/README.md, "In the AMI").
+# A chart archive is a gzipped tar whose single top directory holds Chart.yaml,
+# so plain tar is enough; COPYFILE_DISABLE keeps macOS from adding ._ files.
+# The VIP is left as SET-ME for node 1 to fill in.
+$(VIPC_MANIFEST): $(VIPC_CHART_FILES)
+	@echo "==> vip-controller HelmChart manifest"
+	@COPYFILE_DISABLE=1 tar -czf $@.tgz -C $(VIPC_DIR) chart
+	@sed "s|CHART-CONTENT|$$(base64 < $@.tgz | tr -d '\n')|" $(VIPC_DIR)/deploy/helmchart.yaml > $@.part
+	@rm -f $@.tgz && mv $@.part $@
+	@echo "    $@ ($$(du -h $@ | cut -f1))"
+
+vip-controller: $(VIPC_ARCHIVE) $(VIPC_MANIFEST)
+
+vip-controller-manifest: $(VIPC_MANIFEST)
 
 # A pre-arch build left its stamps directly in .make/. Those name a real
 # snapshot and AMI -- the same reason `clean` keeps them -- so migrate rather
@@ -299,15 +320,15 @@ $(STATE)/built: $(STATE)/provisioned
 			./scripts/01-build-instance.sh --device \$$DEV"
 	@touch $@
 
-# The archive is order-only: rebuilding it after this step ran must not redo
-# the customisation by itself.
-$(STATE)/customized: $(STATE)/built | $(VIPC_ARCHIVE)
+# The archive and manifest are order-only: rebuilding them after this step ran
+# must not redo the customisation by itself.
+$(STATE)/customized: $(STATE)/built | $(VIPC_ARCHIVE) $(VIPC_MANIFEST)
 	@echo "==> customising for AWS"
 	@IP=$$($(AWS) ec2 describe-instances --instance-ids $$(cat $(STATE)/instance-id) \
 		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text); \
 	ssh $(SSH_OPTS) -i $(KEY_FILE) $(REMOTE)@$$IP 'mkdir -p ~/vip-controller'; \
 	scp $(SSH_OPTS) -i $(KEY_FILE) $(VIPC_ARCHIVE) $(REMOTE)@$$IP:~/vip-controller/vip-controller.tar.gz ; \
-	scp $(SSH_OPTS) -i $(KEY_FILE) $(VIPC_DIR)/deploy/vip-controller.yaml $(REMOTE)@$$IP:~/vip-controller/vip-controller.yaml ; \
+	scp $(SSH_OPTS) -i $(KEY_FILE) $(VIPC_MANIFEST) $(REMOTE)@$$IP:~/vip-controller/vip-controller.yaml ; \
 	ssh $(SSH_OPTS) -i $(KEY_FILE) $(REMOTE)@$$IP \
 		"set -eu; DEV=\$$(lsblk -dbpno NAME,SIZE | grep -v \"\$$(lsblk -no pkname \$$(findmnt -no SOURCE /))\" | awk -v w=\$$(( $(VOLUME_SIZE) * 1073741824 )) '\$$2 >= w {print \$$1; exit}'); \
 		 sudo ./scripts/02-customize-instance.sh \$$DEV --vip-controller \$$HOME/vip-controller"

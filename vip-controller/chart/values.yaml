@@ -1,0 +1,22 @@
+# Required. The cluster VIP, e.g. 172.31.0.182. On a cluster from the AMI,
+# node 1 fills this in at first boot.
+vip: ""
+
+# How often the lease holder re-checks EC2, as a Go duration. Empty means the
+# controller's default, 10s.
+recheckInterval: ""
+
+# Optional VPC routes that follow the VIP. Each key is a route table ID; each
+# value lists destination CIDRs in that table. The routes must already exist:
+# the controller only replaces their target, never creates or deletes one.
+# Empty means no route table is touched. Rendered into the ConfigMap
+# harvester-system/vip-controller-routes. Needs deploy/iam-policy-routes.json
+# on the instance role.
+routes: {}
+#  rtb-0123456789abcdef0:
+#    - 10.60.0.0/24
+
+image:
+  repository: harvester-aws/vip-controller
+  # Empty means the chart's appVersion.
+  tag: ""

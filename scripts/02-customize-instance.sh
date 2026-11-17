@@ -71,7 +71,8 @@ Options:
                         serial-only.
   --vip-controller DIR  Stage the vip-controller image and manifest on COS_OEM.
                         DIR holds vip-controller.tar.gz (for this image's
-                        architecture) and vip-controller.yaml. \`make ami\`
+                        architecture) and vip-controller.yaml (the RKE2
+                        HelmChart from \`make vip-controller\`). \`make ami\`
                         always passes it; see vip-controller/README.md.
   -h, --help            Show this help.
 USAGE
@@ -391,8 +392,8 @@ echo "[4/7] Installing AWS first-boot glue..."
 rm -rf "$MNT_OEM/aws"
 mkdir -p "$MNT_OEM/aws"
 
-# vip-controller: image archive + manifest, copied into RKE2 by configure.sh
-# (section 6c). The archive must match the image's architecture -- RKE2 would
+# vip-controller: image archive + HelmChart manifest (the chart is inside it),
+# copied into RKE2 by configure.sh (section 6c). The archive must match the image's architecture -- RKE2 would
 # import a foreign one without complaint and the pod would never start -- so it
 # is checked against the loader found above. COS_OEM is 50 MiB; the archive is
 # about 10 MB.
@@ -824,6 +825,12 @@ mount_data_partition || true
 #
 # All three options have to be given together: updateBond() only injects its
 # mode/miimon defaults when bond_options is absent entirely.
+#
+# install.addons.kubeovn_operator.enabled: kube-ovn is the only VM network that
+# works on EC2 (README, "VM networking on EC2"), so the add-on starts enabled.
+# The installer renders it into the kubeovn-operator Addon on the node that
+# creates the cluster (rancherd-22-addons.yaml, same key in v1.8 and v1.9);
+# other nodes ignore it. User-data wins, so `enabled: false` there keeps it off.
 DEFAULT_HOSTNAME="$DEFAULT_HOSTNAME" DEFAULT_TOKEN="$DEFAULT_TOKEN" \
 INSTALL_DISK="$INSTALL_DISK" yq -n '
   .scheme_version = 1 |
@@ -837,7 +844,8 @@ INSTALL_DISK="$INSTALL_DISK" yq -n '
   .install.management_interface.method = "dhcp" |
   .install.management_interface.bond_options.mode = "active-backup" |
   .install.management_interface.bond_options.miimon = "100" |
-  .install.management_interface.bond_options.fail_over_mac = "active"
+  .install.management_interface.bond_options.fail_over_mac = "active" |
+  .install.addons.kubeovn_operator.enabled = true
 ' > "$WORK/defaults.yaml"
 
 # Deep merge, user-data wins.
@@ -1046,16 +1054,19 @@ fi
 
 # aws.vip_controller only decides whether the controller is deployed. Only the
 # node that creates the cluster writes the manifest: it is the one that knows
-# the VIP, and RKE2 keeps the objects applied from there. Off by default.
+# the VIP. The manifest is an RKE2 HelmChart carrying the chart itself, so
+# RKE2's helm-controller installs it with nothing to download; values beyond
+# the VIP (routes) go in a HelmChartConfig of the same name. Off by default.
 if [ "$(yq -r '.aws.vip_controller // false' "$WORK/user-data.yaml" 2>/dev/null)" = "true" ]; then
     if [ "$MODE" != "create" ]; then
         say "aws.vip_controller: the creating node deploys it; nothing to do on a $MODE node"
     elif [ ! -f "$VIPC_SRC/vip-controller.yaml" ]; then
         say "WARNING: aws.vip_controller is true but this AMI has no $VIPC_SRC/vip-controller.yaml"
     else
-        VIP="$VIP" yq '(select(.kind == "DaemonSet") | .spec.template.spec.containers[0].env[] | select(.name == "VIP") | .value) = strenv(VIP)' \
-            "$VIPC_SRC/vip-controller.yaml" > "$WORK/vip-controller.yaml"
-        if grep -q 'SET-ME' "$WORK/vip-controller.yaml"; then
+        # SET-ME is the chart's vip value. Base64 has no '-', so the embedded
+        # chart can never contain it.
+        sed "s/SET-ME/${VIP}/" "$VIPC_SRC/vip-controller.yaml" > "$WORK/vip-controller.yaml"
+        if [ -z "$VIP" ] || grep -q 'SET-ME' "$WORK/vip-controller.yaml"; then
             say "WARNING: could not set VIP in the vip-controller manifest; not deploying it"
         else
             mkdir -p /var/lib/rancher/rke2/server/manifests
@@ -1100,8 +1111,9 @@ AWS first-boot glue, installed by 02-customize-instance.sh.
                       harvester-aws-config.service, getty ordering.
   configure.sh        harvester-aws-config.service: IMDSv2 -> /oem/userdata.yaml.
   vip-controller/     image archive (copied to RKE2's agent/images on first
-                      boot) and manifest (deployed only with
-                      aws.vip_controller: true). See vip-controller/README.md.
+                      boot) and HelmChart manifest carrying the chart
+                      (deployed only with aws.vip_controller: true). See
+                      vip-controller/README.md.
 
 Logs:
   journalctl -u harvester-aws-config

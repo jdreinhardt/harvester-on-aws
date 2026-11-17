@@ -146,22 +146,25 @@ vip-controller can repoint those routes along with the VIP:
 2. Deploy with source/destination check disabled: CloudFormation
    `DisableSourceDestCheck=true`, or Terraform `disable_source_dest_check = true`.
 3. After the cluster is up, create the route if it doesn't exist yet, then
-   list it in this ConfigMap and apply it with `kubectl apply -f`:
+   list it in this HelmChartConfig and apply it with `kubectl apply -f`:
 
    ```yaml
-   apiVersion: v1
-   kind: ConfigMap
+   apiVersion: helm.cattle.io/v1
+   kind: HelmChartConfig
    metadata:
-     name: vip-controller-routes
-     namespace: harvester-system
-   data:
-     rtb-0123456789abcdef0: |
-       10.60.0.0/24
+     name: harvester-aws-vip-controller
+     namespace: kube-system
+   spec:
+     valuesContent: |-
+       routes:
+         rtb-0123456789abcdef0:
+           - 10.60.0.0/24
    ```
 
-   Each key is a route table ID, and each value lists that table's destination
-   CIDRs, one per line. vip-controller only changes where listed routes point;
-   it never creates or deletes a route.
+   Each key under `routes` is a route table ID, and each value lists that
+   table's destination CIDRs. This adds to the vip-controller chart's settings
+   without touching the VIP. vip-controller only changes where listed routes
+   point; it never creates or deletes a route.
 
 ## 4a. Deploy with CloudFormation
 
@@ -430,6 +433,16 @@ Every node should show `Ready`, and on a 3-node cluster each should have the
 
 ## 6. Check vip-controller
 
+It is installed as a Helm chart by RKE2. If no pods appear, check the install
+job first:
+
+```bash
+kubectl -n kube-system get helmchart harvester-aws-vip-controller
+kubectl -n kube-system logs job/helm-install-harvester-aws-vip-controller
+```
+
+Then the controller itself:
+
 ```bash
 kubectl -n harvester-system get pods -l app.kubernetes.io/name=vip-controller -o wide
 kubectl -n harvester-system logs -l app.kubernetes.io/name=vip-controller --prefix
@@ -479,4 +492,5 @@ capacity reservation.
 
 Guest VMs don't boot on arm64 Harvester v1.9.0
 ([README](README.md#what-has-been-tested)). For
-arm64 VMs, build v1.8.2 instead with `HARVESTER_VERSION=v1.8.2`.
+arm64 VMs, build v1.9.1 (or v1.8.2) instead, for example with
+`HARVESTER_VERSION=v1.9.1`.

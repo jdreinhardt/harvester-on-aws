@@ -2,8 +2,13 @@
 
 Makes the VPC follow kube-vip's election, so the Harvester VIP fails over on
 EC2. Optionally, VPC routes follow it too. Status: **both have been run on a
-cluster by hand (results below). Every AMI from `make ami` now carries the
-image; that AMI path has not been run yet.** The
+cluster by hand (results below), and the AMI path with the plain manifest was
+validated on v1.8.2 and v1.9.0. It is now deployed as a Helm chart (below,
+"In the AMI"). The chart's install, routes, turn-off and turn-on steps were
+run on a local k3s, which has the same helm-controller as RKE2. On Harvester
+v1.9.1, a fresh AMI install of the chart (routes and a holder reboot
+included), and moving a cluster from the plain manifest to the chart, have
+both been run.** The
 design and the reasoning behind it are in the main README, under "The VIP does
 not fail over" → "Proposed design".
 
@@ -33,8 +38,9 @@ that reassignment, and leaves binding the address to kube-vip.
 | `routes.go` | the optional routes ConfigMap, repointing routes |
 | `claim_test.go`, `routes_test.go` | the claim, lease and route decisions, with a fake EC2 |
 | `Dockerfile` | cross-compiles per architecture into a `scratch` image |
-| `deploy/vip-controller.yaml` | ServiceAccount, Role, RoleBinding, DaemonSet |
-| `deploy/routes-configmap.example.yaml` | an example routes ConfigMap |
+| `chart/` | the Helm chart: ServiceAccount, Role, RoleBinding, DaemonSet, and the routes ConfigMap when routes are set |
+| `deploy/helmchart.yaml` | the RKE2 HelmChart template that `make vip-controller` fills with the packaged chart |
+| `deploy/routes-helmchartconfig.example.yaml` | an example HelmChartConfig adding routes |
 | `deploy/iam-policy.json` | the instance-role policy, VIP only |
 | `deploy/iam-policy-routes.json` | the same, plus route table edits |
 
@@ -51,22 +57,29 @@ route's target; it never creates or deletes a route, and never looks for
 routes by what they currently point at. A blackholed route left on a stopped
 node is still found by its destination, and repointed.
 
-The list is the ConfigMap `harvester-system/vip-controller-routes`. Each key is
-a route table ID; each value lists destination CIDRs in that table, one per
-line:
+The list is the chart value `routes`. Each key is a route table ID; each value
+lists destination CIDRs in that table:
 
 ```yaml
-data:
-  rtb-0123456789abcdef0: |
-    10.60.0.0/24
-    10.61.0.0/24
+routes:
+  rtb-0123456789abcdef0:
+    - 10.60.0.0/24
+    - 10.61.0.0/24
 ```
 
-* **No ConfigMap, no route changes.** That is the default.
+Set it with a HelmChartConfig named after the HelmChart
+(`deploy/routes-helmchartconfig.example.yaml`), applied with `kubectl apply
+-f`. Its values are added to the HelmChart's, so the VIP node 1 set is kept,
+and RKE2 never overwrites it. The chart renders the list into the ConfigMap
+`harvester-system/vip-controller-routes`, which is what the controller reads.
+
+* **No routes, no route changes.** That is the default: the chart renders no
+  ConfigMap at all.
 * **Read on every check** while the node holds the Lease: on becoming holder,
-  then every `RECHECK_INTERVAL`. Adding, removing or editing entries takes
-  effect within that interval, with no restart. Removing an entry stops
-  managing that route; it does not delete it.
+  then every `RECHECK_INTERVAL`. Applying or editing the HelmChartConfig
+  re-runs the chart, which rewrites the ConfigMap, and the controller picks it
+  up within that interval, with no restart. Removing an entry stops managing
+  that route; it does not delete it.
 * **Checked before changing.** For each listed route it reads the current
   target and calls `ReplaceRoute` only if the target is not its own ENI, so the
   periodic check also repairs a route someone repointed by hand.
@@ -80,30 +93,42 @@ data:
   target. The module's `disable_source_dest_check` (CloudFormation:
   `DisableSourceDestCheck`) applies to every node.
 
-`deploy/routes-configmap.example.yaml` is a starting point. It is a separate
-file from `vip-controller.yaml` so that re-applying the manifest never
-overwrites your routes.
-
 ## Configuration
 
-| Variable | |
-| --- | --- |
-| `VIP` | Required. The cluster VIP. Set in the manifest. |
-| `NODE_NAME` | Required. From the downward API; must match kube-vip's `holderIdentity`. |
-| `RECHECK_INTERVAL` | Optional, a Go duration. Default `10s`. |
+Chart values (`chart/values.yaml`):
 
-The manifest also points the client at `127.0.0.1:6443`, the API server on the
-same node, rather than the service IP.
+| Value | |
+| --- | --- |
+| `vip` | Required; the chart refuses to render without it. Node 1 sets it at first boot. |
+| `recheckInterval` | Optional, a Go duration. Empty means the controller's default, `10s`. |
+| `routes` | Optional; see above. |
+| `image.repository`, `image.tag` | The imported image. The tag defaults to the chart's `appVersion`. |
+
+They become the controller's environment: `VIP`, `RECHECK_INTERVAL`, and
+`NODE_NAME` from the downward API, which must match kube-vip's
+`holderIdentity`. The chart also points the client at `127.0.0.1:6443`, the API
+server on the same node, rather than the service IP. Everything goes in
+`harvester-system` whatever the release namespace, since that is where the
+lease is.
 
 ## Build
 
 ```bash
 go test ./...
+helm lint chart --set vip=172.31.0.182
 ```
 
-One archive per architecture, each tagged `harvester-aws/vip-controller:0.2.0`
-to match the manifest. Build into the local engine and `docker save`, because
-the default `docker` buildx driver cannot write an archive directly:
+From the repository root, `make vip-controller ARCH=amd64` (or `arm64`) builds
+both things the AMI needs: the image archive (needs docker) and
+`vip-controller.yaml`, the HelmChart with the chart packaged into it (`make
+vip-controller-manifest` builds only that, without docker). To bump the
+version, change `appVersion` in `chart/Chart.yaml`; the Makefile reads the
+image tag from there.
+
+By hand: one archive per architecture, each tagged
+`harvester-aws/vip-controller:0.2.0` to match the chart. Build into the local
+engine and `docker save`, because the default `docker` buildx driver cannot
+write an archive directly:
 
 ```bash
 for a in amd64 arm64; do
@@ -177,8 +202,8 @@ gotchas").
 
 ## In the AMI
 
-`make ami` builds the archive for the AMI's architecture (`make
-vip-controller`, needs docker) and phase 2 stages it with the manifest on
+`make ami` builds the archive for the AMI's architecture and the HelmChart
+manifest (`make vip-controller`, needs docker), and phase 2 stages both on
 `COS_OEM`. On first boot:
 
 * **Every node** copies the image into `/var/lib/rancher/rke2/agent/images/`,
@@ -186,33 +211,76 @@ vip-controller`, needs docker) and phase 2 stages it with the manifest on
 * **With `aws.vip_controller: true`** (Terraform `vip_controller = true`,
   CloudFormation `VipController=true`, or `03-launch-instance.sh
   --vip-controller` on the first node), the
-  node that creates the cluster also writes the manifest, with its VIP filled
+  node that creates the cluster also writes the HelmChart, with its VIP filled
   in, to `/var/lib/rancher/rke2/server/manifests/harvester-aws-vip-controller.yaml`.
-  RKE2 applies it and keeps it applied.
+  RKE2 applies it, and its helm-controller installs the chart from the
+  HelmChart's `chartContent` as the release `harvester-aws-vip-controller`.
+  Nothing is downloaded. The install job retries until `harvester-system`
+  exists, which Harvester creates during its own bootstrap.
+
+The HelmChart is RKE2's (`kubectl -n kube-system get helmchart
+harvester-aws-vip-controller`); change settings with a HelmChartConfig of the
+same name, as for routes above, rather than by editing it.
 
 Add the instance role (above) before or after; until then the controller logs
 `UnauthorizedOperation` and moves nothing.
 
 **Turning it on later**, on a cluster deployed with the flag off: the image is
-already on every node, so only the manifest is needed.
+already on every node, so only the HelmChart is needed. From the repository
+root:
 
 ```bash
-sed 's/value: "SET-ME".*/value: "<the cluster VIP>"/' deploy/vip-controller.yaml | kubectl apply -f -
+make vip-controller-manifest
+sed 's/SET-ME/<the cluster VIP>/' vip-controller/vip-controller.yaml | kubectl apply -f -
 ```
 
 **Turning it off** where the flag deployed it:
 
 1. Delete `/var/lib/rancher/rke2/server/manifests/harvester-aws-vip-controller.yaml`
    on node 1 first, so RKE2 has nothing to re-apply. Deleting the file alone
-   removes nothing: the objects, and RKE2's record of the file, stay.
-2. `kubectl delete -f deploy/vip-controller.yaml`.
+   removes nothing: the HelmChart, and RKE2's record of the file, stay.
+2. `kubectl -n kube-system delete helmchart harvester-aws-vip-controller`.
+   helm-controller runs an uninstall job that removes the release's objects.
+   A HelmChartConfig, if you made one, is yours to delete.
 3. Remove RKE2's stale record of the file:
    `kubectl -n kube-system delete addons.k3s.cattle.io harvester-aws-vip-controller`.
 
-The VIP stays wherever it was last moved to. Both directions were run on a
-cluster from the AMI: the objects stayed gone, and re-applying with the
-`sed | kubectl apply` line above brought the controller back, moving the VIP
-and the route on the next re-election.
+The VIP stays wherever it was last moved to. With the earlier plain manifest,
+both directions were run on a cluster from the AMI. The HelmChart steps above
+were run on a local k3s: the uninstall removed every object, including the
+routes ConfigMap, nothing came back after a restart, and turning it on again
+picked up a HelmChartConfig left in place.
+
+**Moving a cluster from an older AMI** to the chart. Such a cluster has the
+plain objects, not a release. The new chart's image tag (`appVersion`) has to
+be on every node already; if it isn't, import it first (next section, step 2).
+
+* **If the flag deployed it**, replace the file in place on node 1, with the
+  VIP filled in:
+
+  ```bash
+  make vip-controller-manifest
+  sed 's/SET-ME/<the cluster VIP>/' vip-controller/vip-controller.yaml   # copy to node 1 as:
+  # /var/lib/rancher/rke2/server/manifests/harvester-aws-vip-controller.yaml (mode 0600)
+  ```
+
+  RKE2 deletes the objects the old file made, because it tracks what each
+  manifest applied, and Helm installs fresh ones. On a v1.9.1 cluster from the
+  AMI (2026-11-17) this took about 10 s from the file swap to the new pods
+  running. The VIP and routes stayed where they were throughout.
+* **If it was applied by hand** with `kubectl apply`, RKE2 doesn't own the
+  objects, so delete them first (`kubectl -n harvester-system delete
+  daemonset,serviceaccount,role,rolebinding vip-controller`), then apply the
+  HelmChart as in "Turning it on later". Otherwise Helm refuses to take them over.
+
+A routes ConfigMap applied by hand keeps working alongside the chart, since the
+controller reads it by name. To move it into a HelmChartConfig, apply the
+HelmChartConfig, then delete the ConfigMap. Until the ConfigMap is gone, the
+upgrade fails with `ConfigMap "vip-controller-routes" ... exists and cannot be
+imported into the current release`. The running release and pods stay as they
+were. The install job retries on its own and recreates the ConfigMap under Helm,
+about 70 s after the delete on the same cluster. The pods don't restart, and
+the routes keep being enforced.
 
 ## Try it on a cluster without the AMI image
 
@@ -226,7 +294,7 @@ For an AMI built before the image was added, or to test a new build:
    gunzip -c vip-controller-amd64.tar.gz | sudo /var/lib/rancher/rke2/bin/ctr --address /run/k3s/containerd/containerd.sock -n k8s.io images import -
    ```
 
-3. Set `VIP` in `deploy/vip-controller.yaml` and apply it.
+3. Apply the HelmChart as in "Turning it on later" above.
 4. Watch it: `kubectl -n harvester-system logs -l app.kubernetes.io/name=vip-controller -f --prefix`.
 
 ## Checked on a v1.8.2 cluster
@@ -549,6 +617,51 @@ lease, until authorization was ready; it recovered unaided. Afterwards node 1
 ran v1.9.0 and kube-vip v1.1.2, and the VIP and the overlay VM answered from
 the probe instance. The holder was not rebooted on v1.9.0, so this does not
 settle the kube-vip question below.
+
+## Measured: v1.9.1 from the AMI, Helm chart, holder rebooted (2026-11-17)
+
+v1.9.1 amd64 AMI built by `make ami` (`ami-0d040a196eb99b524`), the first with
+the HelmChart and with kube-ovn on by default. Three m8i.4xlarge nodes,
+Terraform `vip_controller = true`, `harvester-node-role` with the routes
+policy.
+
+**First boot.** The install job started at 20:25:54, retried until
+`harvester-system` existed, and installed release v1 at 20:29:05. The DaemonSet
+ran on node 1, then on nodes 2 and 3 as they joined. (They joined only after a
+Rancher restart, for the bootstrap stall in the main README, "If the joining
+nodes never become Ready".) `kubeovn-operator` was enabled from creation with
+nothing done by hand.
+
+**Routes from a HelmChartConfig.** Applied at 21:09:02. Helm installed release
+v2 and the ConfigMap at 21:09:07. At 21:09:11 the holder repointed the route,
+left on a deleted ENI from the previous cluster, to itself. A route repointed
+by hand to node 2 was back on the holder 12 s later, within one 10 s recheck.
+
+**Node 1 rebooted**, the holder. `systemctl reboot` at 21:11:45.5 UTC; node 3
+pinged the VIP every 0.2 s.
+
+| t (s) | |
+| --- | --- |
+| +2.9 | last VIP reply |
+| +20.4 | node 3's kube-vip acquires the lease (node 1's did not release it) and adds the VIP locally |
+| +20.5 | node 3's ping answered again, but locally (see below) |
+| **+21.2** | **node 3's controller claims the VIP**: about 18 s of outage for anything outside node 3 |
+| +21.6 | and repoints the route |
+| 21:14:55 | node 1 `Ready` again; the lease stayed on node 3 |
+
+The probe node became the new holder, so its replies from +20.5 came from its
+own copy of the address. The VPC delivered the VIP to node 3 only from the
+claim at +21.2. An outside probe, or a node that doesn't win the election, is
+the better observer. The controller took 0.8 s after the lease moved. The rest
+is the same kube-vip behaviour as on v1.9.0, still v1.1.2:
+* Node 1's kube-vip did not release the lease.
+* Node 2's kube-vip logged `Error retrieving lease lock ... 10.53.0.1:443` from
+  21:12:00 until 21:13:19, when it saw node 3 as leader.
+
+Afterwards both OVN databases still had three members. Node 1 kept its server
+IDs and its `.hdr` files from first boot, through the bind-mounted
+`/etc/origin/ovn`. Northbound leadership moved to node 2 and southbound to
+node 3. The kube-ovn operator kept its patched 512Mi limit with no restarts.
 
 ## Still to verify
 
