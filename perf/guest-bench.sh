@@ -139,7 +139,7 @@ Usage: $0 [options]
                       ${IMAGE_SERIAL}, for the cluster's architecture.
   --pod-image IMG     Pod image. Default: ${POD_IMAGE}
   --timeout MIN       Per-mode limit on the benchmark. Default: ${TIMEOUT_MIN}
-  --allow-arm64-v19   Run VMs on arm64 Harvester v1.9.x anyway. Refused by
+  --allow-arm64-v19   Run VMs on arm64 Harvester v1.9.0 anyway. Refused by
                       default: guests dead-loop in firmware there.
   --keep              Leave the namespace and everything in it in place.
   -h, --help          This.
@@ -229,10 +229,10 @@ ARCH="${ARCHES%% *}"
 [ "$(wc -w <<<"$ARCHES")" -eq 1 ] || { echo "ERROR: mixed node architectures: $ARCHES" >&2; exit 1; }
 case "$ARCH" in amd64|arm64) ;; *) echo "ERROR: unsupported architecture '$ARCH'" >&2; exit 1 ;; esac
 
-if { want vm || [ "$CONTENTION" -gt 0 ]; } && [ "$ARCH" = "arm64" ] && [[ "$HARVESTER" == v1.9.* ]] && [ "$ALLOW_ARM64_V19" != "true" ]; then
+if { want vm || [ "$CONTENTION" -gt 0 ]; } && [ "$ARCH" = "arm64" ] && [[ "$HARVESTER" == v1.9.0* ]] && [ "$ALLOW_ARM64_V19" != "true" ]; then
     echo "ERROR: arm64 ${HARVESTER} guests dead-loop in their UEFI firmware and never boot" >&2
     echo "       (see the repository README, 'What has been tested'). There is nothing" >&2
-    echo "       to measure. Use v1.8.2, --mode pod, or --allow-arm64-v19 to try anyway." >&2
+    echo "       to measure. Use v1.9.1 or v1.8.2, --mode pod, or --allow-arm64-v19 to try anyway." >&2
     exit 1
 fi
 

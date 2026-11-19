@@ -139,7 +139,7 @@ Usage: $0 [options]
   --guest-mode M    guest: both (default; VM and pod, which gives the VM
                     overhead), vm or pod.
   --allow-arm64-density
-                    Run density on arm64 v1.9.x anyway. Refused by default:
+                    Run density on arm64 v1.9.0 anyway. Refused by default:
                     guests cannot boot there, yet VMIs still reach Running, so
                     the results look healthy and measure nothing.
   --allow-arm64-v19 As --allow-arm64-density, for density AND guest.
@@ -448,11 +448,11 @@ if [ -n "$PERF_NS" ]; then
     warn "harvester-perf-system already exists (an earlier run kept it); its contents count against the cluster."
 fi
 if has_suite guest; then
-    if [ "$NODE_GOARCH" = "arm64" ] && [[ "$SERVER_VERSION" == v1.9.* ]] && [ "$GUEST_MODE" != "pod" ] \
+    if [ "$NODE_GOARCH" = "arm64" ] && [[ "$SERVER_VERSION" == v1.9.0* ]] && [ "$GUEST_MODE" != "pod" ] \
        && [ "$ALLOW_ARM64_GUEST" != "true" ]; then
         echo "ERROR: the guest suite cannot run on arm64 ${SERVER_VERSION}: its guests dead-loop" >&2
         echo "       in firmware and never boot (README, 'What has been tested'). Drop guest" >&2
-        echo "       from --suites, use v1.8.2, or pass --allow-arm64-v19." >&2
+        echo "       from --suites, use v1.9.1 or v1.8.2, or pass --allow-arm64-v19." >&2
         exit 1
     fi
     [ -n "$KUBE_VERSION" ] || { echo "ERROR: could not read the cluster's Kubernetes version for kubectl" >&2; exit 1; }
@@ -474,11 +474,11 @@ if has_suite guest; then
     : "${GUEST_LABEL:=aws ${NODE_TYPE} ${VIRT}}"
 fi
 if has_suite density; then
-    if [ "$NODE_GOARCH" = "arm64" ] && [[ "$SERVER_VERSION" == v1.9.* ]] && [ "$ALLOW_ARM64_DENSITY" != "true" ]; then
+    if [ "$NODE_GOARCH" = "arm64" ] && [[ "$SERVER_VERSION" == v1.9.0* ]] && [ "$ALLOW_ARM64_DENSITY" != "true" ]; then
         echo "ERROR: density on arm64 ${SERVER_VERSION} would report success while measuring nothing." >&2
-        echo "       The v1.9 guest firmware dead-loops before the kernel boots (see README," >&2
+        echo "       The v1.9.0 guest firmware dead-loops before the kernel boots (see README," >&2
         echo "       'What has been tested'), but density only waits for VMI phase Running," >&2
-        echo "       which QEMU reaches regardless. Drop density from --suites, use v1.8.2," >&2
+        echo "       which QEMU reaches regardless. Drop density from --suites, use v1.9.1 or v1.8.2," >&2
         echo "       or pass --allow-arm64-density to run it anyway." >&2
         exit 1
     fi

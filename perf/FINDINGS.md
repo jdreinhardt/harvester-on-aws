@@ -16,8 +16,9 @@ platform: nested KVM on x86, plain KVM on Graviton metal.
 Status: six configurations measured (x86 nested at gp3 baseline, gp3
 16,000 / 1,000 and io2; Graviton bare metal at gp3 baseline, provisioned gp3,
 and io2), with pgbench and multi-VM contention on both platforms, all on
-v1.8.2. [v1.9.0](#harvester-v190-on-configuration-5s-platform) is measured on
-one x86 configuration. See [the matrix](#test-matrix) for what is next.
+v1.8.2. [v1.9.0](#harvester-v190-on-configuration-5s-platform) and
+[v1.9.1](#harvester-v191-on-configuration-5s-platform) are measured on one x86
+configuration, and v1.9.1 also [on Graviton](#harvester-v191-on-graviton-r7gmetal). See [the matrix](#test-matrix) for what is next.
 
 ## What to expect on AWS, so far
 
@@ -147,8 +148,8 @@ What that means for sizing:
 - **New VM disks are slower until written: confirmed.** Longhorn volumes are
   thin. On a fresh disk, a VM managed 1,119 random-write IOPS; after
   writing the disk once, 2,955. That is a 2.6× penalty on first writes.
-- **Graviton guest VMs need v1.8.2 today.** On v1.9.0 they cannot boot (see
-  the [README](../README.md#what-has-been-tested)).
+- **Graviton guest VMs need v1.8.2 or v1.9.1.** On v1.9.0 they cannot boot;
+  v1.9.1 fixes it (see the [README](../README.md#what-has-been-tested)).
 
 ---
 
@@ -1694,7 +1695,178 @@ What it shows:
    different node, and no etcd histograms. So this is not yet a v1.9.0
    regression. It is the first contention result that needs a rerun: on a
    fresh v1.9.0 cluster without the add-ons, with `etcd_expose_metrics` on.
-   Graviton cannot answer it, since v1.9.0 arm64 guests do not boot.
+   Graviton cannot answer it, since v1.9.0 arm64 guests do not boot (v1.9.1's can).
+
+---
+
+## Harvester v1.9.1 on configuration 5's platform
+
+The v1.9.0 runs above repeated on v1.9.1: the same 3 × `m8i.4xlarge`, gp3
+at 16,000 IOPS / 1,000 MiB/s, harvester-perf `6858e2c` and guest flags.
+
+| | |
+| --- | --- |
+| Harvester | v1.9.1 (Kubernetes v1.36.6+rke2r1), amd64 |
+| Measured | 2026-11-17: full suite with pgbench (`20261117-154629`), then pre-filled 6-VM contention (`20261117-162435`) |
+| Compared with | v1.9.0 (`20261029-144143`, `20261029-152253`) and configuration 5 on v1.8.2 (`20261021-095446`, `20261021-103516`) |
+| Not the same as those runs | etcd metrics exposed (off on v1.9.0), and the etcd benchmark ran against the leader, as on v1.8.2. kube-ovn, vip-controller and rancher-monitoring running, as on v1.9.0. node-capacity's disk check errored: hvperf's floating `bci-base:latest` image no longer has `nsenter` |
+
+### Single VM, etcd, footprint and density: the same as before
+
+| Figure | v1.8.2 | v1.9.0 | **v1.9.1** |
+| --- | --- | --- | --- |
+| VM overhead (compute / scheduler / disk / network) | +19.6% (2.4 / 33.0 / 5.4 / 32.5) | +18.6% (2.6 / 32.1 / 2.6 / 31.9) | **+20.3%** (2.4 / 35.7 / 0.6 / 35.5) |
+| pgbench VM tps, 1 / 8 / 32 clients | 441 / 2,096 / 4,988 | 438 / 2,069 / 4,899 | **439 / 2,046 / 4,870** |
+| VM 4K random write / read, qd32 | 11,775 / 18,952 IOPS | 11,252 / 17,913 IOPS | 10,928 / 17,696 IOPS |
+| VM seq write / read, 1M qd16 | 298 / 143 MiB/s | 299 / 136 MiB/s | 287 / 161 MiB/s |
+| VM 4K write + fsync, qd1 | 640 IOPS, p99 2.06 ms | 644 IOPS, p99 2.02 ms | 631 IOPS, p99 2.25 ms |
+| VM network, 4 streams / round trip | 7.53 Gbit/s / 0.81 ms | 7.95 Gbit/s / 0.71 ms | 7.71 Gbit/s / 0.84 ms |
+| etcd writes, serial / 500 clients | 652 / 39,148 per s | 497 / 30,123 per s (a follower) | 602 / 41,277 per s |
+| etcd serializable reads, 500 clients | 190,300/s | 185,326/s | 178,525/s |
+| etcd WAL fsync / backend commit p99 | 3.95 / 3.98 ms (configuration 1) | not exposed | 3.92 / 4.92 ms |
+| 50 VMIs, creation to `Running` | 100 s; p50 ≈15 s, p99 ≈20 s | 105 s; p50 15.0 s, p99 19.9 s | 112 s; hvperf's latency query returned no data |
+| Allocatable per node | 15 cores, 61.8 GiB, 200 pods | the same | the same |
+| kube-system CPU / memory requests | 5.7 cores / 7.7 GiB | 7.8 / 9.9 | 8.6 / 10.0 |
+
+What it shows:
+
+1. **No figure moves beyond run-to-run variance.** The overall overhead,
+   20.3%, sits inside the 18.5–20.9% configuration 1 measured over three
+   runs.
+   pgbench is within 2% of both earlier releases. Random I/O is 4–7% below
+   v1.8.2, but the VM is within 1% of its own pod, so the VM layer is not
+   the cause.
+2. **etcd is back to leader figures.** 41,277 concurrent writes per second,
+   against v1.9.0's 30,123 from a follower. That confirms the v1.9.0 drop
+   was leadership, not the release.
+3. **kube-system reserves 0.8 more cores than on v1.9.0.** Which pods grew
+   was not checked.
+4. **Density's start times are missing.** hvperf's query returned no data,
+   the same gap seen on [configuration 2](#absolute-figures-side-by-side).
+
+### Six VMs at once, pre-filled: v1.9.0's slow control plane did not recur
+
+| Phase | v1.8.2: total | v1.9.0: total | **v1.9.1: total** | etcd WAL p99, v1.8.2 / **v1.9.1** | API→etcd p99, v1.8.2 / v1.9.0 (worst verb) / **v1.9.1** |
+| --- | --- | --- | --- | --- | --- |
+| Pre-fill, 6 × 10 GiB | 60 s; 171–175 MiB/s | 60 s; 172–186 MiB/s | 54 s; 192–200 MiB/s | – | – |
+| Idle | – | – | – | 3.9 / 4.0 ms | 14.8 / 19.0 / 24.2 ms |
+| One VM, 4K random | 11,494 IOPS | 11,334 IOPS | 11,049 IOPS | 3.9 / 3.9 ms | 15.1 / 21.0 / 19.6 ms |
+| Six VMs, 4K random | 16,033 IOPS | 15,181 IOPS | 16,023 IOPS | 30.9 / 30.7 ms | 49 / 820 / 42 ms |
+| Six VMs, 1 MiB sequential | 1,006 MiB/s | 996 MiB/s | 999 MiB/s | 216 / **327 ms** | 986 / 3,645 / 996 ms |
+
+What it shows:
+
+1. **The storage result is unchanged again.** Six VMs reached the volume's
+   16,000 IOPS and 1,000 MiB/s.
+2. **The API server's etcd latency is back to v1.8.2's**: 996 ms in the
+   sequential phase against 986 ms, where v1.9.0 measured 3,645 ms. The
+   kubeovn-operator restarted twice in the sequential phase, once
+   `OOMKilled` at its 128 MiB limit, against 7 times on v1.9.0. So v1.9.0's
+   result came from that run's conditions rather than from the release. Its
+   cause is still unexplained.
+3. **etcd's WAL fsync p99 in the sequential phase was 327 ms**, against
+   216 ms on v1.8.2. Nothing failed, but it is the narrowest margin to etcd's
+   1 s election timeout measured on 16,000 IOPS. One run of each. Other
+   control-plane counts were not collected.
+
+### Functional: the e2e suite
+
+The upstream e2e suite ran on the same cluster afterwards
+(`e2e/results/20261117-184222`): 217 of 242 passed, 5 failed, 4 errored and
+13 skipped. Six of the nine failures and errors had one cause:
+`harvester-node-role`'s policy allowed claiming the VIP only in a previous
+cluster's subnet. When the power-off test stopped the VIP's node, the VIP went
+dark for the rest of the run. With the policy corrected, the VIP moved within
+3 s. The other three:
+- `test_invalid_values`, which fails on every release
+- the rancher-monitoring add-on test, which assumes the add-on starts disabled
+- `test_vm_with_bogus_vlan`, which assumes every VM network has a VLAN, which
+  the overlay network does not
+
+---
+
+## Harvester v1.9.1 on Graviton (`r7g.metal`)
+
+Every Graviton run above is v1.8.2 on `c7g.metal`, because v1.9.0's arm64
+guests cannot boot. v1.9.1 fixes that (SUSE backported the edk2 fix; the
+[README](../README.md#what-has-been-tested) has the detail), so this is the
+first v1.9 release measured on Graviton. It repeats configuration 3's
+settings, with pgbench and the pre-filled contention test at 16,000 IOPS.
+
+| | |
+| --- | --- |
+| Harvester | v1.9.1 (Kubernetes v1.36.6+rke2r1), arm64 |
+| Nodes | 3 × `r7g.metal` (64 vCPU Graviton3, 512 GiB). `c7g.metal` had no capacity. Same CPU, the same 30 Gbit/s network and the same EBS limits (20,000 Mbps / 80,000 IOPS), with four times the memory |
+| Node volume | gp3, 500 GiB, 16,000 IOPS / 1,000 MiB/s, as configuration 3 |
+| Measured | 2026-11-18, harvester-perf `6858e2c`: node capacity, footprint, etcd and density (`20261118-090149`); guest suite with pgbench (`20261118-094505`); pre-filled 6-VM contention (`20261118-102231`) |
+| Compared with | configuration 2 (density, footprint), configuration 3 (disk, etcd), the pgbench run (`20261020-113253`) and the pre-filled contention at 16,000 (`20261020-172743`), all v1.8.2 on `c7g.metal` |
+| Not the same as those runs | etcd metrics exposed; the kube-ovn add-on, vip-controller and rancher-monitoring running. The guest suite ran on its own after etcd and density, because `perf/guest-bench.sh` still refused arm64 v1.9.x when the first run started (since fixed). node-capacity's disk check errored: hvperf's floating `bci-base:latest` image no longer has `nsenter` |
+
+### Single VM, etcd, footprint and density: the same as v1.8.2
+
+| Figure | v1.8.2, `c7g.metal` | **v1.9.1, `r7g.metal`** |
+| --- | --- | --- |
+| VM overhead (compute / scheduler / disk / network) | +9.7% (0.4 / 3.0 / 7.8 / 25.5), configuration 3 | **+11.8%** (0.3 / 29.1 / −14.2 / 24.9) |
+| pgbench VM tps, 1 / 8 / 32 clients | 565 / 2,600 / 4,605 | **556 / 2,538 / 4,623** |
+| VM seq write / read, 1M qd16 | 452 / 1,059 MiB/s | 428 / 981 MiB/s |
+| VM 4K random write / read, qd32 | 14,130 / 21,590 IOPS | 13,903 / 21,192 IOPS |
+| VM 4K write + fsync, qd1 | 792 IOPS, p99 1.40 ms | 784 IOPS, p99 1.45 ms |
+| VM network, 1 stream / round trip | 4.6 Gbit/s / 0.35 ms (configuration 2) | 4.62 Gbit/s / 0.43 ms; 4 streams 7.74 against the pod's 12.2 |
+| etcd writes, serial / 500 clients | 672 / 38,499 per s | 676 / 41,747 per s |
+| etcd WAL fsync / backend commit p99 | 3.92 / 3.94 ms | 3.91 / 3.95 ms |
+| 50 VMIs, creation to `Running` | 96 s; every start 10–20 s (configuration 2) | 107 s; p50 16.2 s, **p99 29.5 s** |
+| Harvester's own requests, whole cluster | 31 cores / 14.4 GiB (configuration 2) | 34.2 cores / 17.0 GiB; kube-system 8.7 cores / 10.0 GiB, the same as x86 v1.9.1 |
+
+What it shows:
+
+1. **The release changes nothing on a single VM.** Disk, fsync, pgbench
+   (within 2%) and etcd all match v1.8.2 on `c7g.metal`.
+2. **The overall overhead is higher only because of the scheduler figure**,
+   29.1% against 3.0%. That is the figure already known to be unstable on
+   Graviton. This is a seventh sample, slightly above the earlier range:
+   −0.9 to 29.1%, about 15% on average. One part is new: futex wake/wait cost
+   the VM 35.7%, where configuration 2 measured 6%. One run, on a different
+   host type.
+3. **The disk category is negative because of the pod, not the VM.** The pod's
+   sequential read was 534 MiB/s against 1,577 on `c7g.metal`, and its fsync
+   p99 2.21 ms against the VM's 1.45. The VM's own figures match
+   configuration 3.
+4. **Density's tail is slower:** p99 29.5 s, where every start on
+   `c7g.metal` v1.8.2 and on x86 v1.9.0 took 20 s or less. One run, and the
+   quantile is interpolated within buckets that double in width. Not
+   explained.
+
+### Six VMs at once, pre-filled: the same as v1.8.2
+
+| Phase | v1.8.2: total | **v1.9.1: total** | v1.8.2: etcd WAL p99 / API→etcd p99 | **v1.9.1: etcd WAL p99 / API→etcd p99** |
+| --- | --- | --- | --- | --- |
+| Pre-fill, 6 × 10 GiB | 58 s; 178–191 MiB/s | 56 s; 185–250 MiB/s | – | – |
+| Idle | – | – | 4.0 / 17.5 ms | 3.9 / 9.6 ms |
+| One VM, 4K random | 14,102 IOPS | 13,884 IOPS | 3.9 / 15.6 ms | 3.9 / 5.0 ms |
+| Six VMs, 4K random | 16,031 IOPS | 16,025 IOPS | 30.9 / 48 ms | 31.1 / 46.1 ms |
+| Six VMs, 1 MiB sequential | 1,011 MiB/s | 1,011 MiB/s | 123 / 952 ms | 115 / 928 ms |
+
+Every figure is within a few percent of v1.8.2. The slower control plane seen
+on [x86 v1.9.0](#harvester-v190-on-configuration-5s-platform) does not appear
+here. Control-plane event counts (HTTP 500s, probe failures, slow applies)
+were not collected for this run: the e2e suite later disabled the monitoring
+add-on, which removed Prometheus's data.
+
+### Functional: the e2e suite
+
+The upstream e2e suite ran on the same cluster afterwards
+(`e2e/results/20261118-133347`): 215 of 245 passed, 11 failed, 1 errored and
+15 skipped. All five host power-cycle tests passed, and the VIP moved when its
+node stopped. Of the failures:
+
+- four are CPU/memory hotplug, which KubeVirt allows only on x86_64
+- two are the scheduling tests that assume nodes of different sizes
+- two are maintenance mode, whose test expects a node condition v1.9.x does not set
+- the rest are the add-on, setting and storage-network tests that fail on every platform
+
+`test_abort_migrate` failed once and passed on a rerun. KubeVirt aborted the
+migration within a second, but Harvester's `migrationState` annotation stayed
+at `Migrating`.
 
 ---
 
@@ -1716,7 +1888,9 @@ attributed to that change.
 | 7a | 1 + gp3 16,000 / 1,000, new cluster; guest suite with pgbench, and pre-filled contention | what provisioning, a database and contention look like on nested x86 | random write 4.0×, seq write capped at ~300 MiB/s, **seq read stuck at 143 MiB/s**, fsync unchanged; pgbench 441 / 2,096 / 4,988 tps; contention as Graviton, but sequential etcd p99 216 ms |
 | 7c | 7a lowered to gp3 baseline (3,000 / 125), in place | how bad baseline is on x86, for a database and under contention | pgbench −2% to −12% only. Contention caused **a control-plane outage, reproduced in two runs**: etcd fsync p99 about 2 s, all three API servers restarted, a node NotReady, the VIP moving, one leader change |
 | 7b | 7a + io2 at 16,000 IOPS, in place | whether io2's latency gain holds on x86 | yes: fsync +66%, pgbench +42–61%, seq write per disk doubled to 584 MiB/s. Sequential contention hit the instance's EBS burst limit (1,198 MiB/s) and etcd p99 reached 127 ms |
-| V1 | 7a on Harvester v1.9.0, new cluster with kube-ovn and vip-controller, etcd metrics off | whether the release changes any figure | [no, except under contention](#harvester-v190-on-configuration-5s-platform): VM overhead 18.6%, pgbench within 2%, density the same. etcd writes −25% (a follower, not the release). Six saturating VMs: storage the same, API→etcd p99 3.6 s against 1.0 s, kubeovn-operator restarted 7 times; unexplained, rerun needed |
+| V1 | 7a on Harvester v1.9.0, new cluster with kube-ovn and vip-controller, etcd metrics off | whether the release changes any figure | [no, except under contention](#harvester-v190-on-configuration-5s-platform): VM overhead 18.6%, pgbench within 2%, density the same. etcd writes −25% (a follower, not the release). Six saturating VMs: storage the same, API→etcd p99 3.6 s against 1.0 s, kubeovn-operator restarted 7 times; unexplained, and it did not recur on v1.9.1 (V2) |
+| V2 | V1 on Harvester v1.9.1, new cluster, etcd metrics on | whether v1.9.1 changes any figure, and whether V1's contention result recurs | [no, and no](#harvester-v191-on-configuration-5s-platform): VM overhead 20.3%, pgbench within 2%, etcd at leader figures (41,277 writes/s). Six saturating VMs: API→etcd p99 996 ms, as v1.8.2; etcd WAL p99 327 ms against 216 ms |
+| V3 | 3 on `r7g.metal` (no `c7g.metal` capacity) and Harvester v1.9.1, new cluster with kube-ovn and vip-controller, etcd metrics on | whether v1.9.1 runs Graviton guests, and whether any figure changes | [yes, and no](#harvester-v191-on-graviton-r7gmetal): guests boot; VM overhead 11.8% (scheduler 29%, the known unstable figure), pgbench within 2%, disk and etcd the same. Six-VM contention the same as v1.8.2 (sequential etcd p99 115 ms, API 928 ms). Density p99 29.5 s against 20 s or less, one run |
 | 13 | 5b's cluster + a kube-ovn overlay and its VPC route; runner `m8i.4xlarge` as the VPC client (`--guest-vpc-network`) | what VMs get to and from the rest of the VPC | 4 streams: 12.2–14.3 Gbit/s, near the node's own 14.35, inbound through the route node included; single flows about 4.8 Gbit/s (EC2's per-flow limit). The overlay adds 0.2–0.4 ms of round trip |
 | E2 | E1's cluster, guest suite in VM mode with pgbench, data disk on EFS | what one VM and a database get from EFS | fsync 106 IOPS (p99 17 ms), pgbench 114 / 452 / 1,179 tps: about a quarter of Longhorn. Seq read 1,009 MiB/s, which places x86's ~140 MiB/s Longhorn read limit in Longhorn |
 | E5 | E4 again with `vmMigrationTimeout` 60 (restored afterwards) | how much the force-reset timeout sets recovery time | VMs back at 173 s (EFS) and 179 s (Longhorn), about 90 s sooner, as predicted. kube-ovn's `ovn-central` did not recover from this second stop |
@@ -1742,7 +1916,7 @@ IDs are stable labels that the text above links to; the order is the priority.
 | 3 | **Node-level disk, below Longhorn** (old 3c) | how much of the remaining sync-write latency is EBS and how much is Longhorn's engine; and where in Longhorn x86 sequential reads stop at about 150 MiB/s | none; a privileged pod on a node | E2 placed the x86 read limit in Longhorn: the same VM read 1,009 MiB/s from EFS. Run it on x86 first. |
 | 5 | **External storage: EBS CSI**, one EBS volume per VM disk | whether bypassing Longhorn removes the shared-volume limit and the ~460 MiB/s cap | EBS CSI driver | First confirm that Harvester v1.8.2 supports third-party CSI for VM disks, and whether for boot disks too. Trade-off: no live migration, no Longhorn replication, and single-AZ volumes. |
 | 6 | **EFS on Graviton**, and recovery with a shorter `vm-force-reset-policy` | EFS latency on bare metal; how fast a VM can come back after a node failure | the Graviton cluster; a Harvester setting | Contention, the single-VM suite, root disks, live migration and node failure on EFS are measured (E1–E4). |
-| — | **More Graviton samples** | a stable range for the Graviton scheduler figure | none | Six samples so far: −1% to 28%, mean about 13%. The pod varies too, so the variance is in the host. More samples come with every run. |
+| — | **More Graviton samples** | a stable range for the Graviton scheduler figure | none | Seven samples so far, the seventh on `r7g.metal` with v1.9.1: −1% to 29%, mean about 15%. The pod varies too, so the variance is in the host. More samples come with every run. |
 
 ### Optional
 
@@ -1755,7 +1929,7 @@ IDs are stable labels that the text above links to; the order is the priority.
 
 Notes for the runs ahead:
 
-- **Graviton needs v1.8.2.** v1.9.0 arm64 guests cannot boot (the
+- **Graviton needs v1.8.2 or v1.9.1.** v1.9.0 arm64 guests cannot boot (the
   [README](../README.md#what-has-been-tested) has the cause), and
   `run-perf.sh` refuses the guest and density suites there.
 - **Graviton is not a pure "nesting removed" comparison**, because the CPU

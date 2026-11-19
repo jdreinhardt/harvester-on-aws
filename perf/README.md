@@ -135,17 +135,17 @@ procedure has been tried yet, so the script does not do either.
 | `node-capacity` | Node info from the API, plus `lsblk` on every node from a privileged `hostPID` daemonset. | Should pass. Pulls `registry.suse.com/bci/bci-base:latest`. Its `pods.capacity` figure is what bounds density (see below). |
 | `resource-footprint` | Read-only PromQL: per-namespace CPU and memory, requests, host memory, allocatable. | Passes when monitoring is on. The figure that matters most is the one for Harvester's own namespaces, measured on an idle cluster. |
 | `etcd-benchmark` | `etcdctl endpoint`/`check perf`, then serial and concurrent `benchmark put/range` from a host-network job pod on node 1, then etcd's own fsync, commit and peer-RTT histograms. | The benchmarks should pass. `check perf` uses the small profile, which gp3's baseline of 3000 IOPS covers. The interesting output is the WAL fsync p99 on gp3, which etcd, Longhorn and the OS all share on one volume. |
-| `guest` | Not an hvperf suite. CPU, memory, scheduler, disk and network workloads, run inside two Harvester VMs and then in two plain pods on the same nodes. | Should pass on amd64 and on arm64 v1.8.2. This suite is the one that gives the VM overhead, and with it what nested virtualization costs. [Its own section](#the-guest-suite-what-a-vm-actually-gets) covers it. |
+| `guest` | Not an hvperf suite. CPU, memory, scheduler, disk and network workloads, run inside two Harvester VMs and then in two plain pods on the same nodes. | Should pass on amd64 and on arm64 v1.8.2 and v1.9.1 (not yet run on arm64 v1.9.1). This suite is the one that gives the VM overhead, and with it what nested virtualization costs. [Its own section](#the-guest-suite-what-a-vm-actually-gets) covers it. |
 | `density` | Creates batches of cirros containerDisk VMIs (100m CPU, 90Mi) until `maxVMs` is reached or a health check trips, recording VMI boot latency at p50/p95/p99. | Expect the pod limit to stop it before CPU or memory does, at roughly (max-pods − system pods) per node. On amd64, boot latency includes nested virtualization, so do not compare it with bare-metal baselines. |
 
-### arm64 on v1.9.x: density is refused
+### arm64 on v1.9.0: density is refused
 
 Density waits only for the VMI to reach phase `Running`, and QEMU gets there
 whether or not the guest boots. On arm64 v1.9.0, every guest dead-loops in its
 firmware ([README](../README.md#what-has-been-tested)), so density would report
 a healthy ramp and plausible latencies that measure nothing. The script refuses
-that combination unless you pass `--allow-arm64-density`. Use v1.8.2 for arm64
-density.
+that combination unless you pass `--allow-arm64-density`. Use v1.9.1 or v1.8.2
+for arm64 density; v1.9.1 guests boot.
 
 ### State the suites leave behind
 
@@ -479,5 +479,5 @@ worked around here.
 | A global duration overridden in the config file fails to decode (`cannot unmarshal string ... of type time.Duration`), because options round-trip through JSON. Verified. | Only `JobPodNode`, a string, is set at the top level. |
 | The etcd job pod is not pinned to a node that runs etcd. On a cluster with workers, it can land where `127.0.0.1:2379` has nothing listening. | `JobPodNode` is set to node 1. |
 | The local tool paths for the etcd suite are hardcoded, and the image is single-arch. | The tools are cross-compiled into `/usr/local/bin` on the runner. |
-| Density treats VMI `Running` as booted. | arm64 v1.9.x is refused. |
+| Density treats VMI `Running` as booted. | arm64 v1.9.0 is refused. |
 | The etcd peer round-trip query filters on `ConnectionType='ROUND_TRIPPER_RAFT_MESSAGE'`. etcd 3.6 labels that histogram with `To` only (`rafthttp/metrics.go`), so the query always returns nothing. Verified against node metrics and Prometheus, 2026-10-16. | None. Query Prometheus without the filter. With it removed, the v1.8.2 run shows p99 under 3.2 ms. |

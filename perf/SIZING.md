@@ -96,7 +96,7 @@ was not tested.
 | Synchronous write (fsync), p99, gp3 / io2 | 2.06 / 1.35 ms | 1.43 / 1.06 ms |
 | EBS bandwidth | 5,000 Mbps (≈600 MiB/s), 10,000 burst for about 30 min a day; 20,000 IOPS | 20,000 Mbps (≈2,380 MiB/s); 80,000 IOPS |
 | Network | 7.5 Gbit/s, 15 burst | 30 Gbit/s |
-| Guest firmware | any release | needs **v1.8.2**; v1.9.0 arm64 guests do not boot |
+| Guest firmware | any release | needs **v1.8.2 or v1.9.1**; v1.9.0 arm64 guests do not boot |
 
 - **x86 nested** suits compute-bound and general-purpose VMs. Its weakness is
   I/O latency, and its EBS bandwidth: past about 600 MiB/s of sustained

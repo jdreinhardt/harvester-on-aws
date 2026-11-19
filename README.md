@@ -8,7 +8,7 @@ template and a Terraform module for the deployment.
 Current default targets Harvester **v1.9.0** on **amd64**. See
 [What has been tested](#what-has-been-tested) before assuming another version,
 architecture or configuration works — notably, Arm guest VMs do not boot on
-v1.9.0 due to an upstream firmware bug.
+v1.9.0 due to an upstream firmware bug. v1.9.1 fixes it.
 
 For a high-level account of what this does and why — rather than how — see
 [OVERVIEW.md](OVERVIEW.md).
@@ -229,13 +229,13 @@ not listed may work, but known state is unclear.
 | | Image build | Bootstrap | Clustering | VM networking | Guest VMs |
 |---|---|---|---|---|---|
 | **amd64** | yes | yes | 3 nodes | yes | yes |
-| **arm64** | yes | yes | 3 nodes | yes | v1.8.2 yes; **v1.9.0 no** — see below |
+| **arm64** | yes | yes | 3 nodes | yes | v1.8.2 yes; **v1.9.0 no**; v1.9.1 yes — see below |
 
 arm64 runs on Graviton bare metal (`c7g.metal` tested, `c6g.metal` used as the
 build helper). Nodes, clustering, promotion, TLS SANs and overlay VM networking
 all behave the same as on amd64.
 
-**Guest VMs do not boot on arm64 Harvester v1.9.0.** Its `virt-launcher` ships
+**Guest VMs do not boot on arm64 Harvester v1.9.0; v1.9.1 fixes it.** v1.9.0's `virt-launcher` ships
 `qemu-uefi-aarch64-202502`, which carries an upstream edk2 bug: a DSC
 include-ordering fault resolves `ArmTrngLib` to the NULL implementation, so
 `RngDxe` asserts and dead-loops the firmware the moment the Linux EFI stub asks
@@ -252,14 +252,20 @@ hangs. It is not CPU-dependent — Graviton2, 3 and 4 all fail identically, and
 RNDR is irrelevant because the assert is in the SMCCC Arm TRNG path, not the
 RNDR instruction path. Fixed upstream by
 [edk2 PR #11052](https://github.com/tianocore/edk2/pull/11052) (merged
-2025-05-12, first in `edk2-stable202505`); needs a SUSE package rebuild to
-reach Harvester. **Until then, v1.8.2 is the working arm64 baseline.**
+2025-05-12, first in `edk2-stable202505`).
+
+**v1.9.1 carries the fix.** SUSE backported that commit (`399a40e5cba2`,
+bsc#1200260) into `qemu-uefi-aarch64-202502-160000.9.1`, which v1.9.1's
+`virt-launcher` (`1.8.4-11.23`) ships. An Ubuntu guest booted on `c7g.metal`
+(2026-11-17). The firmware is still a DEBUG build, so any other firmware
+`ASSERT` would still hang a guest the same way. The full e2e and perf suites
+have not yet run on arm64 v1.9.1.
 
 Upgrading an arm64 cluster from v1.8.2 does not stop guests that are already
 running: the firmware only runs at boot. Measured on `c6g.metal`
 (2026-10-29): a VM booted on v1.8.2 live-migrated in 9 s onto an upgraded
 node, into v1.9.0's `virt-launcher`, and kept answering. Once it stops or
-restarts, it hangs as above.
+restarts on v1.9.0, it hangs as above.
 
 Diagnose any guest hang from the serial log, never the web console — VNC looks
 identical whether the firmware is dead-looping or the guest booted and stopped
@@ -273,6 +279,7 @@ kubectl logs -n default -l kubevirt.io=virt-launcher -c guest-console-log --tail
 
 | | Image build | Bootstrap | Clustering | VM networking | Notes |
 |---|---|---|---|---|---|
+| **v1.9.1** | yes | yes | 3 nodes | yes | amd64: e2e and perf run on 3 nodes via Terraform (2026-11-17). arm64: guest VMs boot (one VM checked by hand, 2026-11-17); the full suites have not yet run there. |
 | **v1.9.0** | yes | yes | 3 nodes | yes | The default. Validated end to end on amd64, via both CloudFormation and Terraform. On arm64, nodes work but guest VMs do not — see above. |
 | **v1.8.2** | yes | yes | 3 nodes | yes | Works on both architectures, including arm64 guest VMs. But `natOutgoing` is not exposed in the UI — see [natOutgoing](#natoutgoing--check-it-is-set). |
 
@@ -498,12 +505,13 @@ sudo ./scripts/02-customize-instance.sh /dev/nvme1n1
 | `COS_GRUB` | ESP renamed to `EFI/BOOT/BOOTX64.EFI` — the removable-media path AWS boots for a snapshot-registered AMI |
 | `COS_STATE` | `active.img`/`passive.img` `bootargs.cfg` → `console=ttyS0,115200n8` only, and `net.ifnames=0`; same settings mirrored into `grubcustom` so they survive an OS upgrade |
 | `COS_OEM` | `99_aws.yaml` + `aws/stage-initramfs.sh` + `aws/configure.sh` |
-| `COS_OEM` | `aws/vip-controller/` — the vip-controller image archive and manifest, with `--vip-controller DIR` (`make ami` always passes it) |
+| `COS_OEM` | `aws/vip-controller/` — the vip-controller image archive and HelmChart manifest, with `--vip-controller DIR` (`make ami` always passes it) |
 | `COS_OEM` | `harvester.config` — only `install.device` is patched; `mode: install` **must** stay |
 
 Options: `--grow-data-disk`, `--no-serial-console`, `--vip-controller DIR`
 (a directory holding `vip-controller.tar.gz` for the image's architecture and
-`vip-controller.yaml`; `make vip-controller` builds the archive).
+`vip-controller.yaml`, an RKE2 HelmChart carrying the chart; `make
+vip-controller` builds both).
 
 `make ami` needs **docker** on the machine running it, to build the
 vip-controller image; it stops before creating anything in AWS if docker is
@@ -1501,8 +1509,21 @@ a 1500 underlay comes up at ~1450 and never fragments. A guest configured
 **statically** is the exception: it takes 1500, ignores the advertised value,
 and black-holes large packets.
 
-**2. Enable the `kubeovn-operator` addon** (*Advanced > Add-ons*). Marked
-experimental. It installs Kube-OVN as a **secondary** CNI alongside canal.
+**2. Check the `kubeovn-operator` addon is enabled** (*Advanced > Add-ons*).
+Marked experimental. It installs Kube-OVN as a **secondary** CNI alongside
+canal. A cluster from this AMI starts with it enabled: first boot defaults
+`install.addons.kubeovn_operator.enabled` to `true`, which Harvester's
+installer renders into the add-on on the node that creates the cluster. To
+start with it off, set it to `false` in that node's user-data:
+
+```yaml
+install:
+  addons:
+    kubeovn_operator:
+      enabled: false
+```
+
+Clusters from older AMIs, or ones where it was turned off, enable it in the UI.
 
 **3. Check the CIDRs do not overlap.** The addon defaults (pod `10.54.0.0/16`,
 service `10.55.0.0/16`, join `100.64.0.0/16`) already avoid the cluster's own
@@ -1616,6 +1637,33 @@ kubectl get subnet <name> -o jsonpath='{.spec.mtu}{"\n"}'
 
 Guests need a new lease to pick up a changed value — reboot the VM, or renew
 its DHCP lease.
+
+### Known issue: the kube-ovn operator runs out of memory
+
+Both `kubeovn-operator-controller-manager` pods in `kube-system` crash-loop with
+`OOMKilled`. The add-on's chart hard-codes a 128Mi memory limit and ignores
+`.Values.resources`, so the add-on's `valuesContent` can't raise it. Upstream:
+[harvester/harvester#12193](https://github.com/harvester/harvester/issues/12193)
+(open, milestone v1.10.0), also reported on v1.8.2 and v1.9.0 in #11438.
+
+Only the operator is affected. `ovn-central`, `ovs-ovn` and the CNI keep
+running and VM networking works, but changes to the `Configuration` CR aren't
+reconciled and its status goes stale.
+
+On a fresh v1.9.1 cluster from this AMI (2026-11-17), the operator ran fine on
+node 1 alone. It started crash-looping as soon as nodes 2 and 3 joined, killed
+at about 129 MB each time. Since kube-ovn is now on by default, expect this on
+every new multi-node cluster. Raise the limit:
+
+```bash
+kubectl -n kube-system patch deploy kubeovn-operator-controller-manager --type json \
+  -p '[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/memory","value":"512Mi"}]'
+```
+
+That cluster's operator then settled at 121Mi (leader) and 17Mi (standby),
+with no restarts, and the `Configuration` status caught up within a minute. The
+patch lasts until the add-on chart is upgraded, which puts the 128Mi back. The
+AMI doesn't apply it, since it would mean editing a release Harvester owns.
 
 ### Known issue: kube-ovn's databases do not survive a node reboot
 
@@ -2150,6 +2198,50 @@ That means `/oem/userdata.yaml` was missing or rejected. Check
 `journalctl -u harvester-aws-config` — the usual causes are no user-data on the
 instance, user-data that isn't a YAML mapping, or `install.mode: create` with no
 `install.vip`.
+
+### If the joining nodes never become Ready
+
+**Symptom:**
+- Node 1 is Ready.
+- Nodes 2 and onward boot, install, and start `rancher-system-agent`, but never
+  run `rke2-server`, and their rancherd probes report `kubelet` unhealthy.
+- *Cluster Management* shows them as machines stuck in Provisioning. The local
+  cluster says `waiting for at least one control plane, etcd, and worker node to
+  be registered`.
+
+The cause is on node 1. Its rancherd retries this every 15 s, indefinitely:
+
+```
+Error from server (NotFound): plans.upgrade.cattle.io "system-agent-upgrader" not found
+```
+
+Rancher creates that plan only once `fleet-local/local`'s RKEControlPlane has
+the condition `SystemUpgradeControllerReady`. On a stalled cluster that
+condition is missing, although `agentConnected` is `true` and the
+system-upgrade-controller app is deployed. To confirm, the first command prints
+nothing and the second prints `true`:
+
+```bash
+kubectl -n fleet-local get rkecontrolplane local \
+  -o jsonpath='{.status.conditions[?(@.type=="SystemUpgradeControllerReady")].status}'
+```
+
+```bash
+kubectl -n fleet-local get rkecontrolplane local -o jsonpath='{.status.agentConnected}'
+```
+
+Restart Rancher on node 1:
+
+```bash
+kubectl -n cattle-system rollout restart deploy/rancher
+```
+
+Seen on 2 of 3 v1.9.x deploys (v1.9.0 on 2026-10-29, v1.9.1 on 2026-11-17).
+Both times the condition and the plan appeared about 60 s after the restart,
+and every node was Ready about 3–4 minutes later. The likely trigger is
+Harvester's chart redeploying Rancher partway through bootstrap: the new pod
+never sets the condition. The root cause is unconfirmed, and it's not related
+to this repository's changes.
 
 ### Customizing the node configuration
 

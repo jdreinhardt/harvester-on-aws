@@ -142,7 +142,8 @@ isn't configurable, and it applies to bare metal too.
 What works is an overlay. VM traffic gets encapsulated inside ordinary
 host-to-host traffic, so AWS only ever sees instances talking to instances. VMs
 get their own addresses, reach the internet and the wider network, and can be
-reached in return.
+reached in return. The add-on that provides it, kube-ovn, is enabled when the
+cluster is created.
 
 ---
 
